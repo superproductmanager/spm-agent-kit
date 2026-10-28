@@ -14,7 +14,6 @@ const ROOT = path.resolve(__dirname, '..');
 const NAME = 'Example agent';
 const EMAIL = 'spm-example-agent@agents.invalid';
 const APP_ID = 'example-app-id-0000000000000000';
-const PIN = '12.4.0';
 
 // The seven allow rules, absolute, built from the kit folder that setup-env.sh runs from (0.2.0 adds agent-health last).
 function rulesFor(kit) {
@@ -47,6 +46,8 @@ function sandbox({ version, npmFail = false, claudeMdBlock = false, selfcheckFai
   fs.mkdirSync(sb.bin);
   fs.mkdirSync(path.join(sb.kit, 'skill', 'spm-agent'), { recursive: true });
   for (const f of ['setup-env.sh', 'cloud-agent-setup.sh']) fs.copyFileSync(path.join(ROOT, f), path.join(sb.kit, f));
+  fs.mkdirSync(path.join(sb.kit, 'runtime'));
+  for (const f of ['package.json', 'package-lock.json']) fs.copyFileSync(path.join(ROOT, 'runtime', f), path.join(sb.kit, 'runtime', f));
   fs.copyFileSync(SKILL_SRC, path.join(sb.kit, 'skill', 'spm-agent', 'SKILL.md'));
   if (version !== undefined) fs.writeFileSync(path.join(sb.kit, 'VERSION'), version);
   if (claudeMdBlock) {
@@ -77,15 +78,22 @@ function cleanup(sb) {
   fs.rmSync(sb.root, { recursive: true, force: true });
 }
 
-// Fake npm: logs its call; on success writes the package.json the real install would write, at version 12.4.0.
+// The SDK packages and their pins, read from the kit's runtime/package.json (not hard-coded here).
+const SDK_PINS = JSON.parse(fs.readFileSync(path.join(ROOT, 'runtime', 'package.json'), 'utf8')).dependencies;
+
+// FAKE npm (no network): logs its call; on success writes, for `npm ci --prefix <dir>`, a package.json for each
+// SDK package at the version the runtime/package.json pins, as the real npm ci would.
 function fakeNpm(sb, fail) {
+  const writes = Object.entries(SDK_PINS).flatMap(([name, version]) => [
+    `mkdir -p "$prefix/node_modules/${name}"`,
+    `printf '%s' '{"name":"${name}","version":"${version}"}' > "$prefix/node_modules/${name}/package.json"`,
+  ]);
   const body = fail
     ? 'exit 1\n'
     : [
         'prefix=""',
         'while [ $# -gt 0 ]; do case "$1" in --prefix) prefix="$2"; shift 2;; *) shift;; esac; done',
-        'mkdir -p "$prefix/node_modules/firebase"',
-        `printf '%s' '{"name":"firebase","version":"${PIN}"}' > "$prefix/node_modules/firebase/package.json"`,
+        ...writes,
         '',
       ].join('\n');
   fs.writeFileSync(path.join(sb.bin, 'npm'), `#!/usr/bin/env bash\nprintf '%s\\n' "$*" >> '${sb.npmLog}'\n${body}`, { mode: 0o755 });
@@ -541,13 +549,15 @@ test('--no-sdk never runs npm or cloud-agent-setup', () => {
   } finally { cleanup(sb); }
 });
 
-test('without --no-sdk the SDK step installs firebase 12.4.0, and the output is still one line', () => {
+test('without --no-sdk the SDK step runs npm ci for the pinned SDK packages, and the output is still one line', () => {
   const sb = sandbox({ version: '0.1.0\n' });
   try {
     const r = runSetup(sb, ok());
     assert.equal(r.status, 0, r.stderr);
-    assert.match(fs.readFileSync(sb.npmLog, 'utf8'), /firebase@12\.4\.0/);
-    assert.equal(readJson(path.join(sb.runtime, 'node_modules', 'firebase', 'package.json')).version, PIN);
+    assert.match(fs.readFileSync(sb.npmLog, 'utf8'), /^ci --prefix .* --ignore-scripts/m);
+    for (const [name, version] of Object.entries(SDK_PINS)) {
+      assert.equal(readJson(path.join(sb.runtime, 'node_modules', ...name.split('/'), 'package.json')).version, version);
+    }
     assert.equal(r.stdout, `spm-agent-kit 0.1.0: set up for ${NAME}\n`);
   } finally { cleanup(sb); }
 });

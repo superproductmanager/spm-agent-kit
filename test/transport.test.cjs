@@ -1,6 +1,6 @@
 'use strict';
 // Tests for the Firestore transport setting (node or webchannel) in agent-listen.cjs.
-// A FAKE Firebase SDK tree is written to a temp folder: stubs for firebase/app, firebase/auth, firebase/firestore and
+// A FAKE Firebase SDK tree is written to a temp folder: stubs for @firebase/app, @firebase/auth, @firebase/firestore (node build) and
 // @firebase/firestore/dist/index.cjs.js. Each stub appends what it was asked to a log file, so the tests can see which
 // file loaded and which options were passed. The stubs are fakes for the SDK only (no network); the loader code itself is real.
 // Each loader case runs in its own child process, because the SDK cache and the fetch wrap are per process.
@@ -26,24 +26,26 @@ function writeFakeSdk() {
   const put = (rel, body) => { const p = path.join(SDK_DIR, rel); fs.mkdirSync(path.dirname(p), { recursive: true }); fs.writeFileSync(p, body); };
   const rec = (name) => `const fs = require('node:fs'); const rec = (ev, data) => fs.appendFileSync(process.env.FAKE_SDK_LOG, JSON.stringify({ ev, file: ${name}, ...data }) + '\\n');`;
   put('package.json', JSON.stringify({ name: 'fake-runtime', private: true }));
-  put('node_modules/firebase/app.js', `${rec("'firebase/app'")}
+  put('node_modules/@firebase/app/package.json', JSON.stringify({ name: '@firebase/app', version: '0.0.0-fake', main: 'app.js' }));
+  put('node_modules/@firebase/app/app.js', `${rec("'@firebase/app'")}
 fs.appendFileSync(process.env.FAKE_SDK_LOG, JSON.stringify({ ev: 'load', file: __filename }) + '\\n');
 exports.initializeApp = (opts, name) => { rec('initializeApp', { name, hasKey: typeof opts.apiKey === 'string' }); return { name }; };
 exports.deleteApp = async () => {};
 exports.setLogLevel = () => {};`);
-  put('node_modules/firebase/auth.js', `${rec("'firebase/auth'")}
+  put('node_modules/@firebase/auth/package.json', JSON.stringify({ name: '@firebase/auth', version: '0.0.0-fake', main: 'auth.js' }));
+  put('node_modules/@firebase/auth/auth.js', `${rec("'@firebase/auth'")}
 fs.appendFileSync(process.env.FAKE_SDK_LOG, JSON.stringify({ ev: 'load', file: __filename }) + '\\n');
 exports.inMemoryPersistence = { fake: true };
 exports.initializeAuth = (app) => { rec('initializeAuth', {}); return { app }; };
 exports.signInWithCustomToken = async (auth, token) => { rec('signInWithCustomToken', { tokenLen: String(token).length }); return {}; };`);
-  put('node_modules/firebase/firestore.js', `${rec("'firebase/firestore'")}
+  put('node_modules/@firebase/firestore/node.js', `${rec("'@firebase/firestore node'")}
 fs.appendFileSync(process.env.FAKE_SDK_LOG, JSON.stringify({ ev: 'load', file: __filename }) + '\\n');
 exports.getFirestore = (app) => { rec('getFirestore', {}); return { fake: 'db' }; };
 exports.doc = (db, a, b) => ({ a, b });
 exports.onSnapshot = (ref, opts, next, err) => { rec('onSnapshot', { ref }); return () => {}; };
 exports.terminate = async () => {};
 exports.setLogLevel = () => {};`);
-  put('node_modules/@firebase/firestore/package.json', JSON.stringify({ name: '@firebase/firestore', version: '0.0.0-fake', exports: { '.': './dist/index.cjs.js', './package.json': './package.json' } }));
+  put('node_modules/@firebase/firestore/package.json', JSON.stringify({ name: '@firebase/firestore', version: '0.0.0-fake', exports: { '.': './node.js', './package.json': './package.json', './dist/index.cjs.js': './dist/index.cjs.js' } }));
   put('node_modules/@firebase/firestore/dist/index.cjs.js', `${rec("'@firebase/firestore dist'")}
 fs.appendFileSync(process.env.FAKE_SDK_LOG, JSON.stringify({ ev: 'load', file: __filename }) + '\\n');
 exports.initializeFirestore = (app, opts) => { rec('initializeFirestore', { opts }); return { fake: 'db' }; };
@@ -96,9 +98,9 @@ function runMode(mode, extraEnv = {}) {
 
 const loadsOf = (calls) => calls.filter((c) => c.ev === 'load').map((c) => path.relative(SDK_DIR, c.file).split(path.sep).join('/'));
 
-test('node mode loads firebase/firestore, calls getFirestore, and never loads the browser build', () => {
+test('node mode loads @firebase/firestore, calls getFirestore, and never loads the browser build', () => {
   const { calls } = runMode('node');
-  assert.deepEqual(loadsOf(calls), ['node_modules/firebase/app.js', 'node_modules/firebase/auth.js', 'node_modules/firebase/firestore.js']);
+  assert.deepEqual(loadsOf(calls), ['node_modules/@firebase/app/app.js', 'node_modules/@firebase/auth/auth.js', 'node_modules/@firebase/firestore/node.js']);
   assert.ok(calls.some((c) => c.ev === 'getFirestore'), 'getFirestore not called');
   assert.ok(!calls.some((c) => c.ev === 'initializeFirestore'), 'initializeFirestore called in node mode');
   assert.ok(calls.some((c) => c.ev === 'signInWithCustomToken'), 'signIn did not run');
@@ -106,7 +108,7 @@ test('node mode loads firebase/firestore, calls getFirestore, and never loads th
 
 test('webchannel mode loads the browser build by absolute path and passes exactly the two long-polling options', () => {
   const { calls } = runMode('webchannel');
-  assert.deepEqual(loadsOf(calls), ['node_modules/firebase/app.js', 'node_modules/firebase/auth.js', 'node_modules/@firebase/firestore/dist/index.cjs.js']);
+  assert.deepEqual(loadsOf(calls), ['node_modules/@firebase/app/app.js', 'node_modules/@firebase/auth/auth.js', 'node_modules/@firebase/firestore/dist/index.cjs.js']);
   const init = calls.filter((c) => c.ev === 'initializeFirestore');
   assert.equal(init.length, 1, 'initializeFirestore must be called once');
   assert.deepEqual(init[0].opts, { experimentalForceLongPolling: true, useFetchStreams: true });
