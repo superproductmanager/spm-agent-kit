@@ -35,6 +35,9 @@
  * the key or gave no valid identity; 7 SPM could not be reached (identify and settings). An unexpected failure exits 1.
  * Every line starts with "health:" except the session-start and settings lines. A kit older than SPM's min_kit_version
  * gets one warning line and still runs.
+ * SESSION FILES (Addendum C2): usage, heartbeat and start read every file of the session: <projects>/<folder>/<id>.jsonl
+ * in all folders and <folder>/<id>/subagents/*.jsonl. The id is --session <id> (8 to 64 letters, digits or dashes),
+ * else the --transcript file's name, else the newest transcript's name.
  */
 
 const fs = require('node:fs');
@@ -49,6 +52,7 @@ const AGENT_NAME_RE = /^[A-Za-z0-9 ._()-]{1,60}$/;
 const AGENT_ADDRESS_RE = /^[a-z0-9._-]+@agents\.invalid$/;
 const APP_ID_RE = /^[A-Za-z0-9_-]{20,60}$/;
 const SALT_RE = /^[0-9a-f]{32}$/;
+const SESSION_RE = /^[A-Za-z0-9-]{8,64}$/;
 const MODEL_RE = /^claude-[a-z0-9.-]{1,60}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const MAX_NUMBER = 1e12;
@@ -65,9 +69,9 @@ function parseArgs(argv) {
   const cmd = argv[0];
   if (!COMMANDS.includes(cmd)) return bad('the first word must be start, usage, heartbeat, flush, session-start or settings');
   const allowed = {
-    start: ['--role', '--config', '--transcript'],
-    usage: ['--role', '--config', '--transcript'],
-    heartbeat: ['--config', '--main-status', '--transcript'],
+    start: ['--role', '--config', '--transcript', '--session'],
+    usage: ['--role', '--config', '--transcript', '--session'],
+    heartbeat: ['--config', '--main-status', '--transcript', '--session'],
     flush: ['--config'],
     'session-start': ['--config'],
     settings: ['--config', '--autostart', '--reports'],
@@ -89,6 +93,7 @@ function parseArgs(argv) {
   const mainStatus = v['--main-status'] === undefined ? undefined : (R.MAIN_STATUSES.includes(v['--main-status']) ? v['--main-status'] : 'unknown');
   if (mainStatus !== undefined && cmd !== 'heartbeat') return bad('--main-status is only for heartbeat');
   if (v['--transcript'] !== undefined && !path.isAbsolute(v['--transcript'])) return bad('--transcript must be an absolute path');
+  if (v['--session'] !== undefined && !SESSION_RE.test(v['--session'])) return bad('--session must be 8 to 64 letters, digits or dashes');
   const onOff = (name) => {
     if (v[name] === undefined) return { value: undefined };
     if (v[name] !== 'on' && v[name] !== 'off') return { error: `${name} must be on or off` };
@@ -101,7 +106,7 @@ function parseArgs(argv) {
     autostart = a.value; reports = r.value;
     if (autostart === undefined && reports === undefined) return bad('settings needs --autostart on|off, --reports on|off, or both');
   }
-  return { ok: true, cmd, config: v['--config'], role: v['--role'], mainStatus, transcript: v['--transcript'], autostart, reports };
+  return { ok: true, cmd, config: v['--config'], role: v['--role'], mainStatus, transcript: v['--transcript'], session: v['--session'], autostart, reports };
 }
 
 // The settings file as a JSON object, or { error }. A link is refused: the file is rewritten in place.
@@ -218,50 +223,104 @@ function newestTranscript(home) {
 
 const cap = (v) => (Number.isSafeInteger(v) && v >= 0 ? Math.min(v, MAX_NUMBER) : 0);
 
-// Reads a transcript line by line (never whole) and keeps only counts. Per session: the LAST line of each message id
-// wins; <synthetic> and models outside the pattern are skipped; compact_boundary lines are counted with their preTokens.
+// C2: is `file` a regular file (not a link or a folder)? A file that cannot be stat'ed is not one.
+const isRegularFile = (file) => { try { return fs.lstatSync(file).isFile(); } catch (_) { return false; } };
+// C2: a sub-agent file lives in <folder>/<session id>/subagents/; its parent session id is that folder's name.
+const parentOfSubagentFile = (file) => (path.basename(path.dirname(file)) === 'subagents' ? path.basename(path.dirname(path.dirname(file))) : null);
+
+// C2: every file of one session, as [{ file, parent }]. Discovery needs a valid session id: every
+// <home>/.claude/projects/<folder>/<id>.jsonl (regular files, all folders) and every regular *.jsonl directly in
+// <folder>/<id>/subagents/ (parent = <id>). A transcript named by --transcript (or the newest one) is added too.
+// Paths are de-duplicated. Returns [] when there is nothing to read.
+function sessionFiles(home, sid, transcript) {
+  const out = [];
+  const seen = new Set();
+  const add = (file, parent) => {
+    const key = path.resolve(file);
+    if (seen.has(key)) return;
+    seen.add(key);
+    out.push({ file, parent });
+  };
+  if (sid && SESSION_RE.test(sid)) {
+    const root = path.join(home, '.claude', 'projects');
+    let folders = [];
+    try { folders = fs.readdirSync(root, { withFileTypes: true }); } catch (_) { folders = []; }
+    const found = [];
+    for (const d of folders) {
+      if (!d.isDirectory()) continue;
+      const dir = path.join(root, d.name);
+      const main = path.join(dir, `${sid}.jsonl`);
+      if (isRegularFile(main)) found.push({ file: main, parent: null });
+      const sub = path.join(dir, sid, 'subagents');
+      let subs = [];
+      try { subs = fs.readdirSync(sub, { withFileTypes: true }); } catch (_) { subs = []; }
+      for (const f of subs) { if (f.isFile() && f.name.endsWith('.jsonl')) found.push({ file: path.join(sub, f.name), parent: sid }); }
+    }
+    found.sort((a, b) => (a.file < b.file ? -1 : a.file > b.file ? 1 : 0));
+    for (const f of found) add(f.file, f.parent);
+  }
+  if (transcript) add(transcript, parentOfSubagentFile(transcript));
+  return out;
+}
+
+// Reads each file line by line (never whole) and keeps only counts, as ONE result across all files. Per session: the
+// LAST line of each message id wins (across files too); <synthetic> and models outside the pattern are skipped.
+// compact_boundary lines are counted once per key: the line's uuid, or `${timestamp}|${preTokens}` without one (C2).
+// A line from a sub-agent file counts under that file's parent session id; any other line under its own sessionId.
+// A file that cannot be opened or read is skipped; the others still count.
 // Each call gets a price tier: "long" when input + cache read + cache write tokens exceed 100,000, else "standard".
 // Cache writes: the 5m and 1h breakdown when the line has it, else all of cache_creation_input_tokens is 5m (B5).
-// Text fields are never read. Returns { sessions: Map<sessionId, {msgs, compactions, preTokens}>, primary }.
-async function readTranscript(file) {
-  const fallback = path.basename(file, '.jsonl');
+// Text fields are never read. Input: one path, or a list of paths or { file, parent }.
+// Returns { sessions: Map<sessionId, {msgs, compactions, preTokens}>, primary }.
+async function readTranscript(input) {
+  const list = (Array.isArray(input) ? input : [input]).map((e) => (typeof e === 'string' ? { file: e, parent: null } : e));
   const sessions = new Map();
   const counts = new Map();
-  const rl = readline.createInterface({ input: fs.createReadStream(file, { encoding: 'utf8' }), crlfDelay: Infinity });
-  for await (const line of rl) {
-    if (line.trim() === '') continue;
-    let o;
-    try { o = JSON.parse(line); } catch (_) { continue; }
-    if (!o || typeof o !== 'object') continue;
-    const sid = typeof o.sessionId === 'string' && o.sessionId ? o.sessionId : fallback;
-    counts.set(sid, (counts.get(sid) || 0) + 1);
-    let s = sessions.get(sid);
-    if (!s) { s = { msgs: new Map(), compactions: 0, preTokens: 0 }; sessions.set(sid, s); }
-    if (o.type === 'system' && o.subtype === 'compact_boundary') {
-      s.compactions++;
-      s.preTokens += cap(o.compactMetadata && o.compactMetadata.preTokens);
-      continue;
+  for (const { file, parent } of list) {
+    const fallback = parent || path.basename(file, '.jsonl');
+    try {
+      if (!fs.statSync(file).isFile()) continue;
+      fs.closeSync(fs.openSync(file, 'r'));
+    } catch (_) { continue; }
+    const stream = fs.createReadStream(file, { encoding: 'utf8' });
+    const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
+    stream.on('error', () => rl.close());
+    for await (const line of rl) {
+      if (line.trim() === '') continue;
+      let o;
+      try { o = JSON.parse(line); } catch (_) { continue; }
+      if (!o || typeof o !== 'object') continue;
+      const sid = parent || (typeof o.sessionId === 'string' && o.sessionId ? o.sessionId : fallback);
+      counts.set(sid, (counts.get(sid) || 0) + 1);
+      let s = sessions.get(sid);
+      if (!s) { s = { msgs: new Map(), compactions: 0, preTokens: 0, compactKeys: new Set() }; sessions.set(sid, s); }
+      if (o.type === 'system' && o.subtype === 'compact_boundary') {
+        const pre = cap(o.compactMetadata && o.compactMetadata.preTokens);
+        const key = typeof o.uuid === 'string' && o.uuid ? `u:${o.uuid}` : `t:${o.timestamp}|${pre}`;
+        if (!s.compactKeys.has(key)) { s.compactKeys.add(key); s.compactions++; s.preTokens += pre; }
+        continue;
+      }
+      const m = o.message;
+      if (!m || typeof m !== 'object' || typeof m.id !== 'string' || typeof m.model !== 'string') continue;
+      if (m.model === '<synthetic>' || !MODEL_RE.test(m.model) || !m.usage || typeof m.usage !== 'object') continue;
+      const u = m.usage;
+      const cc = u.cache_creation && typeof u.cache_creation === 'object' ? u.cache_creation : null;
+      const hasBreakdown = cc !== null && (cc.ephemeral_5m_input_tokens !== undefined || cc.ephemeral_1h_input_tokens !== undefined);
+      const input = cap(u.input_tokens);
+      const cacheRead = cap(u.cache_read_input_tokens);
+      const cacheWriteAll = cap(u.cache_creation_input_tokens);
+      s.msgs.set(m.id, {
+        model: m.model,
+        tier: input + cacheRead + cacheWriteAll > LONG_TIER_TOKENS ? 'long' : 'standard',
+        input,
+        output: cap(u.output_tokens),
+        cacheRead,
+        write5m: hasBreakdown ? cap(cc.ephemeral_5m_input_tokens) : cacheWriteAll,
+        write1h: hasBreakdown ? cap(cc.ephemeral_1h_input_tokens) : 0,
+      });
     }
-    const m = o.message;
-    if (!m || typeof m !== 'object' || typeof m.id !== 'string' || typeof m.model !== 'string') continue;
-    if (m.model === '<synthetic>' || !MODEL_RE.test(m.model) || !m.usage || typeof m.usage !== 'object') continue;
-    const u = m.usage;
-    const cc = u.cache_creation && typeof u.cache_creation === 'object' ? u.cache_creation : null;
-    const hasBreakdown = cc !== null && (cc.ephemeral_5m_input_tokens !== undefined || cc.ephemeral_1h_input_tokens !== undefined);
-    const input = cap(u.input_tokens);
-    const cacheRead = cap(u.cache_read_input_tokens);
-    const cacheWriteAll = cap(u.cache_creation_input_tokens);
-    s.msgs.set(m.id, {
-      model: m.model,
-      tier: input + cacheRead + cacheWriteAll > LONG_TIER_TOKENS ? 'long' : 'standard',
-      input,
-      output: cap(u.output_tokens),
-      cacheRead,
-      write5m: hasBreakdown ? cap(cc.ephemeral_5m_input_tokens) : cacheWriteAll,
-      write1h: hasBreakdown ? cap(cc.ephemeral_1h_input_tokens) : 0,
-    });
   }
-  let primary = fallback;
+  let primary = list.length ? (list[0].parent || path.basename(list[0].file, '.jsonl')) : '';
   let best = -1;
   for (const [sid, n] of counts) { if (n > best) { best = n; primary = sid; } }
   return { sessions, primary };
@@ -269,6 +328,14 @@ async function readTranscript(file) {
 
 // Addendum A2: first 16 hex of sha256(salt + sessionId).
 const sessionKey = (sid, salt) => crypto.createHash('sha256').update(salt + sid).digest('hex').slice(0, 16);
+
+// The salt when <state>/report-salt already holds a valid one, else null. Never creates it (settings uses this).
+function readSaltIfValid(sdir) {
+  try {
+    const s = fs.readFileSync(path.join(sdir, 'report-salt'), 'utf8').trim();
+    return SALT_RE.test(s) ? s : null;
+  } catch (_) { return null; }
+}
 
 // The salt in <state>/report-salt (32 lower-case hex). Created 0600 when missing. { salt } or { error }.
 function loadSalt(sdir) {
@@ -323,10 +390,10 @@ function usageItems(parsed, role, meta, salt) {
 }
 
 // Queues the usage items of one transcript. Returns how many were queued (0 when there is no transcript).
-async function queueUsage({ transcript, role, spool, meta, now, salt }) {
-  if (!transcript) return 0;
+async function queueUsage({ files, role, spool, meta, now, salt }) {
+  if (!files || files.length === 0) return 0;
   let parsed;
-  try { parsed = await readTranscript(transcript); } catch (_) { return 0; }
+  try { parsed = await readTranscript(files); } catch (_) { return 0; }
   let n = 0;
   for (const item of usageItems(parsed, role, meta, salt)) { if (R.queueItem(spool, item, now).ok) n++; }
   return n;
@@ -400,18 +467,19 @@ async function sessionStart(argv, deps) {
   const rs = readSettings(configPath);
   if (rs.error) return fallbackLine(true, NOTE);
   const c = rs.c;
-  const localOff = c.autostart === false;
-  if (c.report === false) return fallbackLine(!localOff, null);
+  // C1: a local autostart false is final. Nothing is called and nothing is said to SPM.
+  if (c.autostart === false) return fallbackLine(false, null);
+  if (c.report === false) return fallbackLine(true, null);
   const t = sendTarget(c, env);
-  if (t.error) return fallbackLine(!localOff, NOTE);
+  if (t.error) return fallbackLine(true, NOTE);
   const id = await identify({ base: t.base, key: t.key, timeoutMs: identifyTimeout(env) });
-  if (id.kind !== 'ok') return fallbackLine(!localOff, NOTE);
+  if (id.kind !== 'ok') return fallbackLine(true, NOTE);
   try {
     const sdir = R.stateDir(env);
     const st = readHealth(path.join(sdir, 'health.json'));
     R.writeFileAtomic(path.join(sdir, 'health.json'), JSON.stringify({ ...(st || {}), reportOn: id.reportOn }) + '\n', 0o600);
   } catch (_) { /* the state folder is not writable: the answer is still printed */ }
-  return fallbackLine(id.autostart && !localOff, null);
+  return fallbackLine(id.autostart, null);
 }
 
 // settings: posts the given keys to SPM and prints the answer. Local "report": false sends nothing.
@@ -424,6 +492,12 @@ async function settingsCommand(p, c, deps) {
   const body = {};
   if (p.autostart !== undefined) body.autostart = p.autostart;
   if (p.reports !== undefined) body.reports = p.reports;
+  // C5: the kit version, and the session key of the newest session when there is a session id and a salt already.
+  const kv = readKitVersion();
+  if (kv.version) body.kit_version = kv.version;
+  const sid = path.basename(newestTranscript(env.HOME || os.homedir()) || '', '.jsonl');
+  const salt = readSaltIfValid(R.stateDir(env));
+  if (sid && SESSION_RE.test(sid) && salt) body.session_key = sessionKey(sid, salt);
   const r = await callSpm({ base: t.base, key: t.key, method: 'POST', pathname: '/agent/settings', body, timeoutMs: identifyTimeout(env) });
   if (!r) { io.err(`health: ${COULD_NOT_REACH}`); return 7; }
   if (r.status === 401 || r.status === 403 || r.status === 404) { io.err(`health: SPM refused the key (status ${r.status}); nothing changed`); return 6; }
@@ -462,7 +536,10 @@ async function main(argv, deps) {
   const healthFile = path.join(sdir, 'health.json');
   const st = readHealth(healthFile);
   const kv = readKitVersion();
-  const transcript = p.transcript || newestTranscript(home);
+  // C2: the session id is --session, else the --transcript name, else the newest transcript's name.
+  const transcript = p.transcript || (p.session ? null : newestTranscript(home));
+  const sessId = p.session || (transcript ? path.basename(transcript, '.jsonl') : null);
+  const files = sessionFiles(home, sessId, transcript);
   const settingsOff = c.report === false;
   const storedOff = st !== null && st.reportOn === false;
   const offFromSpm = storedOff && !settingsOff;
@@ -485,7 +562,7 @@ async function main(argv, deps) {
     const offNow = settingsOff || offFromSpm;
     let t = null;
     if (!offNow) { t = sendTarget(c, env); if (t.error) { io.err(`health: ${t.error}`); return 2; } }
-    const queued = await queueUsage({ transcript, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
+    const queued = await queueUsage({ files, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
     if (offNow) return offLine(io, `usage queued ${queued}`, offFromSpm);
     return finish(io, await flushWith(t), `usage queued ${queued}`);
   }
@@ -504,11 +581,11 @@ async function main(argv, deps) {
     const containerStartedAt = fresh ? meta.at : (typeof st.containerStartedAt === 'string' ? st.containerStartedAt : meta.at);
     const started = Date.parse(containerStartedAt);
     const uptime = fresh || !Number.isFinite(started) ? 0 : Math.max(0, Math.floor((now - started) / 1000));
-    if (!transcript) {
+    if (files.length === 0) {
       const head = 'no session transcript yet; heartbeat not queued';
       return offNow ? offLine(io, head, offFromSpm) : finish(io, await flushWith(t), head);
     }
-    const sid = (await readTranscript(transcript)).primary;
+    const sid = (await readTranscript(files)).primary;
     // B4: the id is fixed by the salt, the boot id and the log offsets, so a retry after a crash is a duplicate.
     const id = crypto.createHash('sha256').update(sa.salt + (bootId || '') + String(offsetIn) + String(log.offset)).digest('hex').slice(0, 64);
     const item = {
@@ -530,7 +607,7 @@ async function main(argv, deps) {
 
   // start
   if (settingsOff) {
-    const queued = await queueUsage({ transcript, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
+    const queued = await queueUsage({ files, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
     return offLine(io, `usage queued ${queued}`, false);
   }
   const t = sendTarget(c, env);
@@ -561,7 +638,7 @@ async function main(argv, deps) {
   if (id.minKit && kv.version && versionOlder(kv.version, id.minKit)) {
     io.out(`health: warning: kit ${kv.version} is older than the minimum ${id.minKit} that SPM asks for`);
   }
-  const queued = kv.version ? await queueUsage({ transcript, role: p.role, spool, meta: metaOf(), now, salt: sa.salt }) : 0;
+  const queued = kv.version ? await queueUsage({ files, role: p.role, spool, meta: metaOf(), now, salt: sa.salt }) : 0;
   if (!id.reportOn) return offLine(io, `identified ${id.name}; usage queued ${queued}`, true);
   const head = `identified ${id.name}` + (kv.version ? '' : '; kit VERSION missing, usage not queued');
   return finish(io, await flushWith(t), head);

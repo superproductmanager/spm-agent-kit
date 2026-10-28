@@ -793,7 +793,7 @@ test('B1 session-start with SPM not reached prints the default with the fallback
   fs.writeFileSync(config, JSON.stringify({ ...readJson(config), autostart: false }));
   r = await run(kit, home, ['session-start', '--config', config], await deadBase());
   assert.equal(r.code, 0);
-  assert.equal(r.out, 'autostart off (SPM not reached, using the default)\n');
+  assert.equal(r.out, 'autostart off\n', 'a local autostart false is final: no SPM call, no fallback note (C1)');
 });
 
 test('B1 session-start with a refused key still prints one line and exits 0', async () => {
@@ -827,7 +827,7 @@ test('B1 settings posts only the given keys as booleans with the key header only
     assert.equal(r.out, 'settings: autostart off, reports on\n');
     const post = srv.seen.find((q) => q.url.endsWith('/agent/settings'));
     assert.equal(post.method, 'POST');
-    assert.deepEqual(post.json, { autostart: false });
+    assert.deepEqual(post.json, { autostart: false, kit_version: '0.2.0' });
     assert.equal(post.headers['x-spm-api-key'], FAKE_SPM_KEY);
     assert.equal(post.headers['x-spm-user-email'], undefined);
     assert.equal(post.headers['content-type'], 'application/json');
@@ -837,7 +837,7 @@ test('B1 settings posts only the given keys as booleans with the key header only
     const r = await run(kit, home, ['settings', '--autostart', 'on', '--reports', 'off', '--config', config], srv2.base);
     assert.equal(r.code, 0, r.err);
     assert.equal(r.out, 'settings: autostart on, reports off\n');
-    assert.deepEqual(srv2.seen.find((q) => q.url.endsWith('/agent/settings')).json, { autostart: true, reports: false });
+    assert.deepEqual(srv2.seen.find((q) => q.url.endsWith('/agent/settings')).json, { autostart: true, reports: false, kit_version: '0.2.0' });
     assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, false, 'the answer is stored until the next identify');
   } finally { await srv2.close(); }
 });
@@ -920,5 +920,177 @@ test('B3 a batch SPM answers 400 to is dropped with one line naming the code, an
     assert.equal(r.code, 0, r.err);
     assert.deepEqual(r.lines, ['health: dropped 1: field_not_for_kind', 'health: sent 0, kept 0']);
     assert.equal(fs.readFileSync(path.join(stateDir(home), 'setup-report.rejected.jsonl'), 'utf8').split('\n').filter(Boolean).length, 1);
+  } finally { await srv.close(); }
+});
+
+// ---------------------------------------------------------------- Addendum C: C1 autostart off, C2 whole session, C5 settings record
+test('C1 session-start with local "autostart": false prints "autostart off" and sends no request to SPM', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), autostart: false }));
+  const srv = await server(selfWith({ settings: { autostart: true, reports: true } }));
+  try {
+    const r = await run(kit, home, ['session-start', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, 'autostart off\n');
+    assert.equal(srv.seen.length, 0, 'no request reached SPM');
+  } finally { await srv.close(); }
+});
+
+// A sub-agent file: <folder>/<session id>/subagents/<name>.jsonl
+function subFile(home, folder, sid, name, lines) {
+  const dir = path.join(home, '.claude', 'projects', folder, sid, 'subagents');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `${name}.jsonl`);
+  fs.writeFileSync(file, lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
+  return file;
+}
+const callLine = (sid, id, model, input, output) => ({ type: 'assistant', sessionId: sid, message: { id, model, usage: { input_tokens: input, output_tokens: output, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } });
+const usageRows = (srv) => reportsOf(srv).filter((x) => x.kind === 'usage');
+const isRoot = typeof process.getuid === 'function' && process.getuid() === 0;
+
+test('C2 the same session file in two project folders counts once (calls, tokens, compactions)', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  writeTranscript(home, '-copy-proj', SESSION_A, fixtureA());
+  writeSubFixture(home);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config, '--session', SESSION_A], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const rows = usageRows(srv);
+    assert.equal(rows.length, 4, JSON.stringify(rows));
+    const m1 = rows.find((x) => x.model === 'claude-test-model-1');
+    assert.deepEqual(m1.numbers, { calls: 2, input_tokens: 30, output_tokens: 12, cache_write_5m_tokens: 100, cache_write_1h_tokens: 0, cache_read_tokens: 3000, compactions: 2, compaction_pre_tokens: 200000 });
+    assert.equal(m1.session_key, KEY_OF(home, SESSION_A));
+  } finally { await srv.close(); }
+});
+// The sub-agent file used by the copy test: one call on its own model (counted once, next to the copies).
+function writeSubFixture(home) { subFile(home, '-work-proj', SESSION_A, 'agent-copy', [callLine(SESSION_A, 'sub-copy', 'claude-sub-model-9', 1, 1)]); }
+
+test('C2 two sub-agent files add their own calls and model rows to the session totals', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  subFile(home, '-work-proj', SESSION_A, 'agent-one', [callLine(SESSION_A, 'sub-1', 'claude-sub-model-1', 100, 10)]);
+  subFile(home, '-work-proj', SESSION_A, 'agent-two', [callLine(SESSION_A, 'sub-2', 'claude-sub-model-2', 200, 20)]);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config, '--session', SESSION_A], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const rows = usageRows(srv);
+    assert.equal(rows.length, 5, JSON.stringify(rows));
+    const s1 = rows.find((x) => x.model === 'claude-sub-model-1');
+    const s2 = rows.find((x) => x.model === 'claude-sub-model-2');
+    assert.equal(s1.numbers.calls, 1); assert.equal(s1.numbers.input_tokens, 100); assert.equal(s1.numbers.output_tokens, 10);
+    assert.equal(s2.numbers.calls, 1); assert.equal(s2.numbers.input_tokens, 200); assert.equal(s2.numbers.output_tokens, 20);
+    const m1 = rows.find((x) => x.model === 'claude-test-model-1');
+    assert.equal(m1.numbers.calls, 2, 'the main file is unchanged');
+    assert.ok(rows.every((x) => x.session_key === KEY_OF(home, SESSION_A)));
+  } finally { await srv.close(); }
+});
+
+test('C2 a sub-agent line whose sessionId differs counts under the parent session', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, [callLine(SESSION_A, 'main-1', 'claude-test-model-1', 5, 1)]);
+  subFile(home, '-work-proj', SESSION_A, 'agent-odd', [callLine(SESSION_B, 'sub-odd', 'claude-sub-model-3', 40, 4)]);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config, '--session', SESSION_A], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const rows = usageRows(srv);
+    const sub = rows.find((x) => x.model === 'claude-sub-model-3');
+    assert.ok(sub, JSON.stringify(rows));
+    assert.equal(sub.session_key, KEY_OF(home, SESSION_A));
+    assert.equal(sub.numbers.input_tokens, 40);
+    assert.ok(rows.every((x) => x.session_key !== KEY_OF(home, SESSION_B)), 'nothing is filed under the sessionId the line carries');
+  } finally { await srv.close(); }
+});
+
+test('C2 a file that cannot be read is skipped and the others still count (directory named *.jsonl)', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  subFile(home, '-work-proj', SESSION_A, 'agent-good', [callLine(SESSION_A, 'sub-good', 'claude-sub-model-4', 7, 3)]);
+  fs.mkdirSync(path.join(home, '.claude', 'projects', '-work-proj', SESSION_A, 'subagents', 'agent-dir.jsonl'), { recursive: true });
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config, '--session', SESSION_A], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const rows = usageRows(srv);
+    assert.equal(rows.find((x) => x.model === 'claude-sub-model-4').numbers.input_tokens, 7);
+    assert.equal(rows.find((x) => x.model === 'claude-test-model-1').numbers.calls, 2);
+  } finally { await srv.close(); }
+});
+
+test('C2 a sub-agent file with mode 000 is skipped and the others still count', { skip: isRoot ? 'running as root: mode 000 does not stop root, so this case is not run' : false }, async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  const locked = subFile(home, '-work-proj', SESSION_A, 'agent-locked', [callLine(SESSION_A, 'sub-locked', 'claude-sub-model-5', 9, 1)]);
+  fs.chmodSync(locked, 0o000);
+  subFile(home, '-work-proj', SESSION_A, 'agent-good', [callLine(SESSION_A, 'sub-good', 'claude-sub-model-4', 7, 3)]);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config, '--session', SESSION_A], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const rows = usageRows(srv);
+    assert.ok(rows.some((x) => x.model === 'claude-sub-model-4'));
+    assert.ok(!rows.some((x) => x.model === 'claude-sub-model-5'), 'the unreadable file adds nothing');
+  } finally { await srv.close(); fs.chmodSync(locked, 0o600); }
+});
+
+test('C2 with no --session and no --transcript the id is the newest transcript name, and its sub-agent files in any folder count', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 60);
+  subFile(home, '-other-proj', SESSION_A, 'agent-far', [callLine(SESSION_A, 'sub-far', 'claude-sub-model-6', 11, 2)]);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const sub = usageRows(srv).find((x) => x.model === 'claude-sub-model-6');
+    assert.ok(sub, 'the sub-agent file in another folder counts');
+    assert.equal(sub.numbers.input_tokens, 11);
+  } finally { await srv.close(); }
+});
+
+test('C2 a --session that is not 8 to 64 letters, digits or dashes exits 2 with a clear message and sends nothing', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  const srv = await server();
+  try {
+    for (const bad of ['short', '../../etc/passwd', 'has space here', 'under_score_id', 'x'.repeat(65)]) {
+      const r = await run(kit, home, ['usage', '--role', 'main', '--config', config, '--session', bad], srv.base);
+      assert.equal(r.code, 2, bad);
+      assert.ok(hasLine(r.lines, /--session must be 8 to 64 letters, digits or dashes/), JSON.stringify(r.lines));
+    }
+    const hb = await run(kit, home, ['heartbeat', '--config', config, '--session', '../x'], srv.base);
+    assert.equal(hb.code, 2);
+    assert.equal(srv.seen.length, 0);
+  } finally { await srv.close(); }
+});
+
+test('C5 settings posts kit_version and the newest session_key when a salt exists', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 60);
+  fs.mkdirSync(stateDir(home), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(stateDir(home), 'report-salt'), 'ab'.repeat(16) + '\n', { mode: 0o600 });
+  const srv = await server(settingsHandler(200, { autostart: false, reports: true }));
+  try {
+    const r = await run(kit, home, ['settings', '--autostart', 'off', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(srv.seen.find((q) => q.url.endsWith('/agent/settings')).json, { autostart: false, kit_version: '0.2.0', session_key: KEY_OF(home, SESSION_A) });
+  } finally { await srv.close(); }
+});
+
+test('C5 settings omits session_key with no transcript or no salt, still sends kit_version, and creates no salt', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  const srv = await server(settingsHandler(200, { autostart: false, reports: true }));
+  try {
+    const r = await run(kit, home, ['settings', '--autostart', 'off', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(srv.seen.find((q) => q.url.endsWith('/agent/settings')).json, { autostart: false, kit_version: '0.2.0' });
+    writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 60);
+    const r2 = await run(kit, home, ['settings', '--autostart', 'on', '--config', config], srv.base);
+    assert.equal(r2.code, 0, r2.err);
+    const last = srv.seen.filter((q) => q.url.endsWith('/agent/settings')).pop().json;
+    assert.deepEqual(last, { autostart: true, kit_version: '0.2.0' });
+    assert.equal(fs.existsSync(path.join(stateDir(home), 'report-salt')), false, 'settings does not create the salt');
   } finally { await srv.close(); }
 });
