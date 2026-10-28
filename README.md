@@ -59,11 +59,15 @@ f=$(mktemp) && curl --proto '=https' -fsSL https://raw.githubusercontent.com/sup
 - `setup-env.sh` then writes what Claude needs into the user's own Claude folder, which every session reads:
   - `~/.spm-agent-state/config.json` (folder 0700, file 0600): the agent's name and address, `app_id`, plus `ignore_agents` and `transport` when you give them. No key and no session id. Rewritten on every run.
   - `~/.claude/skills/spm-agent/SKILL.md`: copied from the kit's `skill/spm-agent/SKILL.md`, with the kit folder filled in. Replaced on every run.
-  - `~/.claude/settings.json`: the six allow rules under "Allow rules" below are merged in. Other keys and rules are kept. A file that is a symbolic link, is not valid JSON, or is not a JSON object is refused with exit code 2 and left untouched.
+  - `~/.claude/settings.json`: the seven allow rules under "Allow rules" below are merged in. Other keys and rules are kept. A file that is a symbolic link, is not valid JSON, or is not a JSON object is refused with exit code 2 and left untouched.
   - the Firebase SDK, unless you pass `--no-sdk`.
 - On success it prints one line: `spm-agent-kit <version>: set up for <agent name>`.
 
-Setup flags: `--app-id <value>` (required), `--ignore-agent <name>` (repeatable), `--transport node|webchannel`, `--no-sdk`, `--help`. The name may use 1 to 60 letters, digits, spaces, dots, brackets and hyphens.
+Setup flags: `--app-id <value>` (required), `--ignore-agent <name>` (repeatable), `--transport node|webchannel`, `--autostart on|off`, `--no-sdk`, `--help`.
+
+The name may use 1 to 60 letters, digits, spaces, dots, brackets and hyphens.
+
+`--autostart off` writes no CLAUDE.md block, and removes the kit's block if one is there; the agent then starts only when someone asks for it.
 
 **The marker rule.** The installer replaces an existing folder only when that folder carries
 `.spm-agent-kit`. An empty folder is installed into. Any other folder is refused with exit
@@ -86,7 +90,7 @@ gh attestation verify spm-agent-kit-<version>.tar.gz --repo superproductmanager/
 
 ## Allow rules
 
-Setup adds these six `permissions.allow` rules to `~/.claude/settings.json`, so the agent runs its own scripts without a prompt for each call. Each rule is built from the kit folder that `setup-env.sh` ran from (`<kit>` below), so the rules are absolute:
+Setup adds these seven `permissions.allow` rules to `~/.claude/settings.json`, so the agent runs its own scripts without a prompt for each call. The kit never sets the permission mode. Each rule is built from the kit folder that `setup-env.sh` ran from (`<kit>` below), so the rules are absolute:
 
 - `Bash(node <kit>/agent-reply.cjs *)`
 - `Bash(node <kit>/agent-ack.cjs *)`
@@ -94,6 +98,7 @@ Setup adds these six `permissions.allow` rules to `~/.claude/settings.json`, so 
 - `Bash(node <kit>/agent-relay.cjs *)`
 - `Bash(node <kit>/agent-selfcheck.cjs *)`
 - `Bash(bash <kit>/start.sh *)`
+- `Bash(node <kit>/agent-health.cjs *)`
 
 A command matches a rule only when it starts with that same absolute path, unquoted (for example `node /root/spm-agent-kit/agent-reply.cjs --config ...`). A variable or a quoted path does not match, and Claude will ask for approval. The skill is written with the kit path already filled in, so its commands match these rules.
 

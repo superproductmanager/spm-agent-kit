@@ -6,7 +6,8 @@
 #   --app-id <value>              optional (Addendum A1): the public SPM app id, 20 to 60 of A-Z a-z 0-9 _ - . Given: validated and written.
 #                                 Not given: an app id already in the config is kept; agent-health.cjs start writes it from SPM otherwise.
 #   --report on|off               optional (Addendum A4): off writes "report": false into the config (no health reports are sent); on (default) writes nothing
-#   --autostart on|off            optional (Addendum B1): off writes "autostart": false into the config; on (default) writes nothing
+#   --autostart on|off            optional (Addendum B1): off writes "autostart": false into the config, writes no CLAUDE.md block,
+#                                 and removes the kit's block if one is there (Addendum C1); on (default) writes nothing
 #   --name <text>                 optional (0.2.0): the agent's name as people tag it, 1 to 60 of A-Z a-z 0-9, space, dot, brackets, hyphen.
 #                                 Give it with --email. Without both, the agent is identified later by agent-health.cjs start.
 #   --email <address>             optional (0.2.0): the agent's address: lower case, ending in @agents.invalid. Give it with --name.
@@ -26,6 +27,7 @@
 #   ~/.claude/CLAUDE.md                   (Addendum B1) the block from <kit>/hook/claude-md-block.md, between the lines
 #                                         <!-- spm-agent-kit:start --> and <!-- spm-agent-kit:end -->; the two literal paths replaced;
 #                                         created at 0600 if missing; a re-run replaces the block; text outside the markers is kept byte for byte
+#                                         (Addendum C1: with --autostart off, no block is written and the kit's block is removed; no file is created)
 #   ~/.spm-agent-state/setup-report.jsonl one line per step (config, skill, claude-md, settings, sdk), setup report spool (0.2.0)
 #   ~/.spm-agent-state/report-salt        32 random lower-case hex, mode 0600, written once (Addendum A2); kept on every later run
 # Then runs cloud-agent-setup.sh --apply (the Firebase SDK) unless --no-sdk, and agent-selfcheck.cjs --setup (its result never
@@ -53,7 +55,7 @@ usage() {
 usage: setup-env.sh [--app-id <value>] [--name <text> --email <address>] [--ignore-agent <name>]... [--transport node|webchannel] [--report on|off] [--autostart on|off] [--no-sdk] [--help]
   --app-id        optional: the public SPM app id, 20 to 60 of A-Z a-z 0-9 _ - (kept from the config when not given)
   --report        on (default) or off: off sends no health reports
-  --autostart     on (default) or off: off turns the agent's automatic start off
+  --autostart     on (default) or off: off turns the agent's automatic start off (no CLAUDE.md block is written, and the kit's block is removed)
   --name          optional: the agent's name as people tag it, 1 to 60 of A-Z a-z 0-9, space, dot, brackets, hyphen (give it with --email)
   --email         optional: the agent's address, lower case, ending in @agents.invalid (give it with --name)
   --ignore-agent  another agent whose comments are not tags for this one (repeatable)
@@ -196,6 +198,8 @@ const e = process.env;
 const KIT = e.SPM_SETUP_KIT;
 const HOME = e.SPM_SETUP_HOME;
 const KV = e.SPM_SETUP_KIT_VERSION || '';
+// Rework C1: with --autostart off the CLAUDE.md step removes the kit's block (never writes one).
+const AUTOSTART_OFF = e.SPM_SETUP_AUTOSTART === 'off';
 const RULES = [
   `Bash(node ${KIT}/agent-reply.cjs *)`,
   `Bash(node ${KIT}/agent-ack.cjs *)`,
@@ -250,13 +254,31 @@ try {
     cmRaw = fs.readFileSync(cmFile, 'utf8');
   }
   let cmBlock = null;
-  try {
-    cmBlock = fs.readFileSync(BLOCK_FILE, 'utf8')
-      .split('/root/spm-agent-kit').join(KIT)
-      .split('/root/.spm-agent-state').join(configDir);
-  } catch (_) { cmBlock = null; }
+  if (!AUTOSTART_OFF) {
+    try {
+      cmBlock = fs.readFileSync(BLOCK_FILE, 'utf8')
+        .split('/root/spm-agent-kit').join(KIT)
+        .split('/root/.spm-agent-state').join(configDir);
+    } catch (_) { cmBlock = null; }
+  }
   let cmNew = null;
-  if (cmBlock !== null) {
+  if (AUTOSTART_OFF) {
+    // Rework C1: remove the lines from the start marker through the end marker, inclusive; nothing else changes.
+    if (cmSt !== null) {
+      const nS = cmRaw.split(START_MARK).length - 1;
+      const nE = cmRaw.split(END_MARK).length - 1;
+      if (nS === 0 && nE === 0) {
+        cmNew = cmRaw;
+      } else if (nS === 1 && nE === 1 && cmRaw.indexOf(START_MARK) < cmRaw.indexOf(END_MARK)) {
+        const a = cmRaw.indexOf(START_MARK);
+        let b = cmRaw.indexOf(END_MARK) + END_MARK.length;
+        if (cmRaw.charAt(b) === '\n') b += 1;
+        cmNew = cmRaw.slice(0, a) + cmRaw.slice(b);
+      } else {
+        refuse('~/.claude/CLAUDE.md has unbalanced or repeated spm-agent-kit markers; refused, file untouched');
+      }
+    }
+  } else if (cmBlock !== null) {
     const body = cmBlock.replace(/\n+$/, '');
     const core = START_MARK + '\n' + body + '\n' + END_MARK;
     const nS = cmRaw.split(START_MARK).length - 1;
@@ -339,13 +361,11 @@ try {
   SPOOL('skill', 'pass');
 
   // Addendum B1: the CLAUDE.md block. A missing block file is a fail line; the file is then left alone.
-  if (cmNew === null) {
-    SPOOL('claude-md', 'fail', 'missing_claude_md_block');
-  } else if (cmNew !== cmRaw || cmSt === null) {
+  const writeCm = (text) => {
     const cmTmp = path.join(claudeDir, '.CLAUDE.md.' + process.pid + '.tmp');
     try {
       fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 });
-      fs.writeFileSync(cmTmp, cmNew, { mode: cmMode });
+      fs.writeFileSync(cmTmp, text, { mode: cmMode });
       fs.chmodSync(cmTmp, cmMode);
       fs.renameSync(cmTmp, cmFile);
     } catch (err) {
@@ -353,6 +373,15 @@ try {
       SPOOL('claude-md', 'fail', 'write_failed');
       throw err;
     }
+  };
+  if (AUTOSTART_OFF) {
+    // Rework C1: write only when the block was there; a file with no block (or no file) is left alone.
+    if (cmNew !== null && cmNew !== cmRaw) writeCm(cmNew);
+    SPOOL('claude-md', 'skip', 'autostart_off');
+  } else if (cmNew === null) {
+    SPOOL('claude-md', 'fail', 'missing_claude_md_block');
+  } else if (cmNew !== cmRaw || cmSt === null) {
+    writeCm(cmNew);
     SPOOL('claude-md', 'pass');
   } else {
     SPOOL('claude-md', 'pass');

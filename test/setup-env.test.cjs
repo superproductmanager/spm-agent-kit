@@ -900,6 +900,94 @@ test('--autostart off writes autostart false into the config; on removes it; not
   } finally { cleanup(bad); }
 });
 
+// ---- Rework C1: --autostart off writes no CLAUDE.md block and removes the kit's block ----
+test('C1 --autostart off with no CLAUDE.md creates none (block source present), spools claude-md skip autostart_off, exits 0', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    const r = runSetup(sb, ok(['--autostart', 'off', '--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.existsSync(CLAUDE_MD(sb)), false, 'CLAUDE.md was created');
+    const cl = spoolLines(sb).find((l) => l.step === 'claude-md');
+    assert.deepEqual([cl.status, cl.code], ['skip', 'autostart_off']);
+  } finally { cleanup(sb); }
+});
+
+test('C1 --autostart off removes only the kit block: other text stays byte for byte, the file keeps its mode', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    const other = '# My notes\n\nKeep this line, ümlaut and all.\n';
+    fs.writeFileSync(CLAUDE_MD(sb), other + `${START_MARK}\nKit folder: ${sb.kit}\n${END_MARK}\n`);
+    fs.chmodSync(CLAUDE_MD(sb), 0o640);
+    const r = runSetup(sb, ok(['--autostart', 'off', '--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.readFileSync(CLAUDE_MD(sb), 'utf8'), other);
+    assert.equal(mode(CLAUDE_MD(sb)), 0o640);
+    assert.equal(readJson(CONFIG(sb)).autostart, false);
+  } finally { cleanup(sb); }
+});
+
+test('C1 --autostart off on a CLAUDE.md without the kit block leaves it byte-identical, and spools skip autostart_off', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    fs.writeFileSync(CLAUDE_MD(sb), 'no block here\r\nlast line without newline');
+    const before = fs.readFileSync(CLAUDE_MD(sb));
+    const r = runSetup(sb, ok(['--autostart', 'off', '--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.deepEqual(fs.readFileSync(CLAUDE_MD(sb)), before);
+    const cl = spoolLines(sb).find((l) => l.step === 'claude-md');
+    assert.deepEqual([cl.status, cl.code], ['skip', 'autostart_off']);
+  } finally { cleanup(sb); }
+});
+
+test('C1 --autostart off still exits 0 when the block source file is deleted, and writes no fail line', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: false });
+  try {
+    const r = runSetup(sb, ok(['--autostart', 'off', '--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.existsSync(CLAUDE_MD(sb)), false);
+    const cl = spoolLines(sb).find((l) => l.step === 'claude-md');
+    assert.deepEqual([cl.status, cl.code], ['skip', 'autostart_off']);
+    assert.equal(spoolLines(sb).some((l) => l.status === 'fail'), false, 'a fail line was spooled');
+  } finally { cleanup(sb); }
+});
+
+test('C1 --autostart off on a symlinked CLAUDE.md is refused as on is: exit 2, one line, link and target untouched', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    const target = path.join(sb.root, 'target.md');
+    fs.writeFileSync(target, `${START_MARK}\nold\n${END_MARK}\n`);
+    fs.symlinkSync(target, CLAUDE_MD(sb));
+    const r = runSetup(sb, ok(['--autostart', 'off', '--no-sdk']));
+    assert.equal(r.status, 2);
+    assertOneLine(r);
+    assert.ok(fs.lstatSync(CLAUDE_MD(sb)).isSymbolicLink());
+    assert.equal(fs.readFileSync(target, 'utf8'), `${START_MARK}\nold\n${END_MARK}\n`);
+  } finally { cleanup(sb); }
+});
+
+// ---- Rework C4: the kit never sets the permission mode ----
+test('C4 setup leaves an existing permissions.defaultMode unchanged, and adds no defaultMode when there was none', () => {
+  const withMode = sandbox({ version: '0.2.0\n' });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(withMode), { recursive: true });
+    fs.writeFileSync(SETTINGS(withMode), JSON.stringify({ permissions: { defaultMode: 'acceptEdits', allow: [] } }, null, 2) + '\n');
+    assert.equal(runSetup(withMode, ok(['--no-sdk'])).status, 0);
+    assert.equal(readJson(SETTINGS(withMode)).permissions.defaultMode, 'acceptEdits');
+    assert.deepEqual(readJson(SETTINGS(withMode)).permissions.allow, rulesFor(withMode.kit));
+  } finally { cleanup(withMode); }
+  const noMode = sandbox({ version: '0.2.0\n' });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(noMode), { recursive: true });
+    fs.writeFileSync(SETTINGS(noMode), JSON.stringify({ permissions: { allow: [] } }, null, 2) + '\n');
+    assert.equal(runSetup(noMode, ok(['--no-sdk'])).status, 0);
+    assert.equal('defaultMode' in readJson(SETTINGS(noMode)).permissions, false, 'defaultMode was added');
+    assert.equal(/defaultMode/.test(fs.readFileSync(SETTINGS(noMode), 'utf8')), false);
+  } finally { cleanup(noMode); }
+});
+
 // ---- Addendum item 5: the six old rules gain only the seventh ----
 test('settings with the six old allow rules gains only the agent-health rule, in place order, nothing else changed', () => {
   const sb = sandbox({ version: '0.2.0\n' });

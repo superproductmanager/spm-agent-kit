@@ -23,6 +23,10 @@ The local commit hook only watches commits made through Claude's Bash tool. A co
 (from a plain terminal, an editor, or another tool) is not checked by that hook. For those commits,
 GitHub push protection is the backstop: it blocks a push that contains a known key format.
 
+## Session log files
+
+From the session's log files under ~/.claude/projects/, the kit reads only these fields: type, subtype, sessionId, uuid, timestamp, message.id, message.model, the numbers in message.usage, and compactMetadata.preTokens. It never reads or keeps any text from those files, and it sends SPM only totals per session, model and price tier.
+
 ## Supported versions
 
 Only the latest release tag receives security fixes.
