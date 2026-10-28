@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # start.sh --config <abs path> [--state-dir <abs path>]
 # Starts the SPM agent listener for one settings file (K-A3 item 3).
+#   0. (Addendum B2) Runs node <kit>/agent-health.cjs start --role listener --config <cfg> first. Its exit 0 lets the
+#      rest run; any other exit prints its output and exits 1 before the selfcheck.
 #   1. Runs agent-selfcheck.cjs. On a failure it prints the FAIL line (or the selfcheck's own message), exits 1,
 #      and starts nothing.
 #   2. On success it prints ONE line, {"kind":"start","log":"<state>/listener.log","version":"<v>"}, and runs
@@ -8,9 +10,9 @@
 # State dir: --state-dir, else $SPM_AGENT_STATE_DIR, else $HOME/.spm-agent-state. It is created 700 and refused
 # when it is inside a git work tree (a state folder must never be committed by accident).
 # Version: the VERSION file next to this script (a plain version string), else "dev".
-# Test-only overrides: SPM_AGENT_START_SELFCHECK_CMD and SPM_AGENT_START_LISTENER_CMD replace the two commands
-# (run with bash -c). KEEPALIVE_MAX_RUNS is read by the wrapper and is for tests only.
-# EXIT: 0 when the wrapper exits 0; 1 when the selfcheck fails; 2 for a usage error or a refused state dir.
+# Test-only overrides: SPM_AGENT_START_HEALTH_CMD, SPM_AGENT_START_SELFCHECK_CMD and SPM_AGENT_START_LISTENER_CMD replace
+# the three commands (run with bash -c). KEEPALIVE_MAX_RUNS is read by the wrapper and is for tests only.
+# EXIT: 0 when the wrapper exits 0; 1 when the identify or the selfcheck fails; 2 for a usage error or a refused state dir.
 set -u
 
 KIT="$(cd "$(dirname "$0")" && pwd)"
@@ -51,6 +53,19 @@ case "$NODE_MAJ" in ''|*[!0-9]*) NODE_OK=0 ;; *) case "$NODE_MIN" in ''|*[!0-9]*
 if [ "$NODE_OK" -ne 1 ]; then
   echo "start.sh: Node 22.21 or newer is needed (found ${NODE_VER_RAW:-none})" >&2
   exit 2
+fi
+
+# 0. Identify (Addendum B2): first, so a failed identify changes nothing else. Its output is printed only on failure.
+if [ -n "${SPM_AGENT_START_HEALTH_CMD:-}" ]; then
+  HC_CMD="$SPM_AGENT_START_HEALTH_CMD"
+else
+  HC_CMD="node $(printf '%q' "$KIT/agent-health.cjs") start --role listener --config $(printf '%q' "$CONFIG")"
+fi
+HC_OUT="$(bash -c "$HC_CMD" 2>&1)"
+HC_RC=$?
+if [ "$HC_RC" -ne 0 ]; then
+  if [ -n "$HC_OUT" ]; then printf '%s\n' "$HC_OUT"; fi
+  exit 1
 fi
 
 # 1. Selfcheck. Its output is captured: on success only the start line is printed.

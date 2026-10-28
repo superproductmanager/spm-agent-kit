@@ -12,7 +12,7 @@
 # The install folder is only ever replaced when it carries the kit marker .spm-agent-kit
 # (one line: "spm-agent-kit <version>"). An empty folder is installed into. Anything else is refused.
 #
-# Setup report (0.2.0): each of the download, checksum and unpack steps appends one JSON line to
+# Setup report (0.2.0): each of the download, checksum and unpack steps appends one JSON line (kit_version from <version>, Addendum B7) to
 # $HOME/.spm-agent-state/setup-report.jsonl (folder 0700, file 0600). A run id is written to
 # $HOME/.spm-agent-state/setup-run-id on every run. Spool lines never go to stdout, and a failed write never stops the install.
 #
@@ -68,8 +68,8 @@ spool_line() {
     umask 077
     mkdir -p "$STATE_DIR" && chmod 0700 "$STATE_DIR" || exit 1
     [ ! -L "$f" ] || exit 1
-    printf '{"id":"%s","kind":"setup","role":"setup","run_id":"%s","step":"%s","status":"%s"%s,"at":"%s"}\n' \
-      "$id" "$RUN_ID" "$1" "$2" "$code_part" "$at" >> "$f" && chmod 0600 "$f"
+    printf '{"id":"%s","kind":"setup","role":"setup","run_id":"%s","step":"%s","status":"%s"%s,"at":"%s","kit_version":"%s"}\n' \
+      "$id" "$RUN_ID" "$1" "$2" "$code_part" "$at" "$VERSION" >> "$f" && chmod 0600 "$f"
   ) 2>/dev/null
   return 0
 }

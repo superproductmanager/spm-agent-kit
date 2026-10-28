@@ -69,7 +69,7 @@ test('an upper-case address is refused', () => {
 });
 
 test('an address outside the agents.invalid domain is refused', () => {
-  const p = write('domain.json', { agent: { name: 'Example agent', email: 'spm-example-agent@example.com' } });
+  const p = write('domain.json', { agent: { name: 'Example agent', email: 'spm-example-agent@example.invalid' } });
   assert.throws(() => loadConfig({ argv: ['--config', p], env: {} }), ConfigError);
 });
 
@@ -202,4 +202,17 @@ test('a report value that is not a boolean is refused', () => {
 test('app_id may be absent: the strict loader accepts it and reports null', () => {
   const p = write('noappid.json', { agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' } });
   assert.equal(loadConfig({ argv: ['--config', p], env: {} }).appId, null);
+});
+
+// ---- Addendum B1: autostart setting (optional, default on) ----
+test('autostart defaults to true when absent, and false is read as false', () => {
+  const on = write('autostart-absent.json', { agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' } });
+  assert.equal(loadConfig({ argv: ['--config', on], env: {} }).autostart, true);
+  const off = write('autostart-off.json', { app_id: APP, autostart: false });
+  assert.equal(loadConfigOptionalAgent({ argv: ['--config', off], env: {} }).autostart, false);
+});
+
+test('an autostart value that is not a boolean is refused', () => {
+  const p = write('autostart-bad.json', { app_id: APP, autostart: 'off' });
+  assert.throws(() => loadConfigOptionalAgent({ argv: ['--config', p], env: {} }), (e) => e instanceof ConfigError && /autostart must be true or false/.test(e.message));
 });

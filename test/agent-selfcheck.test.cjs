@@ -622,3 +622,35 @@ test('setup: a second run inside the hour reuses the run id', async () => {
     assert.equal(ids.size, 1, 'one run id across both runs');
   } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+// ---- Addendum B6: --setup goes through the proxy whenever HTTPS_PROXY is set ----
+// A local proxy answers every CONNECT with 502 and records the target, so no real host is reached.
+test('setup (B6): with HTTPS_PROXY set, the checks go through the proxy (CONNECT to the SPM and Google hosts)', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  const targets = [];
+  const proxy = http.createServer((req, res) => { res.writeHead(502); res.end(); });
+  proxy.on('connect', (req, sock) => { targets.push(req.url); sock.end('HTTP/1.1 502 Bad Gateway\r\n\r\n'); });
+  await new Promise((resolve) => proxy.listen(0, '127.0.0.1', resolve));
+  try {
+    const cfg = setupConfig({ app_id: SETUP_CONFIG_APP });
+    const r = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, [path.join(kit, 'agent-selfcheck.cjs'), '--setup', '--config', cfg], {
+        env: { PATH: process.env.PATH, HOME: home, HTTPS_PROXY: `http://127.0.0.1:${proxy.address().port}` },
+      });
+      let stdout = '';
+      child.stdout.on('data', (c) => { stdout += c; });
+      child.on('error', reject);
+      child.on('close', (code) => resolve({ code, stdout }));
+    });
+    assert.equal(r.code, 0);
+    assert.equal(r.stdout, '');
+    assert.ok(targets.includes('asia-south1-litethink.cloudfunctions.net:443'), 'the SPM host was not called through the proxy: ' + JSON.stringify(targets));
+    assert.ok(targets.includes('firestore.asia-southeast1.rep.googleapis.com:443'), 'the Google host was not called through the proxy: ' + JSON.stringify(targets));
+    assert.deepEqual(spoolOf(home).map((l) => [l.step, l.status, l.code]), [['spm-host', 'fail', 'no_answer'], ['google-host', 'fail', 'no_answer']]);
+  } finally {
+    await new Promise((r) => proxy.close(r));
+    fs.rmSync(kit, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});

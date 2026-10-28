@@ -40,7 +40,7 @@ function install(args, env, home = HOME) {
   });
 }
 
-// 0.2.0 setup report spool: one JSON line per step in <home>/.spm-agent-state/setup-report.jsonl.
+// 0.2.0 setup report spool: one JSON line per step in <home>/.spm-agent-state/setup-report.jsonl (kit_version from the version argument, Addendum B7).
 const SPOOL_RE = {
   id: /^[a-f0-9-]{16,64}$/,
   run_id: /^[a-f0-9-]{8,64}$/,
@@ -250,7 +250,7 @@ test('a good install spools download, checksum and unpack as pass, with the spoo
       assert.match(l.step, SPOOL_RE.step);
       assert.equal(l.code, undefined, 'a pass has no code');
       assert.match(l.at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
-      assert.equal(l.kit_version, undefined, 'the installer does not fill kit_version');
+      assert.equal(l.kit_version, VERSION, 'Addendum B7: the installer fills kit_version from its version argument');
     }
     assert.equal(new Set(lines.map((l) => l.id)).size, 3, 'each line has its own id');
     assert.equal(fs.statSync(path.join(home, '.spm-agent-state')).mode & 0o777, 0o700);

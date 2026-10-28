@@ -6,6 +6,7 @@
 #   --app-id <value>              optional (Addendum A1): the public SPM app id, 20 to 60 of A-Z a-z 0-9 _ - . Given: validated and written.
 #                                 Not given: an app id already in the config is kept; agent-health.cjs start writes it from SPM otherwise.
 #   --report on|off               optional (Addendum A4): off writes "report": false into the config (no health reports are sent); on (default) writes nothing
+#   --autostart on|off            optional (Addendum B1): off writes "autostart": false into the config; on (default) writes nothing
 #   --name <text>                 optional (0.2.0): the agent's name as people tag it, 1 to 60 of A-Z a-z 0-9, space, dot, brackets, hyphen.
 #                                 Give it with --email. Without both, the agent is identified later by agent-health.cjs start.
 #   --email <address>             optional (0.2.0): the agent's address: lower case, ending in @agents.invalid. Give it with --name.
@@ -20,10 +21,12 @@
 #   ~/.claude/skills/spm-agent/SKILL.md   copied from skill/spm-agent/SKILL.md, with the literal
 #                                         /root/spm-agent-kit replaced by this kit folder and
 #                                         /root/.spm-agent-state by $HOME/.spm-agent-state; replaced on every run
-#   ~/.claude/settings.json               the seven allow rules (absolute, from this kit folder) merged in, and (0.2.0) one SessionStart
-#                                         hook entry running cat on <kit>/hook/session-start.txt; other keys and rules kept; written
-#                                         through a temp file in the same folder, then renamed; no change when already there
-#   ~/.spm-agent-state/setup-report.jsonl one line per step (config, skill, settings, hook, sdk), setup report spool (0.2.0)
+#   ~/.claude/settings.json               the seven allow rules (absolute, from this kit folder) merged in; other keys and rules kept;
+#                                         written through a temp file in the same folder, then renamed; no change when already there
+#   ~/.claude/CLAUDE.md                   (Addendum B1) the block from <kit>/hook/claude-md-block.md, between the lines
+#                                         <!-- spm-agent-kit:start --> and <!-- spm-agent-kit:end -->; the two literal paths replaced;
+#                                         created at 0600 if missing; a re-run replaces the block; text outside the markers is kept byte for byte
+#   ~/.spm-agent-state/setup-report.jsonl one line per step (config, skill, claude-md, settings, sdk), setup report spool (0.2.0)
 #   ~/.spm-agent-state/report-salt        32 random lower-case hex, mode 0600, written once (Addendum A2); kept on every later run
 # Then runs cloud-agent-setup.sh --apply (the Firebase SDK) unless --no-sdk, and agent-selfcheck.cjs --setup (its result never
 # changes the exit code).
@@ -47,9 +50,10 @@ if [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then KIT_VERSION="$VERSION"; fi
 
 usage() {
   cat <<'USAGE'
-usage: setup-env.sh [--app-id <value>] [--name <text> --email <address>] [--ignore-agent <name>]... [--transport node|webchannel] [--report on|off] [--no-sdk] [--help]
+usage: setup-env.sh [--app-id <value>] [--name <text> --email <address>] [--ignore-agent <name>]... [--transport node|webchannel] [--report on|off] [--autostart on|off] [--no-sdk] [--help]
   --app-id        optional: the public SPM app id, 20 to 60 of A-Z a-z 0-9 _ - (kept from the config when not given)
   --report        on (default) or off: off sends no health reports
+  --autostart     on (default) or off: off turns the agent's automatic start off
   --name          optional: the agent's name as people tag it, 1 to 60 of A-Z a-z 0-9, space, dot, brackets, hyphen (give it with --email)
   --email         optional: the agent's address, lower case, ending in @agents.invalid (give it with --name)
   --ignore-agent  another agent whose comments are not tags for this one (repeatable)
@@ -67,6 +71,7 @@ NAME=""
 EMAIL=""
 APP_ID=""
 REPORT=""
+AUTOSTART=""
 TRANSPORT=""
 NAME_GIVEN=0
 EMAIL_GIVEN=0
@@ -78,7 +83,7 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --no-sdk) SDK=0; shift ;;
-    --name|--email|--app-id|--ignore-agent|--transport|--report)
+    --name|--email|--app-id|--ignore-agent|--transport|--report|--autostart)
       if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
         fail "$1 needs a value (see --help)"
       fi
@@ -90,6 +95,7 @@ while [ $# -gt 0 ]; do
         --ignore-agent) HAS_IGNORE=1; IGNORE_LIST="$IGNORE_LIST$2"$'\n' ;;
         --transport) TRANSPORT="$2" ;;
         --report) REPORT="$2" ;;
+        --autostart) AUTOSTART="$2" ;;
       esac
       shift 2
       ;;
@@ -120,6 +126,10 @@ case "$REPORT" in
   ""|on|off) ;;
   *) fail "--report must be on or off (see --help)" ;;
 esac
+case "$AUTOSTART" in
+  ""|on|off) ;;
+  *) fail "--autostart must be on or off (see --help)" ;;
+esac
 case "$TRANSPORT" in
   ""|node|webchannel) ;;
   *) fail "--transport must be node or webchannel" ;;
@@ -131,10 +141,6 @@ if [ "$HAS_IGNORE" -eq 1 ]; then
   done <<< "${IGNORE_LIST%$'\n'}"
 fi
 [ -n "${HOME:-}" ] || fail "HOME is not set"
-# The session hook command is written as cat '<kit>/hook/session-start.txt', so a single quote in the kit path cannot be written safely.
-case "$KIT" in
-  *"'"*) fail "the kit folder path contains a single quote, so the session hook cannot be written there (nothing written)" ;;
-esac
 [ -f "$KIT/skill/spm-agent/SKILL.md" ] || { echo "setup-env: the kit has no skill/spm-agent/SKILL.md; nothing written" >&2; exit 1; }
 
 CLAUDE_DIR="$HOME/.claude"
@@ -183,7 +189,7 @@ function spool(home, kitVersion, rec) {
 JS
 )"
 
-# The node step: checks the settings file, then writes config, skill, settings (rules and hook) and spools each step.
+# The node step: checks the settings file and CLAUDE.md, then writes config, skill, CLAUDE.md and settings, and spools each step.
 # It prints nothing on success. A refusal writes nothing and exits 2 (no spool line: nothing was set up).
 MAIN_JS="$(cat <<'JS'
 const e = process.env;
@@ -199,8 +205,9 @@ const RULES = [
   `Bash(bash ${KIT}/start.sh *)`,
   `Bash(node ${KIT}/agent-health.cjs *)`,
 ];
-const HOOK_CMD = `cat '${KIT}/hook/session-start.txt'`;
-const HOOK_FILE = path.join(KIT, 'hook', 'session-start.txt');
+const BLOCK_FILE = path.join(KIT, 'hook', 'claude-md-block.md');
+const START_MARK = '<!-- spm-agent-kit:start -->';
+const END_MARK = '<!-- spm-agent-kit:end -->';
 function SPOOL(step, status, code) { spool(HOME, KV, { step, status, code }); }
 function refuse(msg) {
   process.stderr.write('setup-env: ' + msg + '\n');
@@ -230,6 +237,40 @@ try {
   let obj = {};
   let mode = 0o600;
   let changed = st === null;
+  // Addendum B1: the CLAUDE.md block is planned here too, so a refusal writes nothing.
+  const cmFile = path.join(claudeDir, 'CLAUDE.md');
+  let cmSt = null;
+  try { cmSt = fs.lstatSync(cmFile); } catch (err) { if (err.code !== 'ENOENT') throw err; }
+  let cmRaw = '';
+  let cmMode = 0o600;
+  if (cmSt) {
+    if (cmSt.isSymbolicLink()) refuse('~/.claude/CLAUDE.md is a symbolic link; refused, file untouched');
+    if (!cmSt.isFile()) refuse('~/.claude/CLAUDE.md is not a plain file; refused, file untouched');
+    cmMode = cmSt.mode & 0o777;
+    cmRaw = fs.readFileSync(cmFile, 'utf8');
+  }
+  let cmBlock = null;
+  try {
+    cmBlock = fs.readFileSync(BLOCK_FILE, 'utf8')
+      .split('/root/spm-agent-kit').join(KIT)
+      .split('/root/.spm-agent-state').join(configDir);
+  } catch (_) { cmBlock = null; }
+  let cmNew = null;
+  if (cmBlock !== null) {
+    const body = cmBlock.replace(/\n+$/, '');
+    const core = START_MARK + '\n' + body + '\n' + END_MARK;
+    const nS = cmRaw.split(START_MARK).length - 1;
+    const nE = cmRaw.split(END_MARK).length - 1;
+    if (nS === 0 && nE === 0) {
+      cmNew = cmRaw + (cmRaw === '' ? '' : (cmRaw.endsWith('\n') ? '\n' : '\n\n')) + core + '\n';
+    } else if (nS === 1 && nE === 1 && cmRaw.indexOf(START_MARK) < cmRaw.indexOf(END_MARK)) {
+      const a = cmRaw.indexOf(START_MARK);
+      const b = cmRaw.indexOf(END_MARK) + END_MARK.length;
+      cmNew = cmRaw.slice(0, a) + core + cmRaw.slice(b);
+    } else {
+      refuse('~/.claude/CLAUDE.md has unbalanced or repeated spm-agent-kit markers; refused, file untouched');
+    }
+  }
   if (st) {
     if (st.isSymbolicLink()) refuse('~/.claude/settings.json is a symbolic link; refused, file untouched');
     if (!st.isFile()) refuse('~/.claude/settings.json is not a plain file; refused, file untouched');
@@ -251,24 +292,6 @@ try {
     obj.permissions = perms;
     changed = true;
   }
-  // the session hook (0.2.0): one entry, no matcher, so it runs on every start, resume, clear and compaction
-  const hooksVal = obj.hooks === undefined ? {} : obj.hooks;
-  if (!hooksVal || typeof hooksVal !== 'object' || Array.isArray(hooksVal)) refuse('hooks in ~/.claude/settings.json is not an object; refused, file untouched');
-  const sessionStart = hooksVal.SessionStart === undefined ? [] : hooksVal.SessionStart;
-  if (!Array.isArray(sessionStart)) refuse('hooks.SessionStart in ~/.claude/settings.json is not a list; refused, file untouched');
-  let hookRes = { status: 'pass' };
-  let hookFileOk = false;
-  try { hookFileOk = fs.statSync(HOOK_FILE).isFile(); } catch (_) { hookFileOk = false; }
-  const present = sessionStart.some((g) => g && typeof g === 'object' && Array.isArray(g.hooks)
-    && g.hooks.some((h) => h && typeof h === 'object' && h.type === 'command' && h.command === HOOK_CMD));
-  if (!hookFileOk) {
-    hookRes = { status: 'fail', code: 'missing_hook_text' };
-  } else if (!present) {
-    hooksVal.SessionStart = sessionStart.concat([{ hooks: [{ type: 'command', command: HOOK_CMD }] }]);
-    obj.hooks = hooksVal;
-    changed = true;
-  }
-
   // 2. config: the agent block when --name and --email were given; else the one already there, if any
   let oldCfg = {};
   try {
@@ -295,6 +318,9 @@ try {
   // Addendum A4: off writes false; on writes nothing; not given keeps the value already there.
   if (e.SPM_SETUP_REPORT === 'off') cfg.report = false;
   else if (e.SPM_SETUP_REPORT !== 'on' && typeof oldCfg.report === 'boolean') cfg.report = oldCfg.report;
+  // Addendum B1: the same rule for autostart
+  if (e.SPM_SETUP_AUTOSTART === 'off') cfg.autostart = false;
+  else if (e.SPM_SETUP_AUTOSTART !== 'on' && typeof oldCfg.autostart === 'boolean') cfg.autostart = oldCfg.autostart;
   try {
     fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });
     fs.chmodSync(configDir, 0o700);
@@ -312,6 +338,26 @@ try {
   } catch (err) { SPOOL('skill', 'fail', 'write_failed'); throw err; }
   SPOOL('skill', 'pass');
 
+  // Addendum B1: the CLAUDE.md block. A missing block file is a fail line; the file is then left alone.
+  if (cmNew === null) {
+    SPOOL('claude-md', 'fail', 'missing_claude_md_block');
+  } else if (cmNew !== cmRaw || cmSt === null) {
+    const cmTmp = path.join(claudeDir, '.CLAUDE.md.' + process.pid + '.tmp');
+    try {
+      fs.mkdirSync(claudeDir, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(cmTmp, cmNew, { mode: cmMode });
+      fs.chmodSync(cmTmp, cmMode);
+      fs.renameSync(cmTmp, cmFile);
+    } catch (err) {
+      try { fs.rmSync(cmTmp, { force: true }); } catch { /* nothing more to do */ }
+      SPOOL('claude-md', 'fail', 'write_failed');
+      throw err;
+    }
+    SPOOL('claude-md', 'pass');
+  } else {
+    SPOOL('claude-md', 'pass');
+  }
+
   // Addendum A2: the salt for session keys, written once; every later run keeps it
   try {
     fs.writeFileSync(path.join(configDir, 'report-salt'), crypto.randomBytes(16).toString('hex') + '\n', { flag: 'wx', mode: 0o600 });
@@ -328,13 +374,10 @@ try {
     } catch (err) {
       try { fs.rmSync(tmp, { force: true }); } catch { /* nothing more to do */ }
       SPOOL('settings', 'fail', 'write_failed');
-      SPOOL('hook', 'fail', 'write_failed');
       throw err;
     }
   }
   SPOOL('settings', 'pass');
-  if (hookRes.status === 'fail') SPOOL('hook', 'fail', hookRes.code);
-  else SPOOL('hook', 'pass');
 } catch (err) {
   process.stderr.write('setup-env: could not write the settings files (' + (err.code || 'error') + ')\n');
   process.exit(1);
@@ -353,10 +396,10 @@ spool_setup() {
     node -e "$SPOOL_CLI_JS" >/dev/null 2>&1 || true
 }
 
-# Steps config, skill, settings and hook (node), each spooled as it is done. A refusal exits 2 with nothing written.
+# Steps config, skill, claude-md and settings (node), each spooled as it is done. A refusal exits 2 with nothing written.
 SPM_SETUP_KIT="$KIT" SPM_SETUP_HOME="$HOME" SPM_SETUP_KIT_VERSION="$KIT_VERSION" \
   SPM_SETUP_HAS_AGENT="$HAS_AGENT" SPM_SETUP_NAME="$NAME" SPM_SETUP_EMAIL="$EMAIL" \
-  SPM_SETUP_APP_ID="$APP_ID" SPM_SETUP_HAS_APP="$HAS_APP" SPM_SETUP_REPORT="$REPORT" SPM_SETUP_TRANSPORT="$TRANSPORT" SPM_SETUP_HAS_IGNORE="$HAS_IGNORE" \
+  SPM_SETUP_APP_ID="$APP_ID" SPM_SETUP_HAS_APP="$HAS_APP" SPM_SETUP_REPORT="$REPORT" SPM_SETUP_AUTOSTART="$AUTOSTART" SPM_SETUP_TRANSPORT="$TRANSPORT" SPM_SETUP_HAS_IGNORE="$HAS_IGNORE" \
   SPM_SETUP_IGNORE="$IGNORE_LIST" \
   node -e "$WRITE_JS"
 RC=$?
@@ -387,6 +430,6 @@ fi
 if [ "$HAS_AGENT" -eq 1 ]; then
   echo "spm-agent-kit $VERSION: set up for $NAME"
 else
-  echo "spm-agent-kit $VERSION: set up"
+  echo "spm-agent-kit $VERSION: set up; the agent's name and address come from SPM at first start"
 fi
 exit 0

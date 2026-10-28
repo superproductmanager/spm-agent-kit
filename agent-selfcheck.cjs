@@ -305,6 +305,8 @@ async function mainSetup(argv) {
     for (const s of ['spm-host', 'google-host']) spoolCheck(s, 'fail', 'no_config');
     return 0;
   }
+  // Addendum B6: whenever a proxy is set, every https call goes through it (the setup run has no key; the proxy adds it where it is needed).
+  VIA_PROXY = proxyUrl(process.env) !== null;
   const ctx = { email: conf.email || '', appId: conf.appId, bases: a.bases, key: null, customToken: null, idToken: null, secret: false, setup: true };
   // Addendum A1: the app-id test is dropped (SPM now returns the app id at identify).
   for (const [name, check] of [['spm-host', checkSpmHost], ['google-host', checkGoogleHost]]) {

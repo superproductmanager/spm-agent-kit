@@ -17,11 +17,12 @@ function workdir(label) {
   return fs.mkdtempSync(path.join(os.tmpdir(), `start-test-${label}-`));
 }
 
+// Addendum B2: the identify step is replaced in every test that is not about it (no real SPM call from tests).
 function runStart(args, env = {}, script = START) {
   return spawnSync('bash', [script, ...args], {
     encoding: 'utf8',
     timeout: 60000,
-    env: { PATH: process.env.PATH, HOME: workdir('home'), ...env },
+    env: { PATH: process.env.PATH, HOME: workdir('home'), SPM_AGENT_START_HEALTH_CMD: 'exit 0', ...env },
   });
 }
 
@@ -166,4 +167,65 @@ test('start.sh: Node 22.21.0 passes the version check and the selfcheck runs', (
   });
   assert.equal(r.status, 0, `status ${r.status}, stderr ${r.stderr}`);
   assert.equal(fs.readFileSync(marker, 'utf8'), 'selfcheck\nstarted\n');
+});
+
+// ---- Addendum B2: start.sh first runs node <kit>/agent-health.cjs start --role listener --config <cfg>; exit 7 stops before the selfcheck ----
+// A sandbox copy of the kit with a stub agent-health.cjs (records its arguments; exit 7 when stub-exit7 exists) and a stub selfcheck.
+function healthSandbox() {
+  const dir = workdir('health');
+  const kit = path.join(dir, 'kit');
+  fs.mkdirSync(kit);
+  fs.copyFileSync(START, path.join(kit, 'start.sh'));
+  fs.copyFileSync(path.join(KIT, 'agent-keepalive.sh'), path.join(kit, 'agent-keepalive.sh'));
+  fs.writeFileSync(path.join(kit, 'agent-health.cjs'), [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "fs.appendFileSync(path.join(__dirname, 'health-calls.log'), JSON.stringify(process.argv.slice(2)) + '\\n');",
+    "if (fs.existsSync(path.join(__dirname, 'stub-exit7'))) { console.log('could not reach SPM, run again'); process.exit(7); }",
+    'process.exit(0);',
+    '',
+  ].join('\n'));
+  fs.writeFileSync(path.join(kit, 'agent-selfcheck.cjs'), "'use strict';\nrequire('node:fs').writeFileSync(require('node:path').join(__dirname, 'selfcheck-ran'), 'yes');\nprocess.exit(0);\n");
+  return { dir, kit };
+}
+
+function runSandboxStart(kit, dir, extra = {}) {
+  return spawnSync('bash', [path.join(kit, 'start.sh'), '--config', CONFIG, '--state-dir', path.join(dir, 'state')], {
+    encoding: 'utf8',
+    timeout: 60000,
+    env: { PATH: process.env.PATH, HOME: workdir('home'), SPM_AGENT_START_LISTENER_CMD: 'exit 0', KEEPALIVE_MAX_RUNS: '1', ...extra },
+  });
+}
+
+test('start.sh (B2): the identify step runs first with --role listener and --config; exit 0 lets the selfcheck run', () => {
+  const { dir, kit } = healthSandbox();
+  const r = runSandboxStart(kit, dir);
+  assert.equal(r.status, 0, `status ${r.status}, stderr ${r.stderr}`);
+  assert.deepEqual(fs.readFileSync(path.join(kit, 'health-calls.log'), 'utf8').trim().split('\n').map((l) => JSON.parse(l)), [['start', '--role', 'listener', '--config', CONFIG]]);
+  assert.equal(fs.readFileSync(path.join(kit, 'selfcheck-ran'), 'utf8'), 'yes');
+});
+
+test('start.sh (B2): identify exit 7 prints its line, exits 1, and the selfcheck and the listener never run', () => {
+  const { dir, kit } = healthSandbox();
+  fs.writeFileSync(path.join(kit, 'stub-exit7'), '');
+  const marker = path.join(dir, 'listener-ran');
+  const r = runSandboxStart(kit, dir, { SPM_AGENT_START_LISTENER_CMD: `echo started >> ${marker}` });
+  assert.equal(r.status, 1, `status ${r.status}, stderr ${r.stderr}`);
+  assert.equal(r.stdout, 'could not reach SPM, run again\n');
+  assert.equal(fs.existsSync(path.join(kit, 'selfcheck-ran')), false, 'the selfcheck ran after a failed identify');
+  assert.equal(fs.existsSync(marker), false, 'the listener started after a failed identify');
+});
+
+test('start.sh (B2): the identify override is used when set, and its failure stops before the selfcheck', () => {
+  const dir = workdir('healthover');
+  const marker = path.join(dir, 'marker');
+  const r = runStart(['--config', CONFIG, '--state-dir', path.join(dir, 'state')], {
+    SPM_AGENT_START_HEALTH_CMD: `echo 'could not reach SPM, run again'; exit 7`,
+    SPM_AGENT_START_SELFCHECK_CMD: `echo selfcheck >> ${marker}; exit 0`,
+    KEEPALIVE_MAX_RUNS: '1',
+  });
+  assert.equal(r.status, 1);
+  assert.equal(r.stdout, 'could not reach SPM, run again\n');
+  assert.equal(fs.existsSync(marker), false);
 });

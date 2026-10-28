@@ -14,6 +14,9 @@
 #
 # KEEPALIVE_MAX_RUNS (tests only): stop after that many runs with exit 0.
 #
+# Once its lock is held (Addendum B4) the wrapper appends {"kind":"wrapper.start","t":"<ISO UTC>"} to LOG, once per wrapper.
+# A wrapper that finds the lock held writes nothing.
+#
 # Single instance: the wrapper takes an exclusive flock on LOG.lock (next to LOG), held on fd 9 for its whole life.
 # A second wrapper on the same LOG prints one line to stderr ("another wrapper already runs for <LOG>") and exits 0
 # without starting the command. The lock is released when the wrapper exits, SIGTERM included. Fd 9 is closed in the
@@ -47,6 +50,8 @@ if command -v flock >/dev/null 2>&1; then
 else
   echo "agent-keepalive: flock not installed, running without a single-instance lock" >&2
 fi
+
+printf '{"kind":"wrapper.start","t":"%s"}\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$LOG"
 
 ERR="$LOG.err"
 BASE="${RESTART_DELAY_S:-5}"

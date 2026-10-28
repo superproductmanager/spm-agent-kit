@@ -30,9 +30,9 @@ function rulesFor(kit) {
 }
 
 // A fresh sandbox: root, home (HOME), runtime (SPM_AGENT_RUNTIME_DIR), bin (fake npm), kit (copied kit folder).
-// hookText: the sandbox kit gets hook/session-start.txt (the main loop writes the real one; tests make a fixture).
+// claudeMdBlock: the sandbox kit gets hook/claude-md-block.md (the main loop writes the real one; tests make a fixture).
 // selfcheckFail: the stand-in selfcheck exits 1.
-function sandbox({ version, npmFail = false, hookText = false, selfcheckFail = false } = {}) {
+function sandbox({ version, npmFail = false, claudeMdBlock = false, selfcheckFail = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'setup-env-test-'));
   const sb = {
     root,
@@ -49,9 +49,9 @@ function sandbox({ version, npmFail = false, hookText = false, selfcheckFail = f
   for (const f of ['setup-env.sh', 'cloud-agent-setup.sh']) fs.copyFileSync(path.join(ROOT, f), path.join(sb.kit, f));
   fs.copyFileSync(SKILL_SRC, path.join(sb.kit, 'skill', 'spm-agent', 'SKILL.md'));
   if (version !== undefined) fs.writeFileSync(path.join(sb.kit, 'VERSION'), version);
-  if (hookText) {
+  if (claudeMdBlock) {
     fs.mkdirSync(path.join(sb.kit, 'hook'));
-    fs.writeFileSync(path.join(sb.kit, 'hook', 'session-start.txt'), 'fixture hook text\n');
+    fs.writeFileSync(path.join(sb.kit, 'hook', 'claude-md-block.md'), CLAUDE_MD_FIXTURE);
   }
   stubSelfcheck(sb, selfcheckFail);
   fakeNpm(sb, npmFail);
@@ -104,6 +104,8 @@ const CLAUDE_DIR = (sb) => path.join(sb.home, '.claude');
 const SETTINGS = (sb) => path.join(sb.home, '.claude', 'settings.json');
 const SKILL_DEST = (sb) => path.join(sb.home, '.claude', 'skills', 'spm-agent', 'SKILL.md');
 const SKILL_SRC = path.join(ROOT, 'skill', 'spm-agent', 'SKILL.md');
+// The CLAUDE.md block fixture: the two literal paths the installed copy must replace.
+const CLAUDE_MD_FIXTURE = 'Kit folder: /root/spm-agent-kit\nState folder: /root/.spm-agent-state\n';
 const mode = (p) => fs.statSync(p).mode & 0o777;
 const readJson = (p) => JSON.parse(fs.readFileSync(p, 'utf8'));
 
@@ -195,7 +197,7 @@ test('a name outside ^[A-Za-z0-9 ._()-]{1,60}$ exits 2 and writes nothing', () =
 test('emails that break the lib/config.cjs rule exit 2 with one line and write nothing', () => {
   const bad = [
     'Spm-Example@agents.invalid', // upper case
-    'someone@example.com', // not .invalid
+    'someone@example.invalid', // not agents.invalid
     'spm-example@agents.invalid extra', // suffix after the domain
     'spm example@agents.invalid', // space
     '@agents.invalid', // no local part
@@ -603,20 +605,18 @@ test('a second full run changes nothing: same output, same config, skill and set
 // ---- 0.2.0: identity optional, session hook, setup report spool, selfcheck call ----
 const SPOOL = (sb) => path.join(sb.home, '.spm-agent-state', 'setup-report.jsonl');
 const RUN_ID_FILE = (sb) => path.join(sb.home, '.spm-agent-state', 'setup-run-id');
-const HOOK_CMD = (sb) => `cat '${sb.kit}/hook/session-start.txt'`;
 const SPOOL_RE = { id: /^[a-f0-9-]{16,64}$/, run_id: /^[a-f0-9-]{8,64}$/, step: /^[a-z0-9-]{1,32}$/, code: /^[a-z0-9_]{1,64}$/ };
 function spoolLines(sb) {
   if (!fs.existsSync(SPOOL(sb))) return [];
   return fs.readFileSync(SPOOL(sb), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
 }
-const hookEntry = (sb) => ({ hooks: [{ type: 'command', command: HOOK_CMD(sb) }] });
 
 test('a line without --name and --email installs: config has app_id and no agent, the output has no name', () => {
   const sb = sandbox({ version: '0.2.0\n' });
   try {
     const r = runSetup(sb, ['--app-id', APP_ID, '--no-sdk']);
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.stdout, 'spm-agent-kit 0.2.0: set up\n');
+    assert.equal(r.stdout, "spm-agent-kit 0.2.0: set up; the agent's name and address come from SPM at first start\n");
     assert.deepEqual(readJson(CONFIG(sb)), { app_id: APP_ID });
     assert.deepEqual(readJson(SETTINGS(sb)).permissions.allow, rulesFor(sb.kit));
   } finally { cleanup(sb); }
@@ -642,93 +642,12 @@ test('--email alone exits 2 with one line and writes nothing', () => {
   } finally { cleanup(sb); }
 });
 
-test('the SessionStart hook entry is written once with the absolute kit path; a second run adds no duplicate and keeps the bytes', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
-  try {
-    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
-    assert.deepEqual(readJson(SETTINGS(sb)).hooks, { SessionStart: [hookEntry(sb)] });
-    const before = fs.readFileSync(SETTINGS(sb)).toString('base64');
-    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
-    assert.deepEqual(readJson(SETTINGS(sb)).hooks.SessionStart, [hookEntry(sb)]);
-    assert.equal(fs.readFileSync(SETTINGS(sb)).toString('base64'), before, 'a second run leaves settings.json untouched');
-  } finally { cleanup(sb); }
-});
-
-test('an existing SessionStart hook of another tool is kept; only the kit entry is added after it', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
-  try {
-    const other = { hooks: [{ type: 'command', command: 'echo other' }] };
-    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
-    fs.writeFileSync(SETTINGS(sb), JSON.stringify({ hooks: { SessionStart: [other], Stop: [] } }));
-    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
-    assert.deepEqual(readJson(SETTINGS(sb)).hooks, { SessionStart: [other, hookEntry(sb)], Stop: [] });
-  } finally { cleanup(sb); }
-});
-
-test('a SessionStart value that is not a list is refused: exit 2, one line, file untouched, nothing written', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
-  try {
-    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
-    const text = '{"hooks":{"SessionStart":{}}}\n';
-    fs.writeFileSync(SETTINGS(sb), text);
-    const r = runSetup(sb, ok(['--no-sdk']));
-    assert.equal(r.status, 2);
-    assertOneLine(r);
-    assert.equal(fs.readFileSync(SETTINGS(sb), 'utf8'), text);
-    assert.equal(fs.existsSync(CONFIG(sb)), false, 'no config when settings are refused');
-  } finally { cleanup(sb); }
-});
-
-test('a hooks value that is not an object is refused the same way', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
-  try {
-    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
-    const text = '{"hooks":[]}\n';
-    fs.writeFileSync(SETTINGS(sb), text);
-    const r = runSetup(sb, ok(['--no-sdk']));
-    assert.equal(r.status, 2);
-    assertOneLine(r);
-    assert.equal(fs.readFileSync(SETTINGS(sb), 'utf8'), text);
-  } finally { cleanup(sb); }
-});
-
-test('a kit path with a single quote is refused before anything is written', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
-  try {
-    const kit = path.join(sb.root, "it's-kit");
-    fs.mkdirSync(path.join(kit, 'skill', 'spm-agent'), { recursive: true });
-    fs.copyFileSync(path.join(sb.kit, 'setup-env.sh'), path.join(kit, 'setup-env.sh'));
-    fs.copyFileSync(SKILL_SRC, path.join(kit, 'skill', 'spm-agent', 'SKILL.md'));
-    const r = spawnSync('bash', [path.join(kit, 'setup-env.sh'), ...ok(['--no-sdk'])], {
-      encoding: 'utf8',
-      env: { PATH: `${sb.bin}:${process.env.PATH}`, HOME: sb.home, SPM_AGENT_RUNTIME_DIR: sb.runtime },
-    });
-    assert.equal(r.status, 2, r.stdout + r.stderr);
-    assertOneLine(r);
-    assert.match(r.stderr, /single quote/);
-    assertNothingWritten(sb);
-  } finally { cleanup(sb); }
-});
-
-test('a missing hook text: the hook step spools fail with code missing_hook_text, setup exits 0, rules are written, no SessionStart entry', () => {
-  const sb = sandbox({ version: '0.2.0\n' });
-  try {
-    const r = runSetup(sb, ok(['--no-sdk']));
-    assert.equal(r.status, 0, r.stderr);
-    assert.equal(r.stdout, `spm-agent-kit 0.2.0: set up for ${NAME}\n`);
-    assert.deepEqual(readJson(SETTINGS(sb)).permissions.allow, rulesFor(sb.kit));
-    assert.equal(readJson(SETTINGS(sb)).hooks, undefined);
-    const hook = spoolLines(sb).find((l) => l.step === 'hook');
-    assert.deepEqual([hook.status, hook.code], ['fail', 'missing_hook_text']);
-  } finally { cleanup(sb); }
-});
-
 test('each run spools one setup line per step in order, all valid against the spool contract, with one run id and kit_version', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
   try {
     assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
     const lines = spoolLines(sb);
-    assert.deepEqual(lines.map((l) => [l.step, l.status]), [['config', 'pass'], ['skill', 'pass'], ['settings', 'pass'], ['hook', 'pass'], ['sdk', 'skip']]);
+    assert.deepEqual(lines.map((l) => [l.step, l.status]), [['config', 'pass'], ['skill', 'pass'], ['claude-md', 'pass'], ['settings', 'pass'], ['sdk', 'skip']]);
     const runId = fs.readFileSync(RUN_ID_FILE(sb), 'utf8').trim();
     for (const l of lines) {
       assert.equal(l.kind, 'setup');
@@ -742,6 +661,7 @@ test('each run spools one setup line per step in order, all valid against the sp
       assert.equal(l.code, undefined, 'no code on a pass or skip');
     }
     assert.equal(new Set(lines.map((l) => l.id)).size, 5);
+    assert.equal(lines.some((l) => l.step === 'hook'), false, 'Addendum B1: no hook step');
     assert.equal(fs.statSync(path.join(sb.home, '.spm-agent-state')).mode & 0o777, 0o700);
     assert.equal(fs.statSync(SPOOL(sb)).mode & 0o777, 0o600);
     assert.equal(fs.statSync(RUN_ID_FILE(sb)).mode & 0o777, 0o600);
@@ -763,11 +683,13 @@ test('an SDK run spools sdk pass; a failing SDK spools sdk fail with code sdk_fa
     const sdk = spoolLines(bad).find((l) => l.step === 'sdk');
     assert.deepEqual([sdk.status, sdk.code], ['fail', 'sdk_failed']);
     assert.equal(fs.existsSync(path.join(bad.home, '.spm-agent-state', 'config.json')), true, 'config written before the SDK step');
+    assert.deepEqual(JSON.parse('[' + fs.readFileSync(bad.selfcheckLog, 'utf8').trim().split('\n').join(',') + ']'), [['--setup', '--config', path.join(bad.home, '.spm-agent-state', 'config.json')]], 'Addendum B8: selfcheck --setup still runs after an SDK failure');
+    assert.equal(r.stdout, '', 'nothing on stdout when the SDK step fails');
   } finally { cleanup(bad); }
 });
 
 test('a spool write that fails never stops setup: exit 0, config and settings written', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
   try {
     fs.mkdirSync(SPOOL(sb), { recursive: true });
     const r = runSetup(sb, ok(['--no-sdk']));
@@ -779,8 +701,8 @@ test('a spool write that fails never stops setup: exit 0, config and settings wr
 });
 
 test('the run id file is reused while younger than an hour, and replaced when older', () => {
-  const sb = sandbox({ version: '0.2.0\n', hookText: true });
-  const old = sandbox({ version: '0.2.0\n', hookText: true });
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  const old = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
   try {
     fs.mkdirSync(path.dirname(RUN_ID_FILE(sb)), { recursive: true });
     fs.writeFileSync(RUN_ID_FILE(sb), 'abcdef0123456789\n');
@@ -863,5 +785,139 @@ test('report-salt is 32 lower-case hex, mode 0600, written once; a second run ke
     assert.equal(mode(SALT(sb)), 0o600);
     assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
     assert.equal(fs.readFileSync(SALT(sb), 'utf8').trim(), salt);
+  } finally { cleanup(sb); }
+});
+
+// ---- Addendum B1: the CLAUDE.md block (replaces the SessionStart hook) ----
+const CLAUDE_MD = (sb) => path.join(sb.home, '.claude', 'CLAUDE.md');
+const START_MARK = '<!-- spm-agent-kit:start -->';
+const END_MARK = '<!-- spm-agent-kit:end -->';
+
+test('CLAUDE.md block: created at 0600 when missing, between the markers, with the two literal paths replaced', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    assert.equal(mode(CLAUDE_MD(sb)), 0o600);
+    const text = fs.readFileSync(CLAUDE_MD(sb), 'utf8');
+    assert.equal(text, `${START_MARK}\nKit folder: ${sb.kit}\nState folder: ${path.join(sb.home, '.spm-agent-state')}\n${END_MARK}\n`);
+    assert.equal(text.includes('/root/'), false);
+    const cl = spoolLines(sb).find((l) => l.step === 'claude-md');
+    assert.deepEqual([cl.status, cl.code], ['pass', undefined]);
+  } finally { cleanup(sb); }
+});
+
+test('CLAUDE.md block: an existing file keeps every byte outside the markers and its mode; a re-run replaces the block only', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    const before = '# My notes\n\nKeep this line, ümlaut and all.\n';
+    fs.writeFileSync(CLAUDE_MD(sb), before + `${START_MARK}\nold block\n${END_MARK}\n` + 'After the block: no newline at the end');
+    fs.chmodSync(CLAUDE_MD(sb), 0o640);
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    const after = fs.readFileSync(CLAUDE_MD(sb), 'utf8');
+    assert.ok(after.startsWith(before), 'the text before the block changed');
+    assert.ok(after.endsWith('After the block: no newline at the end'), 'the text after the block changed');
+    assert.equal(after.split(START_MARK).length, 2, 'a second block was added');
+    assert.ok(after.includes(`Kit folder: ${sb.kit}`), 'the block was not written');
+    assert.equal(mode(CLAUDE_MD(sb)), 0o640);
+    // a second run with the same fixture: same bytes
+    const once = fs.readFileSync(CLAUDE_MD(sb));
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    assert.deepEqual(fs.readFileSync(CLAUDE_MD(sb)), once);
+  } finally { cleanup(sb); }
+});
+
+test('CLAUDE.md block: when the block text changes, a re-run replaces the old block and keeps the rest', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    fs.writeFileSync(CLAUDE_MD(sb), `head\n${START_MARK}\nstale text\n${END_MARK}\ntail\n`);
+    fs.writeFileSync(path.join(sb.kit, 'hook', 'claude-md-block.md'), 'fresh text /root/spm-agent-kit\n');
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    assert.equal(fs.readFileSync(CLAUDE_MD(sb), 'utf8'), `head\n${START_MARK}\nfresh text ${sb.kit}\n${END_MARK}\ntail\n`);
+  } finally { cleanup(sb); }
+});
+
+test('CLAUDE.md block: a symlinked CLAUDE.md is refused: exit 2, one line, link and target untouched, nothing written', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    const target = path.join(sb.root, 'real-claude.md');
+    fs.writeFileSync(target, 'keep\n');
+    fs.symlinkSync(target, CLAUDE_MD(sb));
+    const r = runSetup(sb, ok(['--no-sdk']));
+    assert.equal(r.status, 2);
+    assertOneLine(r);
+    assert.equal(fs.readFileSync(target, 'utf8'), 'keep\n');
+    assert.ok(fs.lstatSync(CLAUDE_MD(sb)).isSymbolicLink());
+    assert.equal(fs.existsSync(CONFIG(sb)), false, 'no config when CLAUDE.md is refused');
+  } finally { cleanup(sb); }
+});
+
+test('CLAUDE.md block: unbalanced markers are refused: exit 2, one line, file untouched, nothing written', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    const text = `${START_MARK}\nno end marker\n`;
+    fs.writeFileSync(CLAUDE_MD(sb), text);
+    const r = runSetup(sb, ok(['--no-sdk']));
+    assert.equal(r.status, 2);
+    assertOneLine(r);
+    assert.equal(fs.readFileSync(CLAUDE_MD(sb), 'utf8'), text);
+    assert.equal(fs.existsSync(CONFIG(sb)), false);
+  } finally { cleanup(sb); }
+});
+
+test('CLAUDE.md block: a missing block file spools claude-md fail with code missing_claude_md_block, setup exits 0, CLAUDE.md not created', () => {
+  const sb = sandbox({ version: '0.2.0\n' });
+  try {
+    const r = runSetup(sb, ok(['--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.existsSync(CLAUDE_MD(sb)), false);
+    const cl = spoolLines(sb).find((l) => l.step === 'claude-md');
+    assert.deepEqual([cl.status, cl.code], ['fail', 'missing_claude_md_block']);
+    assert.deepEqual(readJson(SETTINGS(sb)).permissions.allow, rulesFor(sb.kit));
+  } finally { cleanup(sb); }
+});
+
+// ---- Addendum B1 / A4: --autostart on|off ----
+test('--autostart off writes autostart false into the config; on removes it; not given keeps it; another value exits 2 and writes nothing', () => {
+  const sb = sandbox({ version: '0.2.0\n' });
+  try {
+    assert.equal(runSetup(sb, ok(['--autostart', 'off', '--no-sdk'])).status, 0);
+    assert.equal(readJson(CONFIG(sb)).autostart, false);
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    assert.equal(readJson(CONFIG(sb)).autostart, false, 'a run without --autostart keeps the override');
+    assert.equal(runSetup(sb, ok(['--autostart', 'on', '--no-sdk'])).status, 0);
+    assert.equal('autostart' in readJson(CONFIG(sb)), false, 'on writes nothing');
+  } finally { cleanup(sb); }
+  const bad = sandbox({ version: '0.2.0\n' });
+  try {
+    const r = runSetup(bad, ok(['--autostart', 'maybe', '--no-sdk']));
+    assert.equal(r.status, 2);
+    assertOneLine(r);
+    assertNothingWritten(bad);
+  } finally { cleanup(bad); }
+});
+
+// ---- Addendum item 5: the six old rules gain only the seventh ----
+test('settings with the six old allow rules gains only the agent-health rule, in place order, nothing else changed', () => {
+  const sb = sandbox({ version: '0.2.0\n' });
+  try {
+    const six = rulesFor(sb.kit).slice(0, 6);
+    fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
+    fs.writeFileSync(SETTINGS(sb), JSON.stringify({ model: 'x', permissions: { allow: six, deny: ['Bash(rm -rf *)'] } }, null, 2) + '\n');
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    assert.deepEqual(readJson(SETTINGS(sb)), { model: 'x', permissions: { allow: rulesFor(sb.kit), deny: ['Bash(rm -rf *)'] } });
+  } finally { cleanup(sb); }
+});
+
+// ---- Addendum B8: the final line when no name is given ----
+test('no --name: the final line says the name and address come from SPM at first start', () => {
+  const sb = sandbox({ version: '0.2.0\n' });
+  try {
+    const r = runSetup(sb, ['--app-id', APP_ID, '--no-sdk']);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.stdout, "spm-agent-kit 0.2.0: set up; the agent's name and address come from SPM at first start\n");
   } finally { cleanup(sb); }
 });

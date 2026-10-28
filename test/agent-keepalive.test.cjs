@@ -8,7 +8,7 @@ const assert = require('node:assert/strict');
 const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 const SCRIPT = path.join(__dirname, '..', 'agent-keepalive.sh');
 
@@ -279,4 +279,35 @@ test('single instance: without flock, one warning line and the wrapper still run
   assert.equal(r.stderr.trim().split('\n').length, 1, 'one warning line');
   assert.equal(fs.existsSync(marker), true, 'the command ran without a lock');
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+// ---- Addendum B4: wrapper.start line once the lock is held ----
+test('wrapper.start: one line with an ISO UTC time, written before the first run, once the lock is held', () => {
+  const dir = tmpdir();
+  const log = path.join(dir, 'listener.log');
+  const r = run(log, 'exit 0', { PATH: process.env.PATH, KEEPALIVE_MAX_RUNS: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const lines = readLines(log);
+  const first = JSON.parse(lines[0]);
+  assert.equal(first.kind, 'wrapper.start');
+  assert.match(first.t, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/);
+  assert.equal(lines.filter((l) => l.includes('"wrapper.start"')).length, 1);
+});
+
+test('wrapper.start: a second wrapper on a held lock writes no wrapper.start line and runs nothing', async () => {
+  const dir = tmpdir();
+  const log = path.join(dir, 'listener.log');
+  const marker = path.join(dir, 'never');
+  const first = spawn('bash', [SCRIPT, log, 'sleep 30'], { env: { PATH: process.env.PATH }, stdio: 'ignore' });
+  const closed = new Promise((resolve) => first.on('close', resolve));
+  try {
+    for (let i = 0; i < 200 && !readLines(log).some((l) => l.includes('"wrapper.start"')); i++) await new Promise((r) => setTimeout(r, 50));
+    const second = run(log, `echo ran >> ${marker}`, { PATH: process.env.PATH, KEEPALIVE_MAX_RUNS: '1' });
+    assert.equal(second.status, 0, second.stderr);
+    assert.equal(fs.existsSync(marker), false, 'the second command ran');
+    assert.equal(readLines(log).filter((l) => l.includes('"wrapper.start"')).length, 1);
+  } finally {
+    first.kill('SIGTERM');
+    await closed;
+  }
 });
