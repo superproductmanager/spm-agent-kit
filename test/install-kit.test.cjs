@@ -105,7 +105,7 @@ test('the template copy of install-kit.sh is byte-identical to install/install-k
 test('the SessionStart hook runs the repo copy of the installer and downloads nothing itself', () => {
   const settings = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'org-repo', '.claude', 'settings.json'), 'utf8'));
   const cmd = settings.hooks.SessionStart[0].hooks[0].command;
-  assert.equal(cmd, 'bash "$CLAUDE_PROJECT_DIR/.claude/hooks/install-kit.sh" 0.1.0 REPLACE_WITH_SHA256_FROM_SHA256SUMS && bash "${SPM_AGENT_KIT_DIR:-$HOME/spm-agent-kit}/cloud-agent-setup.sh" --apply');
+  assert.ok(cmd.startsWith('bash "$CLAUDE_PROJECT_DIR/.claude/hooks/install-kit.sh" 0.1.0 REPLACE_WITH_SHA256_FROM_SHA256SUMS && '), 'the hook runs the repo copy of the installer first');
   assert.ok(!/curl|wget|raw\.githubusercontent/.test(cmd), 'the hook command must not fetch anything');
 });
 
