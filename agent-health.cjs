@@ -17,7 +17,8 @@
  *       Posts the given settings to SPM (key header only) and prints "settings: autostart <on|off>, reports <on|off>".
  *       Exits 6 for a refused key, 7 when SPM cannot be reached, 2 when no flag is given.
  *   node agent-health.cjs usage --role main|listener --config <absolute path> [--transcript <absolute path>]
- *       Queues one usage item per model and price tier for the newest session transcript, then sends the spool.
+ *       Queues one usage item per model and price tier for the session named by --session, else by CLAUDE_CODE_SESSION_ID,
+ *       then sends the spool. With neither it prints one line, queues nothing, sends nothing and exits 0.
  *   node agent-health.cjs heartbeat --config <absolute path> [--main-status <word>] [--transcript <absolute path>]
  *       Queues one heartbeat item (listener.log lines since the last heartbeat, container and main-session changes), then sends.
  *   node agent-health.cjs flush --config <absolute path>
@@ -37,7 +38,9 @@
  * gets one warning line and still runs.
  * SESSION FILES (Addendum C2): usage, heartbeat and start read every file of the session: <projects>/<folder>/<id>.jsonl
  * in all folders and <folder>/<id>/subagents/*.jsonl. The id is --session <id> (8 to 64 letters, digits or dashes),
- * else the --transcript file's name, else the newest transcript's name.
+ * else CLAUDE_CODE_SESSION_ID (the same rule; Claude Code sets it for every command a session runs), else the
+ * --transcript file's name. It never falls back to the newest log file, which in a shared environment can belong
+ * to another session (kit 0.2.0).
  */
 
 const fs = require('node:fs');
@@ -199,26 +202,16 @@ async function identify({ base, key, timeoutMs }) {
   };
 }
 
-// The newest *.jsonl directly under <home>/.claude/projects/<folder>/ (by mtime), or null.
-function newestTranscript(home) {
-  const root = path.join(home, '.claude', 'projects');
-  let best = null;
-  let folders;
-  try { folders = fs.readdirSync(root, { withFileTypes: true }); } catch (_) { return null; }
-  for (const d of folders) {
-    if (!d.isDirectory()) continue;
-    const dir = path.join(root, d.name);
-    let files;
-    try { files = fs.readdirSync(dir, { withFileTypes: true }); } catch (_) { continue; }
-    for (const f of files) {
-      if (!f.isFile() || !f.name.endsWith('.jsonl')) continue;
-      const file = path.join(dir, f.name);
-      let mtime;
-      try { mtime = fs.statSync(file).mtimeMs; } catch (_) { continue; }
-      if (!best || mtime > best.mtime) best = { file, mtime };
-    }
-  }
-  return best ? best.file : null;
+// The session id a command counts (kit 0.2.0): --session when given, else CLAUDE_CODE_SESSION_ID when it is a valid id
+// (Claude Code sets it for every command a session runs; it equals the session's log file name), else the --transcript
+// file's name, else null. It never looks for the newest log file: in a shared environment that file can belong to
+// another session.
+function resolveSessionId({ session, transcript, env }) {
+  if (session) return session;
+  const fromEnv = env ? env.CLAUDE_CODE_SESSION_ID : undefined;
+  if (typeof fromEnv === 'string' && SESSION_RE.test(fromEnv)) return fromEnv;
+  if (transcript) return path.basename(transcript, '.jsonl');
+  return null;
 }
 
 const cap = (v) => (Number.isSafeInteger(v) && v >= 0 ? Math.min(v, MAX_NUMBER) : 0);
@@ -230,7 +223,7 @@ const parentOfSubagentFile = (file) => (path.basename(path.dirname(file)) === 's
 
 // C2: every file of one session, as [{ file, parent }]. Discovery needs a valid session id: every
 // <home>/.claude/projects/<folder>/<id>.jsonl (regular files, all folders) and every regular *.jsonl directly in
-// <folder>/<id>/subagents/ (parent = <id>). A transcript named by --transcript (or the newest one) is added too.
+// <folder>/<id>/subagents/ (parent = <id>). A transcript named by --transcript is added too.
 // Paths are de-duplicated. Returns [] when there is nothing to read.
 function sessionFiles(home, sid, transcript) {
   const out = [];
@@ -492,10 +485,11 @@ async function settingsCommand(p, c, deps) {
   const body = {};
   if (p.autostart !== undefined) body.autostart = p.autostart;
   if (p.reports !== undefined) body.reports = p.reports;
-  // C5: the kit version, and the session key of the newest session when there is a session id and a salt already.
+  // C5: the kit version, and the session key of the session in CLAUDE_CODE_SESSION_ID (never the newest file) when
+  // there is one and a salt already. No variable, no session_key.
   const kv = readKitVersion();
   if (kv.version) body.kit_version = kv.version;
-  const sid = path.basename(newestTranscript(env.HOME || os.homedir()) || '', '.jsonl');
+  const sid = resolveSessionId({ env }) || '';
   const salt = readSaltIfValid(R.stateDir(env));
   if (sid && SESSION_RE.test(sid) && salt) body.session_key = sessionKey(sid, salt);
   const r = await callSpm({ base: t.base, key: t.key, method: 'POST', pathname: '/agent/settings', body, timeoutMs: identifyTimeout(env) });
@@ -536,10 +530,15 @@ async function main(argv, deps) {
   const healthFile = path.join(sdir, 'health.json');
   const st = readHealth(healthFile);
   const kv = readKitVersion();
-  // C2: the session id is --session, else the --transcript name, else the newest transcript's name.
-  const transcript = p.transcript || (p.session ? null : newestTranscript(home));
-  const sessId = p.session || (transcript ? path.basename(transcript, '.jsonl') : null);
+  // C2 (kit 0.2.0): the session id is --session, else CLAUDE_CODE_SESSION_ID, else the --transcript name. Never the newest file.
+  const transcript = p.transcript || null;
+  const sessId = resolveSessionId({ session: p.session, transcript, env });
   const files = sessionFiles(home, sessId, transcript);
+  // Usage with no session id counts nothing, says so, and sends nothing (exit 0).
+  if (p.cmd === 'usage' && !sessId) {
+    io.out('health: no session id (no --session and CLAUDE_CODE_SESSION_ID is not set); usage not counted');
+    return 0;
+  }
   const settingsOff = c.report === false;
   const storedOff = st !== null && st.reportOn === false;
   const offFromSpm = storedOff && !settingsOff;
@@ -658,4 +657,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseArgs, readTranscript, usageItems, newestTranscript, readLogSince, versionOlder, sessionKey };
+module.exports = { main, parseArgs, readTranscript, usageItems, readLogSince, versionOlder, sessionKey };

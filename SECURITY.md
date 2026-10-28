@@ -25,7 +25,11 @@ GitHub push protection is the backstop: it blocks a push that contains a known k
 
 ## Session log files
 
-From the session's log files under ~/.claude/projects/, the kit reads only these fields: type, subtype, sessionId, uuid, timestamp, message.id, message.model, the numbers in message.usage, and compactMetadata.preTokens. It never reads or keeps any text from those files, and it sends SPM only totals per session, model and price tier.
+From the session's log files under ~/.claude/projects/, the kit parses each line as JSON and keeps only these fields: type, subtype, sessionId, uuid, timestamp, message.id, message.model, the numbers in message.usage, and compactMetadata.preTokens. The rest of each line, including all conversation text, is dropped as soon as the line is parsed: it is never stored, logged or sent. SPM gets only totals per session, model and price tier.
+
+## Allow rules apply to the whole environment
+
+Setup puts the seven allow rules in ~/.claude/settings.json, so they apply to every session in the environment. Where several sessions share one environment, any of them can post, mark Seen and resolve as the agent without a prompt. If that matters to you, run the agent in an environment that only its own sessions use. An option to leave the rules out is planned for 0.2.1.
 
 ## Supported versions
 

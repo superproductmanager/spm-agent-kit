@@ -269,7 +269,7 @@ test('usage counts the fixture by hand: last line per message id, <synthetic> sk
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const srv = await server();
   try {
-    const r = await run(kit, home, ['usage', '--role', 'listener', '--config', config], srv.base);
+    const r = await run(kit, home, ['usage', '--role', 'listener', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     const usage = reportsOf(srv).filter((x) => x.kind === 'usage');
     assert.equal(usage.length, 3, JSON.stringify(usage));
@@ -288,13 +288,13 @@ test('usage counts the fixture by hand: last line per message id, <synthetic> sk
   } finally { await srv.close(); }
 });
 
-test('usage reads only the newest transcript under the projects folders', async () => {
+test('usage reads only the session named by CLAUDE_CODE_SESSION_ID, never the newest file (kit 0.2.0)', async () => {
   const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 3600);
-  writeTranscript(home, '-other-proj', SESSION_B, [{ type: 'assistant', sessionId: SESSION_B, message: { id: 'old-1', model: 'claude-old-model', usage: { input_tokens: 500, output_tokens: 500, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }], 7200);
+  writeTranscript(home, '-other-proj', SESSION_B, [{ type: 'assistant', sessionId: SESSION_B, message: { id: 'old-1', model: 'claude-old-model', usage: { input_tokens: 500, output_tokens: 500, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } }], 60);
   const srv = await server();
   try {
-    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     const usage = reportsOf(srv).filter((x) => x.kind === 'usage');
     assert.ok(usage.length >= 1);
     assert.ok(usage.every((x) => x.session_key === KEY_OF(home, SESSION_A)), 'the older session is not reported');
@@ -330,7 +330,7 @@ test('usage with no transcript queues nothing and exits 0', async () => {
 test('usage with SPM down keeps its items in the spool file, one line each', async () => {
   const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
-  const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase());
+  const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase(), { CLAUDE_CODE_SESSION_ID: SESSION_A });
   assert.equal(r.code, 0, r.err);
   assert.deepEqual(r.lines, ['health: kept 3 for later']);
   const lines = fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
@@ -366,7 +366,7 @@ test('heartbeat: the first run counts the whole log, the next run counts only ne
   fs.writeFileSync(log, ['{"kind":"wrapper.start","t":"x"}', '{"kind":"start","t":"x"}', '{"kind":"listener.restart","t":"x","exit_code":1,"delay_s":2}', '{"kind":"listener.failing","t":"x","restarts":3}'].join('\n') + '\n');
   const srv = await server();
   try {
-    const r1 = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const r1 = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r1.code, 0, r1.err);
     const hb1 = reportsOf(srv).filter((x) => x.kind === 'heartbeat');
     assert.equal(hb1.length, 1);
@@ -376,7 +376,7 @@ test('heartbeat: the first run counts the whole log, the next run counts only ne
     assert.equal(hb1[0].main_status, undefined);
     fs.appendFileSync(log, '{"kind":"listener.restart","t":"y"}\n{"kind":"wrapper.start","t":"y"}\n{"kind":"wrapper.start","t":"z"\n');
     srv.seen.length = 0;
-    const r2 = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const r2 = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r2.code, 0, r2.err);
     const hb2 = reportsOf(srv).filter((x) => x.kind === 'heartbeat');
     assert.equal(hb2.length, 1);
@@ -394,22 +394,22 @@ test('heartbeat: container_starts is 1 for a new boot id, and main_changes follo
   fs.writeFileSync(path.join(stateDir(home), 'main-session-id'), 'main-one\n');
   const srv = await server();
   try {
-    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     const first = reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0];
     assert.equal(first.numbers.main_changes, 1, 'the first id seen counts as a change');
     srv.seen.length = 0;
-    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0].numbers.main_changes, 0);
     fs.writeFileSync(path.join(stateDir(home), 'main-session-id'), 'main-two\n');
     srv.seen.length = 0;
-    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0].numbers.main_changes, 1);
     // A state file from another boot: this is a new container.
     const healthFile = path.join(stateDir(home), 'health.json');
     const st = readJson(healthFile);
     fs.writeFileSync(healthFile, JSON.stringify({ ...st, bootId: 'some-other-boot' }));
     srv.seen.length = 0;
-    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0].numbers.container_starts, 1);
   } finally { await srv.close(); }
 });
@@ -421,12 +421,12 @@ test('heartbeat with no transcript queues nothing and keeps the log position', a
   fs.writeFileSync(log, '{"kind":"wrapper.start","t":"x"}\n');
   const srv = await server();
   try {
-    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     assert.equal(reportsOf(srv).length, 0);
     assert.equal(fs.existsSync(path.join(stateDir(home), 'health.json')), false);
     writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
-    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0].numbers.listener_starts, 1);
   } finally { await srv.close(); }
 });
@@ -436,11 +436,11 @@ test('heartbeat --main-status accepts a listed word; an unknown word becomes unk
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const srv = await server();
   try {
-    const bad = await run(kit, home, ['heartbeat', '--main-status', 'sleeping', '--config', config], srv.base);
+    const bad = await run(kit, home, ['heartbeat', '--main-status', 'sleeping', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(bad.code, 0, bad.err);
     assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat').at(-1).main_status, 'unknown');
     srv.seen.length = 0;
-    const ok = await run(kit, home, ['heartbeat', '--main-status', 'review_ready', '--config', config], srv.base);
+    const ok = await run(kit, home, ['heartbeat', '--main-status', 'review_ready', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(ok.code, 0, ok.err);
     assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0].main_status, 'review_ready');
   } finally { await srv.close(); }
@@ -513,9 +513,9 @@ test('no request body or output carries the key, and no body carries a secret-sh
   const srv = await server();
   try {
     const outs = [];
-    outs.push(await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base));
-    outs.push(await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base));
-    outs.push(await run(kit, home, ['heartbeat', '--config', config], srv.base));
+    outs.push(await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A }));
+    outs.push(await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A }));
+    outs.push(await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A }));
     assert.equal(srv.seen.length >= 4, true, JSON.stringify(srv.seen.map((q) => [q.method, q.url, q.text.length])));
     for (const q of srv.seen) {
       assert.equal(q.text.includes(FAKE_SPM_KEY), false, 'the key is never in a body');
@@ -537,11 +537,11 @@ test('the state folder follows SPM_AGENT_STATE_DIR when it is set', async () => 
   const alt = tmpdir('alt-state');
   const srv = await server();
   try {
-    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base, { SPM_AGENT_STATE_DIR: alt });
+    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base, { SPM_AGENT_STATE_DIR: alt, CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     assert.equal(fs.existsSync(path.join(alt, 'health.json')), false, 'no transcript, so no state is saved');
     writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
-    await run(kit, home, ['heartbeat', '--config', config], srv.base, { SPM_AGENT_STATE_DIR: alt });
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { SPM_AGENT_STATE_DIR: alt, CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(fs.existsSync(path.join(alt, 'health.json')), true);
     assert.equal(fs.existsSync(stateDir(home)), false);
   } finally { await srv.close(); }
@@ -577,7 +577,7 @@ test('B1 settings.reports false from SPM: nothing is sent until the next identif
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   let srv = await server(selfWith({ settings: { autostart: true, reports: false } }));
   try {
-    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     assert.equal(srv.seen.length, 1, 'only the identify call');
     assert.ok(hasLine(r.lines, /reports off/), JSON.stringify(r.lines));
@@ -588,13 +588,13 @@ test('B1 settings.reports false from SPM: nothing is sent until the next identif
     assert.equal(f.code, 0, f.err);
     assert.ok(hasLine(f.lines, /reports off/));
     assert.equal(srv.seen.length, 0, 'flush sends nothing while off');
-    const u = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    const u = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(u.code, 0, u.err);
     assert.equal(srv.seen.length, 0, 'usage sends nothing while off');
   } finally { await srv.close(); }
   srv = await server(selfWith({ settings: { autostart: true, reports: true } }));
   try {
-    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, true);
     assert.ok(reportsOf(srv).length >= 1, 'sending resumes after the next identify');
@@ -623,7 +623,7 @@ test('A2 the session key is sha256(salt + sessionId) with a salt created 0600 on
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const srv = await server();
   try {
-    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     const saltFile = path.join(stateDir(home), 'report-salt');
     assert.match(fs.readFileSync(saltFile, 'utf8').trim(), /^[0-9a-f]{32}$/);
     assert.equal(fs.statSync(saltFile).mode & 0o777, 0o600);
@@ -631,7 +631,7 @@ test('A2 the session key is sha256(salt + sessionId) with a salt created 0600 on
     const usage = reportsOf(srv).filter((x) => x.kind === 'usage');
     assert.equal(usage[0].session_key, crypto.createHash('sha256').update(salt + SESSION_A).digest('hex').slice(0, 16));
     assert.notEqual(usage[0].session_key, KEY_OF_UNSALTED(SESSION_A));
-    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(saltOf(home), salt, 'the salt is not replaced');
   } finally { await srv.close(); }
 });
@@ -642,7 +642,7 @@ test('A2 a report-salt that is not 32 lower-case hex exits 2 with one line and q
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   fs.mkdirSync(stateDir(home), { recursive: true });
   fs.writeFileSync(path.join(stateDir(home), 'report-salt'), 'NOT-A-SALT\n');
-  const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase());
+  const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase(), { CLAUDE_CODE_SESSION_ID: SESSION_A });
   assert.equal(r.code, 2);
   assert.equal(r.lines.length, 1, JSON.stringify(r.lines));
   assert.equal(fs.existsSync(spoolOf(home)), false);
@@ -652,12 +652,12 @@ test('A3 every item SPM accepts is appended to health-sent.jsonl (0600); nothing
   const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const sent = path.join(stateDir(home), 'health-sent.jsonl');
-  const down = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase());
+  const down = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase(), { CLAUDE_CODE_SESSION_ID: SESSION_A });
   assert.equal(down.code, 0, down.err);
   assert.equal(fs.existsSync(sent), false);
   const srv = await server();
   try {
-    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     const lines = fs.readFileSync(sent, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
     assert.equal(lines.length, 6, 'the three items kept while down, and the three queued now');
@@ -699,10 +699,10 @@ test('A4 settings report false: no network call at all, local files written, one
     assert.equal(start.code, 0, start.err);
     assert.deepEqual(start.lines, ['health: identified Example agent; reports off; nothing sent']);
     assert.equal(srv.seen.length, 1, 'start identifies once (A4 review: reports off does not skip identify)');
-    const usage = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    const usage = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(usage.code, 0, usage.err);
     assert.match(usage.lines[0], /reports off/);
-    const hb = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const hb = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(hb.code, 0, hb.err);
     assert.match(hb.lines[0], /reports off/);
     const fl = await run(kit, home, ['flush', '--config', config], srv.base);
@@ -736,10 +736,10 @@ test('A6 a missing kit VERSION does not stop identify; queueing commands exit 2;
     assert.equal(st.code, 0, st.err);
     assert.deepEqual(readJson(config).agent, { name: SPM_NAME, email: SPM_ADDRESS });
     assert.equal(readJson(config).app_id, APP_ID);
-    const us = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    const us = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(us.code, 2, us.err);
     assert.equal(us.lines.length, 1);
-    const hb = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const hb = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(hb.code, 2);
     srv.seen.length = 0;
     const fl = await run(kit, home, ['flush', '--config', config], srv.base);
@@ -882,7 +882,7 @@ test('B4 listener_starts counts wrapper.start lines only, and the heartbeat id i
   fs.writeFileSync(log, body);
   const srv = await server();
   try {
-    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     const hb = reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0];
     assert.equal(hb.numbers.listener_starts, 2);
@@ -901,11 +901,11 @@ test('B4 a retried heartbeat after a crash (same offsets) queues nothing new loc
   fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }));
   const srv = await server();
   try {
-    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     const healthFile = path.join(stateDir(home), 'health.json');
     const st = readJson(healthFile);
     fs.writeFileSync(healthFile, JSON.stringify({ ...st, logOffset: 0 })); // as if the state save was lost
-    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     const hbLines = fs.readFileSync(path.join(stateDir(home), 'setup-report.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.kind === 'heartbeat');
     assert.equal(hbLines.length, 1, 'one heartbeat line, not two');
   } finally { await srv.close(); }
@@ -1037,13 +1037,13 @@ test('C2 a sub-agent file with mode 000 is skipped and the others still count', 
   } finally { await srv.close(); fs.chmodSync(locked, 0o600); }
 });
 
-test('C2 with no --session and no --transcript the id is the newest transcript name, and its sub-agent files in any folder count', async () => {
+test('C2 with CLAUDE_CODE_SESSION_ID and no --session or --transcript the id is that session, and its sub-agent files in any folder count', async () => {
   const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 60);
   subFile(home, '-other-proj', SESSION_A, 'agent-far', [callLine(SESSION_A, 'sub-far', 'claude-sub-model-6', 11, 2)]);
   const srv = await server();
   try {
-    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     const sub = usageRows(srv).find((x) => x.model === 'claude-sub-model-6');
     assert.ok(sub, 'the sub-agent file in another folder counts');
@@ -1067,14 +1067,14 @@ test('C2 a --session that is not 8 to 64 letters, digits or dashes exits 2 with 
   } finally { await srv.close(); }
 });
 
-test('C5 settings posts kit_version and the newest session_key when a salt exists', async () => {
+test('C5 settings posts kit_version and the session_key of CLAUDE_CODE_SESSION_ID when a salt exists', async () => {
   const kit = makeKit(); const { home, config } = makeHome();
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 60);
   fs.mkdirSync(stateDir(home), { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(stateDir(home), 'report-salt'), 'ab'.repeat(16) + '\n', { mode: 0o600 });
   const srv = await server(settingsHandler(200, { autostart: false, reports: true }));
   try {
-    const r = await run(kit, home, ['settings', '--autostart', 'off', '--config', config], srv.base);
+    const r = await run(kit, home, ['settings', '--autostart', 'off', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
     assert.equal(r.code, 0, r.err);
     assert.deepEqual(srv.seen.find((q) => q.url.endsWith('/agent/settings')).json, { autostart: false, kit_version: '0.2.0', session_key: KEY_OF(home, SESSION_A) });
   } finally { await srv.close(); }
@@ -1137,5 +1137,115 @@ test('start with local "report": false and a refused key exits 6 and changes not
     assert.ok(hasLine(r.lines, /refused the key/), JSON.stringify(r.lines));
     assert.equal(fs.readFileSync(config, 'utf8'), before);
     assert.equal(reportsOf(srv).length, 0);
+  } finally { await srv.close(); }
+});
+
+// ---------------------------------------------------------------- Kit 0.2.0: usage counts the session that runs it
+// CLAUDE_CODE_SESSION_ID names the session; the newest log file never does. run() gives a clean environment,
+// so the variable is set only where a test sets it.
+const SESSION_ENV = 'CLAUDE_CODE_SESSION_ID';
+const NO_SESSION_LINE = 'health: no session id (no --session and CLAUDE_CODE_SESSION_ID is not set); usage not counted';
+
+// Two sessions in one environment. A has the older files; B has the newest. Each has a log in two project
+// folders and a sub-agent file.
+function twoSessions(home) {
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 3600);
+  writeTranscript(home, '-other-proj', SESSION_A, [callLine(SESSION_A, 'a-other-1', 'claude-a-model-5', 5, 5)], 3600);
+  subFile(home, '-work-proj', SESSION_A, 'agent-a', [callLine(SESSION_A, 'sub-a', 'claude-a-sub-7', 13, 1)]);
+  writeTranscript(home, '-work-proj', SESSION_B, [callLine(SESSION_B, 'b-1', 'claude-b-model-8', 21, 2)], 60);
+  writeTranscript(home, '-other-proj', SESSION_B, [callLine(SESSION_B, 'b-2', 'claude-b-model-8', 34, 3)], 60);
+  subFile(home, '-other-proj', SESSION_B, 'agent-b', [callLine(SESSION_B, 'sub-b', 'claude-b-sub-9', 55, 4)]);
+}
+
+test('K0.2.0 T1 usage with CLAUDE_CODE_SESSION_ID=A counts all of A and none of the newest session B', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  twoSessions(home);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { [SESSION_ENV]: SESSION_A });
+    assert.equal(r.code, 0, r.err);
+    const rows = usageRows(srv);
+    assert.ok(rows.length > 0, JSON.stringify(r.lines));
+    assert.ok(rows.every((x) => x.session_key === KEY_OF(home, SESSION_A)), 'every row is session A');
+    assert.ok(rows.every((x) => !/^claude-b-/.test(x.model)), 'no model that only session B used');
+    assert.ok(rows.some((x) => x.model === 'claude-a-sub-7'), 'the sub-agent file of A counts');
+    assert.ok(rows.some((x) => x.model === 'claude-a-model-5'), 'the copy of A in the other folder counts');
+    assert.equal(rows.find((x) => x.model === 'claude-test-model-1').numbers.calls, 2);
+  } finally { await srv.close(); }
+});
+
+test('K0.2.0 T2 --session B with CLAUDE_CODE_SESSION_ID=A counts B: the flag wins', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  twoSessions(home);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config, '--session', SESSION_B], srv.base, { [SESSION_ENV]: SESSION_A });
+    assert.equal(r.code, 0, r.err);
+    const rows = usageRows(srv);
+    assert.ok(rows.length > 0, JSON.stringify(r.lines));
+    assert.ok(rows.every((x) => x.session_key === KEY_OF(home, SESSION_B)), 'every row is session B');
+    assert.ok(rows.every((x) => !/^claude-a-/.test(x.model) && !/^claude-test-model-/.test(x.model)), 'nothing from A');
+  } finally { await srv.close(); }
+});
+
+test('K0.2.0 T3 usage with no session id prints one line, queues nothing, sends nothing, exits 0', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 60);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, NO_SESSION_LINE + '\n');
+    assert.equal(r.err, '');
+    assert.equal(srv.seen.length, 0, 'no request to SPM');
+    assert.equal(spoolText(home), '', 'nothing queued');
+  } finally { await srv.close(); }
+});
+
+test('K0.2.0 T4 CLAUDE_CODE_SESSION_ID that is not a valid id (../x, or 5 characters) counts as not set', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA(), 60);
+  const srv = await server();
+  try {
+    for (const bad of ['../x', 'abcde']) {
+      const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { [SESSION_ENV]: bad });
+      assert.equal(r.code, 0, bad);
+      assert.equal(r.out, NO_SESSION_LINE + '\n', bad);
+    }
+    assert.equal(srv.seen.length, 0, 'no request to SPM');
+    assert.equal(spoolText(home), '', 'nothing queued');
+  } finally { await srv.close(); }
+});
+
+test('K0.2.0 T5 settings sends the key of session A from the environment, and no session_key without it', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  twoSessions(home);
+  fs.mkdirSync(stateDir(home), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(stateDir(home), 'report-salt'), 'ab'.repeat(16) + '\n', { mode: 0o600 });
+  const srv = await server(settingsHandler(200, { autostart: false, reports: true }));
+  try {
+    const r = await run(kit, home, ['settings', '--autostart', 'off', '--config', config], srv.base, { [SESSION_ENV]: SESSION_A });
+    assert.equal(r.code, 0, r.err);
+    const body = srv.seen.find((q) => q.url.endsWith('/agent/settings')).json;
+    assert.equal(body.session_key, KEY_OF(home, SESSION_A), 'the key of A, not of the newest file (B)');
+    const r2 = await run(kit, home, ['settings', '--autostart', 'on', '--config', config], srv.base);
+    assert.equal(r2.code, 0, r2.err);
+    const body2 = srv.seen.filter((q) => q.url.endsWith('/agent/settings')).pop().json;
+    assert.equal(Object.prototype.hasOwnProperty.call(body2, 'session_key'), false, 'no environment variable, no session_key');
+  } finally { await srv.close(); }
+});
+
+test('K0.2.0 T6 heartbeat with CLAUDE_CODE_SESSION_ID=A reads the files of A, not of the newest session B', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  twoSessions(home);
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(home), 'listener.log'), '{"kind":"wrapper.start","t":"x"}\n');
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base, { [SESSION_ENV]: SESSION_A });
+    assert.equal(r.code, 0, r.err);
+    const hb = reportsOf(srv).filter((x) => x.kind === 'heartbeat');
+    assert.equal(hb.length, 1, JSON.stringify(r.lines));
+    assert.equal(hb[0].session_key, KEY_OF(home, SESSION_A));
   } finally { await srv.close(); }
 });

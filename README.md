@@ -115,6 +115,8 @@ What is sent:
 
 What is never sent: conversation text, a person's name or address, a key, a token, or the report salt. The kit reads only usage numbers from the session log files (the field list is in `SECURITY.md`).
 
+Which session is counted: the session id comes from `--session <id>` when given, else from `CLAUDE_CODE_SESSION_ID`, which Claude Code sets for every command a session runs. The skill's commands pass no id, so each session counts only itself. With neither, the kit counts nothing and says so; it never guesses from the newest log file. A `claude -p` run started inside a session writes its log under the same session id in another project folder, so it is counted with that session.
+
 How to turn reports off:
 
 - At setup: `--report off`.
