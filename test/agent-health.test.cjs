@@ -18,19 +18,26 @@ const SPM_NAME = 'Example agent';
 const SPM_ADDRESS = 'spm-example-agent@agents.invalid';
 const SESSION_A = '3f2a9c10-1111-4aaa-8bbb-000000000001';
 const SESSION_B = '3f2a9c10-2222-4aaa-8bbb-000000000002';
-const KEY_OF = (sid) => crypto.createHash('sha256').update(sid).digest('hex').slice(0, 16);
+// The salted session key (Addendum A2): first 16 hex of sha256(salt + sessionId), salt = <state>/report-salt.
+const saltOf = (home) => fs.readFileSync(path.join(home, '.spm-agent-state', 'report-salt'), 'utf8').trim();
+const KEY_OF = (home, sid) => crypto.createHash('sha256').update(saltOf(home) + sid).digest('hex').slice(0, 16);
 
 function tmpdir(label) { return fs.mkdtempSync(path.join(os.tmpdir(), `health-${label}-`)); }
 
 // A kit folder: a copy of agent-health.cjs and lib/, with a VERSION file as the installer writes it.
-function makeKit() {
+function makeKit({ version = '0.2.0\n' } = {}) {
   const dir = tmpdir('kit');
   fs.mkdirSync(path.join(dir, 'lib'));
   fs.copyFileSync(path.join(KIT_SRC, 'agent-health.cjs'), path.join(dir, 'agent-health.cjs'));
   for (const f of fs.readdirSync(path.join(KIT_SRC, 'lib'))) fs.copyFileSync(path.join(KIT_SRC, 'lib', f), path.join(dir, 'lib', f));
-  fs.writeFileSync(path.join(dir, 'VERSION'), '0.2.0\n');
+  if (version !== null) fs.writeFileSync(path.join(dir, 'VERSION'), version);
   return dir;
 }
+
+// A self answer with extra fields (Addendum A1: app_id, min_kit_version, report).
+const selfWith = (extra = {}) => (rec) => (rec.url.endsWith('/agent/self')
+  ? { status: 200, body: { address: SPM_ADDRESS, name: SPM_NAME, workspaces: [], ...extra } } : null);
+const APP_ID = 'appid-test-0123456789abcdef';
 
 // A temp HOME with a key file and a settings file that names no agent yet (unless `agent` is given).
 function makeHome(agent) {
@@ -232,7 +239,7 @@ test('usage counts the fixture by hand: last line per message id, <synthetic> sk
     const m2 = usage.find((x) => x.model === 'claude-test-model-2');
     assert.deepEqual(m1.numbers, { calls: 2, input_tokens: 30, output_tokens: 12, cache_write_tokens: 100, cache_read_tokens: 3000, compactions: 2, compaction_pre_tokens: 200000 });
     assert.deepEqual(m2.numbers, { calls: 1, input_tokens: 3, output_tokens: 4, cache_write_tokens: 5, cache_read_tokens: 6, compactions: 0, compaction_pre_tokens: 0 });
-    assert.equal(m1.session_key, KEY_OF(SESSION_A));
+    assert.equal(m1.session_key, KEY_OF(home, SESSION_A));
     assert.equal(m1.role, 'listener');
     assert.equal(m1.kit_version, '0.2.0');
     assert.match(m1.id, /^[0-9a-f-]{16,64}$/);
@@ -249,7 +256,7 @@ test('usage reads only the newest transcript under the projects folders', async 
     await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
     const usage = reportsOf(srv).filter((x) => x.kind === 'usage');
     assert.ok(usage.length >= 1);
-    assert.ok(usage.every((x) => x.session_key === KEY_OF(SESSION_A)), 'the older session is not reported');
+    assert.ok(usage.every((x) => x.session_key === KEY_OF(home, SESSION_A)), 'the older session is not reported');
     assert.ok(usage.every((x) => x.model !== 'claude-old-model'));
   } finally { await srv.close(); }
 });
@@ -264,7 +271,7 @@ test('usage with --transcript reads the named file', async () => {
     assert.equal(r.code, 0, r.err);
     const usage = reportsOf(srv).filter((x) => x.kind === 'usage');
     assert.equal(usage.length, 1);
-    assert.equal(usage[0].session_key, KEY_OF(SESSION_B));
+    assert.equal(usage[0].session_key, KEY_OF(home, SESSION_B));
     assert.equal(usage[0].numbers.input_tokens, 4);
   } finally { await srv.close(); }
 });
@@ -323,7 +330,7 @@ test('heartbeat: the first run counts the whole log, the next run counts only ne
     const hb1 = reportsOf(srv).filter((x) => x.kind === 'heartbeat');
     assert.equal(hb1.length, 1);
     assert.deepEqual(hb1[0].numbers, { listener_starts: 1, listener_restarts: 1, listener_failing: 1, container_starts: 1, main_changes: 0, uptime_s: 0 });
-    assert.equal(hb1[0].session_key, KEY_OF(SESSION_A));
+    assert.equal(hb1[0].session_key, KEY_OF(home, SESSION_A));
     assert.equal(hb1[0].role, 'listener');
     assert.equal(hb1[0].main_status, undefined);
     fs.appendFileSync(log, '{"kind":"listener.restart","t":"y"}\n{"kind":"start","t":"y"}\n{"kind":"start","t":"z"\n');
@@ -474,6 +481,8 @@ test('no request body or output carries the key, and no body carries a secret-sh
       assert.equal(q.text.includes('synthetic user text'), false);
       assert.equal(q.text.includes('synthetic reply text'), false);
     }
+    const salt = saltOf(home);
+    for (const q of srv.seen) assert.equal(q.text.includes(salt), false, 'the report salt is never sent');
     for (const o of outs) assert.equal((o.out + o.err).includes(FAKE_SPM_KEY), false);
     for (const q of srv.seen.filter((x) => x.url.endsWith('/agent/reports'))) {
       for (const item of q.json.reports) assert.equal(Object.keys(item).every((k) => ['id', 'kind', 'role', 'at', 'kit_version', 'node_version', 'session_key', 'model', 'numbers', 'main_status', 'code', 'detail', 'run_id', 'step', 'status'].includes(k)), true);
@@ -495,3 +504,205 @@ test('the state folder follows SPM_AGENT_STATE_DIR when it is set', async () => 
     assert.equal(fs.existsSync(stateDir(home)), false);
   } finally { await srv.close(); }
 });
+
+// ---------------------------------------------------------------- Addendum A (28 Oct): app id, salt, sent log, opt-out, min kit
+test('A1 identify writes app_id when the file has none, keeps an existing one, and ignores an invalid SPM value', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  let srv = await server(selfWith({ app_id: APP_ID }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(readJson(config).app_id, APP_ID);
+  } finally { await srv.close(); }
+  const kept = makeHome({ name: SPM_NAME, email: SPM_ADDRESS }); // has no app_id yet
+  fs.writeFileSync(kept.config, JSON.stringify({ ...readJson(kept.config), app_id: 'existing-app-id-0123456789' }));
+  srv = await server(selfWith({ app_id: APP_ID }));
+  try {
+    await run(kit, kept.home, ['start', '--role', 'listener', '--config', kept.config], srv.base);
+    assert.equal(readJson(kept.config).app_id, 'existing-app-id-0123456789');
+  } finally { await srv.close(); }
+  const bad = makeHome();
+  srv = await server(selfWith({ app_id: 'bad id with spaces !!' }));
+  try {
+    const r = await run(kit, bad.home, ['start', '--role', 'listener', '--config', bad.config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(readJson(bad.config).app_id, undefined);
+  } finally { await srv.close(); }
+});
+
+test('A1 report.on false from SPM: nothing is sent until the next identify, local files are still written', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  let srv = await server(selfWith({ report: { on: false, interval_s: 3600 } }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(srv.seen.length, 1, 'only the identify call');
+    assert.ok(hasLine(r.lines, /reports off/), JSON.stringify(r.lines));
+    assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, false);
+    assert.equal(fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).length, 2, 'usage queued locally');
+    srv.seen.length = 0;
+    const f = await run(kit, home, ['flush', '--config', config], srv.base);
+    assert.equal(f.code, 0, f.err);
+    assert.ok(hasLine(f.lines, /reports off/));
+    assert.equal(srv.seen.length, 0, 'flush sends nothing while off');
+    const u = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    assert.equal(u.code, 0, u.err);
+    assert.equal(srv.seen.length, 0, 'usage sends nothing while off');
+  } finally { await srv.close(); }
+  srv = await server(selfWith({ report: { on: true, interval_s: 3600 } }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, true);
+    assert.ok(reportsOf(srv).length >= 1, 'sending resumes after the next identify');
+  } finally { await srv.close(); }
+});
+
+test('A5 a kit older than min_kit_version prints one warning line and still runs', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  let srv = await server(selfWith({ min_kit_version: '0.3.0' }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.lines.filter((l) => /warning/.test(l)).length, 1, JSON.stringify(r.lines));
+    assert.equal(r.lines.length, 2);
+  } finally { await srv.close(); }
+  srv = await server(selfWith({ min_kit_version: '0.2.0' }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.lines.length, 1, JSON.stringify(r.lines));
+  } finally { await srv.close(); }
+});
+
+test('A2 the session key is sha256(salt + sessionId) with a salt created 0600 on first use and reused after', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  const srv = await server();
+  try {
+    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    const saltFile = path.join(stateDir(home), 'report-salt');
+    assert.match(fs.readFileSync(saltFile, 'utf8').trim(), /^[0-9a-f]{32}$/);
+    assert.equal(fs.statSync(saltFile).mode & 0o777, 0o600);
+    const salt = saltOf(home);
+    const usage = reportsOf(srv).filter((x) => x.kind === 'usage');
+    assert.equal(usage[0].session_key, crypto.createHash('sha256').update(salt + SESSION_A).digest('hex').slice(0, 16));
+    assert.notEqual(usage[0].session_key, KEY_OF_UNSALTED(SESSION_A));
+    await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    assert.equal(saltOf(home), salt, 'the salt is not replaced');
+  } finally { await srv.close(); }
+});
+function KEY_OF_UNSALTED(sid) { return crypto.createHash('sha256').update(sid).digest('hex').slice(0, 16); }
+
+test('A2 a report-salt that is not 32 lower-case hex exits 2 with one line and queues nothing', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(home), 'report-salt'), 'NOT-A-SALT\n');
+  const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase());
+  assert.equal(r.code, 2);
+  assert.equal(r.lines.length, 1, JSON.stringify(r.lines));
+  assert.equal(fs.existsSync(spoolOf(home)), false);
+});
+
+test('A3 every item SPM accepts is appended to health-sent.jsonl (0600); nothing is written when the send fails', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  const sent = path.join(stateDir(home), 'health-sent.jsonl');
+  const down = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase());
+  assert.equal(down.code, 0, down.err);
+  assert.equal(fs.existsSync(sent), false);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const lines = fs.readFileSync(sent, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(lines.length, 4, 'the two items kept while down, and the two queued now');
+    assert.equal(fs.statSync(sent).mode & 0o777, 0o600);
+    assert.deepEqual(lines.map((x) => x.id).sort(), reportsOf(srv).map((x) => x.id).sort());
+  } finally { await srv.close(); }
+});
+
+test('A3 over 1 MB the sent log keeps its newest half of the lines', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  const sent = path.join(stateDir(home), 'health-sent.jsonl');
+  const old = [];
+  for (let i = 0; i < 1200; i++) old.push(`{"old":${i},"pad":"${'p'.repeat(980)}"}`);
+  fs.writeFileSync(sent, old.join('\n') + '\n');
+  fs.writeFileSync(spoolOf(home), JSON.stringify({ id: crypto.randomUUID(), kind: 'setup', role: 'setup', at: new Date().toISOString(), kit_version: '0.2.0', run_id: 'abcdef12', step: 'config', status: 'pass' }) + '\n');
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['flush', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const lines = fs.readFileSync(sent, 'utf8').split('\n').filter(Boolean);
+    assert.equal(lines.length, Math.ceil(1201 / 2));
+    assert.equal(JSON.parse(lines[lines.length - 1]).step, 'config');
+    assert.equal(JSON.parse(lines[0]).old, 600, 'the newest half: old lines 600 to 1199 and the new line');
+    assert.ok(fs.statSync(sent).size <= 1024 * 1024);
+    assert.equal(fs.statSync(sent).mode & 0o777, 0o600);
+  } finally { await srv.close(); }
+});
+
+test('A4 settings report false: no network call at all, local files written, one line says reports off, no key needed', async () => {
+  const kit = makeKit(); const home = tmpdir('home-off');
+  const config = path.join(home, 'agent.json');
+  fs.writeFileSync(config, JSON.stringify({ report: false }) + '\n');
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  const srv = await server();
+  try {
+    const start = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(start.code, 0, start.err);
+    assert.equal(start.lines.length, 1, JSON.stringify(start.lines));
+    assert.match(start.lines[0], /reports off/);
+    const usage = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    assert.equal(usage.code, 0, usage.err);
+    assert.match(usage.lines[0], /reports off/);
+    const hb = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    assert.equal(hb.code, 0, hb.err);
+    assert.match(hb.lines[0], /reports off/);
+    const fl = await run(kit, home, ['flush', '--config', config], srv.base);
+    assert.equal(fl.code, 0, fl.err);
+    assert.match(fl.lines[0], /reports off/);
+    assert.equal(srv.seen.length, 0, 'no network call of any kind');
+    assert.equal(readJson(config).agent, undefined, 'identify did not run, so no agent name is written');
+    const queued = fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.ok(queued.some((x) => x.kind === 'usage') && queued.some((x) => x.kind === 'heartbeat'));
+    assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, undefined);
+  } finally { await srv.close(); }
+});
+
+test('A4 a report setting that is not true or false exits 2 with one line', async () => {
+  const kit = makeKit(); const home = tmpdir('home-badreport');
+  const config = path.join(home, 'agent.json');
+  fs.writeFileSync(config, JSON.stringify({ report: 'off' }) + '\n');
+  const r = await run(kit, home, ['flush', '--config', config], await deadBase());
+  assert.equal(r.code, 2);
+  assert.equal(r.lines.length, 1, JSON.stringify(r.lines));
+});
+
+test('A6 a missing kit VERSION does not stop identify; queueing commands exit 2; flush keeps lines it cannot version', async () => {
+  const kit = makeKit({ version: null }); const { home, config } = makeHome();
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  fs.writeFileSync(spoolOf(home), JSON.stringify({ id: crypto.randomUUID(), kind: 'setup', role: 'setup', at: new Date().toISOString(), run_id: 'abcdef12', step: 'config', status: 'pass' }) + '\n');
+  const srv = await server(selfWith({ app_id: APP_ID }));
+  try {
+    const st = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
+    assert.equal(st.code, 0, st.err);
+    assert.deepEqual(readJson(config).agent, { name: SPM_NAME, email: SPM_ADDRESS });
+    assert.equal(readJson(config).app_id, APP_ID);
+    const us = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
+    assert.equal(us.code, 2, us.err);
+    assert.equal(us.lines.length, 1);
+    const hb = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    assert.equal(hb.code, 2);
+    srv.seen.length = 0;
+    const fl = await run(kit, home, ['flush', '--config', config], srv.base);
+    assert.equal(fl.code, 0, fl.err);
+    assert.equal(reportsOf(srv).length, 0, 'the unversioned line is not sent');
+    assert.equal(readLines(spoolOf(home)).length, 1, 'and is kept for later');
+  } finally { await srv.close(); }
+});
+function readLines(f) { return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean); }

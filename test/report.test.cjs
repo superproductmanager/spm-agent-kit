@@ -295,3 +295,23 @@ test('spmBase: default production base, a local http override, and refusals for 
   assert.throws(() => report.spmBase({ SPM_AGENT_API_BASE: 'ftp://127.0.0.1/x' }));
   assert.throws(() => report.spmBase({ SPM_AGENT_API_BASE: 'not a url' }));
 });
+
+// ---------------------------------------------------------------- Addendum A (28 Oct) in lib/report.cjs
+test('A3 flushSpool appends each 2xx item to the sent log, and a missing kit version keeps unversioned lines', async () => {
+  const file = spoolFile();
+  const sentLog = path.join(path.dirname(file), 'health-sent.jsonl');
+  report.queueItem(file, setupItem({ step: 'one' }), NOW);
+  fs.appendFileSync(file, JSON.stringify({ ...setupItem({ step: 'noversion' }), kit_version: undefined }).replace(',"kit_version":undefined', '') + '\n');
+  const srv = await server();
+  try {
+    const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: null, now: NOW, sentLog });
+    assert.equal(r.sent, 1);
+    assert.equal(r.kept, 1, 'the line with no kit version waits');
+    assert.equal(readLines(sentLog).length, 1);
+    assert.equal(fs.statSync(sentLog).mode & 0o777, 0o600);
+    assert.equal(readLines(file).length, 1);
+    const r2 = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW, sentLog });
+    assert.equal(r2.sent, 1);
+    assert.equal(readLines(sentLog).length, 2);
+  } finally { await srv.close(); }
+});

@@ -2,11 +2,12 @@
 'use strict';
 /**
  * agent-health.cjs: the agent's health reports to SPM (kit 0.2.0). Numbers only: counts, token totals, fixed words.
- * It never reads or sends conversation text, a person's name or address, a key, or a token.
+ * It never reads or sends conversation text, a person's name or address, a key, a token or the report salt.
  *
  *   node agent-health.cjs start --role main|listener --config <absolute path>
- *       Asks SPM whose key this is (GET /agent/self, key header only). Writes agent.name and agent.email into the
- *       settings file when they are absent; exits 5 when they are present and differ. Then queues usage and sends the spool.
+ *       Asks SPM whose key this is (GET /agent/self, key header only). Writes agent.name and agent.email, and app_id
+ *       when the file has none, into the settings file; exits 5 when agent.name or agent.email differ. Stores SPM's
+ *       report.on in the state folder (health.json). Then queues usage and sends the spool.
  *   node agent-health.cjs usage --role main|listener --config <absolute path> [--transcript <absolute path>]
  *       Queues one usage item per model for the newest session transcript, then sends the spool.
  *   node agent-health.cjs heartbeat --config <absolute path> [--main-status <word>] [--transcript <absolute path>]
@@ -14,12 +15,16 @@
  *   node agent-health.cjs flush --config <absolute path>
  *       Sends the spool only.
  *
- * SETTINGS FILE: the JSON file of lib/config.cjs. Only key_file, agent and the agent's own fields are read here; a file
- * without agent is fine. The state folder is SPM_AGENT_STATE_DIR, else $HOME/.spm-agent-state (see lib/report.cjs).
+ * SETTINGS FILE: the JSON file of lib/config.cjs. Read here: key_file, agent, app_id, report. A file without agent is fine.
+ * "report": false in the file means nothing is sent at all (no network call); the local files are still written.
+ * The state folder is SPM_AGENT_STATE_DIR, else $HOME/.spm-agent-state (see lib/report.cjs). It holds the spool
+ * (setup-report.jsonl), the sent copy (health-sent.jsonl, Addendum A3), the salt for session keys (report-salt, A2),
+ * health.json (state, and report.on from SPM, A4), and the listener log and main-session-id the heartbeat reads.
  * SPM: https://asia-south1-litethink.cloudfunctions.net/accountApi (override for tests: SPM_AGENT_API_BASE, 127.0.0.1 only).
- * EXIT CODES: 0 ok, or reports kept for later (one line "health: kept <n> for later"); 2 bad arguments or settings file;
- * 5 the settings file names another agent than this key's; 6 SPM refused the key. Any other failure exits 1.
- * Every line starts with "health:". Nothing is printed but those lines and the usage text.
+ * EXIT CODES: 0 ok, or reports kept for later ("health: kept <n> for later"), or reports off; 2 bad arguments or settings
+ * file, a queueing command with no kit VERSION file, or a bad report-salt; 5 the settings file names another agent than
+ * this key's; 6 SPM refused the key. An unexpected failure exits 1.
+ * Every line starts with "health:". A kit older than SPM's min_kit_version gets one warning line and still runs.
  */
 
 const fs = require('node:fs');
@@ -31,6 +36,8 @@ const R = require(path.join(__dirname, 'lib', 'report.cjs'));
 
 const AGENT_NAME_RE = /^[A-Za-z0-9 ._()-]{1,60}$/;
 const AGENT_ADDRESS_RE = /^[a-z0-9._-]+@agents\.invalid$/;
+const APP_ID_RE = /^[A-Za-z0-9_-]{20,60}$/;
+const SALT_RE = /^[0-9a-f]{32}$/;
 const MODEL_RE = /^claude-[a-z0-9.-]{1,60}$/;
 const VERSION_RE = /^\d+\.\d+\.\d+$/;
 const MAX_NUMBER = 1e12;
@@ -77,6 +84,7 @@ function readSettings(file) {
   try { c = JSON.parse(fs.readFileSync(file, 'utf8')); } catch (_) { return { error: 'the settings file is not valid JSON' }; }
   if (!c || typeof c !== 'object' || Array.isArray(c)) return { error: 'the settings file must hold a JSON object' };
   if (c.key_file !== undefined && (typeof c.key_file !== 'string' || !path.isAbsolute(c.key_file))) return { error: 'key_file must be an absolute path' };
+  if (c.report !== undefined && typeof c.report !== 'boolean') return { error: 'report must be true or false' };
   return { c, mode: st.mode & 0o777 };
 }
 
@@ -92,6 +100,13 @@ function resolveKey(c, env) {
   } catch (_) { return { error: 'cannot read the key file' }; }
 }
 
+// The key and the base URL for a send. { key, base } or { error }.
+function sendTarget(c, env) {
+  const kr = resolveKey(c, env);
+  if (kr.error) return { error: kr.error };
+  try { return { key: kr.key, base: R.spmBase(env) }; } catch (e) { return { error: e.message }; }
+}
+
 // The kit version from <kit>/VERSION, written by the installer. { version } or { error }.
 function readKitVersion() {
   let text;
@@ -101,8 +116,17 @@ function readKitVersion() {
   return { version: v };
 }
 
-// Asks SPM whose key this is. { kind: 'ok', name, address } | { kind: 'refused', status } | { kind: 'unreachable' }.
-// Any answer that is not a valid identity counts as unreachable: nothing is written from it.
+// True when kit version a is older than b (both x.y.z).
+function versionOlder(a, b) {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < 3; i++) { if (pa[i] !== pb[i]) return pa[i] < pb[i]; }
+  return false;
+}
+
+// Asks SPM whose key this is. { kind: 'ok', name, address, appId, minKit, reportOn } | { kind: 'refused', status }
+// | { kind: 'unreachable' }. Any answer that is not a valid identity counts as unreachable: nothing is written from it.
+// app_id, min_kit_version and report are optional: a bad value is ignored. report.on false turns reports off.
 async function identify({ base, key, timeoutMs }) {
   let r;
   try {
@@ -113,7 +137,10 @@ async function identify({ base, key, timeoutMs }) {
   let j;
   try { j = JSON.parse(r.text); } catch (_) { return { kind: 'unreachable' }; }
   if (!j || typeof j.name !== 'string' || !AGENT_NAME_RE.test(j.name) || typeof j.address !== 'string' || !AGENT_ADDRESS_RE.test(j.address)) return { kind: 'unreachable' };
-  return { kind: 'ok', name: j.name, address: j.address };
+  const appId = typeof j.app_id === 'string' && APP_ID_RE.test(j.app_id) ? j.app_id : null;
+  const minKit = typeof j.min_kit_version === 'string' && VERSION_RE.test(j.min_kit_version) ? j.min_kit_version : null;
+  const reportOn = !(j.report && typeof j.report === 'object' && j.report.on === false);
+  return { kind: 'ok', name: j.name, address: j.address, appId, minKit, reportOn };
 }
 
 // The newest *.jsonl directly under <home>/.claude/projects/<folder>/ (by mtime), or null.
@@ -178,10 +205,31 @@ function readTranscript(file) {
   return { sessions, primary };
 }
 
-const sessionKey = (sid) => crypto.createHash('sha256').update(sid).digest('hex').slice(0, 16);
+// Addendum A2: first 16 hex of sha256(salt + sessionId).
+const sessionKey = (sid, salt) => crypto.createHash('sha256').update(salt + sid).digest('hex').slice(0, 16);
+
+// The salt in <state>/report-salt (32 lower-case hex). Created 0600 when missing. { salt } or { error }.
+function loadSalt(sdir) {
+  const file = path.join(sdir, 'report-salt');
+  const valid = (text) => { const s = text.trim(); return SALT_RE.test(s) ? { salt: s } : { error: 'report-salt is not valid' }; };
+  try {
+    return valid(fs.readFileSync(file, 'utf8'));
+  } catch (e) {
+    if (e.code !== 'ENOENT') return { error: 'cannot read report-salt' };
+  }
+  fs.mkdirSync(sdir, { recursive: true, mode: 0o700 });
+  try {
+    const fresh = crypto.randomBytes(16).toString('hex');
+    fs.writeFileSync(file, fresh + '\n', { mode: 0o600, flag: 'wx' });
+    return { salt: fresh };
+  } catch (e) {
+    if (e.code !== 'EEXIST') return { error: 'cannot create report-salt' };
+    try { return valid(fs.readFileSync(file, 'utf8')); } catch (_) { return { error: 'cannot read report-salt' }; }
+  }
+}
 
 // One usage item per session and model (cumulative totals). The session's compactions go on its model with most calls.
-function usageItems(parsed, role, meta) {
+function usageItems(parsed, role, meta, salt) {
   const items = [];
   for (const [sid, s] of parsed.sessions) {
     const rows = [...s.models].sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0)).map(([model, ids]) => {
@@ -200,19 +248,19 @@ function usageItems(parsed, role, meta) {
       for (const k of Object.keys(x.t)) numbers[k] = cap(x.t[k]);
       numbers.compactions = i === target ? cap(s.compactions) : 0;
       numbers.compaction_pre_tokens = i === target ? cap(s.preTokens) : 0;
-      items.push({ kind: 'usage', role, ...meta, session_key: sessionKey(sid), model: x.model, numbers });
+      items.push({ kind: 'usage', role, ...meta, session_key: sessionKey(sid, salt), model: x.model, numbers });
     });
   }
   return items;
 }
 
 // Queues the usage items of one transcript. Returns how many were queued (0 when there is no transcript).
-function queueUsage({ transcript, role, spool, meta, now }) {
+function queueUsage({ transcript, role, spool, meta, now, salt }) {
   if (!transcript) return 0;
   let parsed;
   try { parsed = readTranscript(transcript); } catch (_) { return 0; }
   let n = 0;
-  for (const item of usageItems(parsed, role, meta)) { if (R.queueItem(spool, item, now).ok) n++; }
+  for (const item of usageItems(parsed, role, meta, salt)) { if (R.queueItem(spool, item, now).ok) n++; }
   return n;
 }
 
@@ -263,6 +311,12 @@ function finish(io, f, head) {
   return 0;
 }
 
+// The one output line when nothing is sent. fromSpm: the off switch came from SPM's identify answer.
+function offLine(io, detail, fromSpm) {
+  io.out(`health: reports off${fromSpm ? ' from SPM' : ''}; nothing sent${detail ? `, ${detail}` : ''}`);
+  return 0;
+}
+
 // Runs one command. deps: io { out, err }, env (default process.env), now () -> epoch ms. Returns the exit code.
 async function main(argv, deps) {
   const io = deps.io;
@@ -273,81 +327,117 @@ async function main(argv, deps) {
   const rs = readSettings(p.config);
   if (rs.error) { io.err(`health: ${rs.error}; nothing changed`); return 2; }
   const c = rs.c;
-  const kr = resolveKey(c, env);
-  if (kr.error) { io.err(`health: ${kr.error}; nothing changed`); return 2; }
-  let base;
-  try { base = R.spmBase(env); } catch (e) { io.err(`health: ${e.message}`); return 2; }
-  const kv = readKitVersion();
-  if (kv.error) { io.err(`health: ${kv.error}`); return 2; }
   const home = env.HOME || os.homedir();
   const sdir = R.stateDir(env);
   const spool = path.join(sdir, 'setup-report.jsonl');
-  const meta = { at: new Date(now).toISOString(), kit_version: kv.version, node_version: process.version };
-  const transcript = p.transcript || newestTranscript(home);
-  const flush = () => R.flushSpool({ spoolFile: spool, base, key: kr.key, kitVersion: kv.version, now });
-
-  if (p.cmd === 'flush') return finish(io, await flush(), null);
-
-  if (p.cmd === 'usage') {
-    const queued = queueUsage({ transcript, role: p.role, spool, meta, now });
-    return finish(io, await flush(), `usage queued ${queued}`);
-  }
-
-  if (p.cmd === 'start') {
-    const id = await identify({ base, key: kr.key, timeoutMs: R.SEND_TIMEOUT_MS });
-    if (id.kind === 'refused') { io.err(`health: SPM refused the key (status ${id.status}); nothing changed`); return 6; }
-    if (id.kind === 'unreachable') {
-      queueUsage({ transcript, role: p.role, spool, meta, now });
-      io.out(`health: kept ${R.readSpool(spool).length} for later`);
-      return 0;
-    }
-    const agent = c.agent;
-    if (agent !== undefined && (!agent || typeof agent !== 'object' || Array.isArray(agent) ||
-        (agent.name !== undefined && typeof agent.name !== 'string') || (agent.email !== undefined && typeof agent.email !== 'string'))) {
-      io.err('health: the agent entry in the settings file is not valid; nothing changed');
-      return 2;
-    }
-    if (agent && ((agent.name !== undefined && agent.name !== id.name) || (agent.email !== undefined && agent.email !== id.address))) {
-      io.err(`health: the settings file names another agent than this key's agent "${id.name}"; nothing changed`);
-      return 5;
-    }
-    if (!agent || agent.name !== id.name || agent.email !== id.address) {
-      c.agent = { ...(agent || {}), name: id.name, email: id.address };
-      R.writeFileAtomic(p.config, JSON.stringify(c, null, 2) + '\n', rs.mode);
-    }
-    queueUsage({ transcript, role: p.role, spool, meta, now });
-    return finish(io, await flush(), `identified ${id.name}`);
-  }
-
-  // heartbeat
+  const sentLog = path.join(sdir, 'health-sent.jsonl');
   const healthFile = path.join(sdir, 'health.json');
   const st = readHealth(healthFile);
-  const bootId = readBootId();
-  const fresh = !st || st.bootId !== bootId;
-  const log = readLogSince(path.join(sdir, 'listener.log'), fresh ? 0 : (Number.isSafeInteger(st.logOffset) && st.logOffset >= 0 ? st.logOffset : 0));
-  const mainNow = readMainId(path.join(sdir, 'main-session-id'));
-  const mainStored = fresh ? null : (typeof st.lastMainId === 'string' ? st.lastMainId : null);
-  const containerStartedAt = fresh ? meta.at : (typeof st.containerStartedAt === 'string' ? st.containerStartedAt : meta.at);
-  const started = Date.parse(containerStartedAt);
-  const uptime = fresh || !Number.isFinite(started) ? 0 : Math.max(0, Math.floor((now - started) / 1000));
-  if (!transcript) {
-    return finish(io, await flush(), 'no session transcript yet; heartbeat not queued');
+  const kv = readKitVersion();
+  const transcript = p.transcript || newestTranscript(home);
+  const settingsOff = c.report === false;
+  const storedOff = st !== null && st.reportOn === false;
+  const offFromSpm = storedOff && !settingsOff;
+  const metaOf = () => ({ at: new Date(now).toISOString(), kit_version: kv.version, node_version: process.version });
+  const flushWith = (t) => R.flushSpool({ spoolFile: spool, base: t.base, key: t.key, kitVersion: kv.version || null, now, sentLog });
+
+  if (p.cmd === 'flush') {
+    if (settingsOff || offFromSpm) return offLine(io, null, offFromSpm);
+    const t = sendTarget(c, env);
+    if (t.error) { io.err(`health: ${t.error}`); return 2; }
+    return finish(io, await flushWith(t), null);
   }
-  const sid = readTranscript(transcript).primary;
-  const item = {
-    kind: 'heartbeat', role: 'listener', ...meta, session_key: sessionKey(sid),
-    numbers: {
-      listener_starts: log.counts.starts, listener_restarts: log.counts.restarts, listener_failing: log.counts.failing,
-      container_starts: fresh ? 1 : 0, main_changes: mainNow !== null && mainNow !== mainStored ? 1 : 0, uptime_s: uptime,
-    },
-  };
-  if (p.mainStatus) item.main_status = p.mainStatus;
-  const q = R.queueItem(spool, item, now);
-  if (!q.ok) { io.err(`health: ${q.error}; nothing queued`); return 1; }
-  R.writeFileAtomic(healthFile, JSON.stringify({
-    bootId, containerStartedAt, logOffset: log.offset, lastMainId: mainNow !== null ? mainNow : mainStored,
-  }) + '\n', 0o600);
-  return finish(io, await flush(), 'heartbeat queued');
+
+  // Every command that queues items needs the salt; usage and heartbeat also need the kit version.
+  const sa = loadSalt(sdir);
+  if (sa.error) { io.err(`health: ${sa.error}; nothing queued`); return 2; }
+  if ((p.cmd === 'usage' || p.cmd === 'heartbeat') && kv.error) { io.err(`health: ${kv.error}; nothing queued`); return 2; }
+
+  if (p.cmd === 'usage') {
+    const offNow = settingsOff || offFromSpm;
+    let t = null;
+    if (!offNow) { t = sendTarget(c, env); if (t.error) { io.err(`health: ${t.error}`); return 2; } }
+    const queued = queueUsage({ transcript, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
+    if (offNow) return offLine(io, `usage queued ${queued}`, offFromSpm);
+    return finish(io, await flushWith(t), `usage queued ${queued}`);
+  }
+
+  if (p.cmd === 'heartbeat') {
+    const offNow = settingsOff || offFromSpm;
+    let t = null;
+    if (!offNow) { t = sendTarget(c, env); if (t.error) { io.err(`health: ${t.error}`); return 2; } }
+    const bootId = readBootId();
+    const fresh = !st || st.bootId !== bootId;
+    const offsetIn = fresh ? 0 : (Number.isSafeInteger(st.logOffset) && st.logOffset >= 0 ? st.logOffset : 0);
+    const log = readLogSince(path.join(sdir, 'listener.log'), offsetIn);
+    const mainNow = readMainId(path.join(sdir, 'main-session-id'));
+    const mainStored = fresh ? null : (typeof st.lastMainId === 'string' ? st.lastMainId : null);
+    const meta = metaOf();
+    const containerStartedAt = fresh ? meta.at : (typeof st.containerStartedAt === 'string' ? st.containerStartedAt : meta.at);
+    const started = Date.parse(containerStartedAt);
+    const uptime = fresh || !Number.isFinite(started) ? 0 : Math.max(0, Math.floor((now - started) / 1000));
+    if (!transcript) {
+      const head = 'no session transcript yet; heartbeat not queued';
+      return offNow ? offLine(io, head, offFromSpm) : finish(io, await flushWith(t), head);
+    }
+    const sid = readTranscript(transcript).primary;
+    const item = {
+      kind: 'heartbeat', role: 'listener', ...meta, session_key: sessionKey(sid, sa.salt),
+      numbers: {
+        listener_starts: log.counts.starts, listener_restarts: log.counts.restarts, listener_failing: log.counts.failing,
+        container_starts: fresh ? 1 : 0, main_changes: mainNow !== null && mainNow !== mainStored ? 1 : 0, uptime_s: uptime,
+      },
+    };
+    if (p.mainStatus) item.main_status = p.mainStatus;
+    const q = R.queueItem(spool, item, now);
+    if (!q.ok) { io.err(`health: ${q.error}; nothing queued`); return 1; }
+    R.writeFileAtomic(healthFile, JSON.stringify({
+      ...(st || {}), bootId, containerStartedAt, logOffset: log.offset, lastMainId: mainNow !== null ? mainNow : mainStored,
+    }) + '\n', 0o600);
+    if (offNow) return offLine(io, 'heartbeat queued', offFromSpm);
+    return finish(io, await flushWith(t), 'heartbeat queued');
+  }
+
+  // start
+  if (settingsOff) {
+    const queued = queueUsage({ transcript, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
+    return offLine(io, `usage queued ${queued}`, false);
+  }
+  const t = sendTarget(c, env);
+  if (t.error) { io.err(`health: ${t.error}`); return 2; }
+  const id = await identify({ base: t.base, key: t.key, timeoutMs: R.SEND_TIMEOUT_MS });
+  if (id.kind === 'refused') { io.err(`health: SPM refused the key (status ${id.status}); nothing changed`); return 6; }
+  if (id.kind === 'unreachable') {
+    if (kv.version) queueUsage({ transcript, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
+    io.out(`health: kept ${R.readSpool(spool).length} for later`);
+    return 0;
+  }
+  const agent = c.agent;
+  if (agent !== undefined && (!agent || typeof agent !== 'object' || Array.isArray(agent) ||
+      (agent.name !== undefined && typeof agent.name !== 'string') || (agent.email !== undefined && typeof agent.email !== 'string'))) {
+    io.err('health: the agent entry in the settings file is not valid; nothing changed');
+    return 2;
+  }
+  if (agent && ((agent.name !== undefined && agent.name !== id.name) || (agent.email !== undefined && agent.email !== id.address))) {
+    io.err(`health: the settings file names another agent than this key's agent "${id.name}"; nothing changed`);
+    return 5;
+  }
+  const next = { ...c };
+  let changed = false;
+  if (!agent || agent.name !== id.name || agent.email !== id.address) {
+    next.agent = { ...(agent || {}), name: id.name, email: id.address };
+    changed = true;
+  }
+  if (id.appId && c.app_id === undefined) { next.app_id = id.appId; changed = true; }
+  if (changed) R.writeFileAtomic(p.config, JSON.stringify(next, null, 2) + '\n', rs.mode);
+  R.writeFileAtomic(healthFile, JSON.stringify({ ...(st || {}), reportOn: id.reportOn }) + '\n', 0o600);
+  if (id.minKit && kv.version && versionOlder(kv.version, id.minKit)) {
+    io.out(`health: warning: kit ${kv.version} is older than the minimum ${id.minKit} that SPM asks for`);
+  }
+  const queued = kv.version ? queueUsage({ transcript, role: p.role, spool, meta: metaOf(), now, salt: sa.salt }) : 0;
+  if (!id.reportOn) return offLine(io, `identified ${id.name}; usage queued ${queued}`, true);
+  const head = `identified ${id.name}` + (kv.version ? '' : '; kit VERSION missing, usage not queued');
+  return finish(io, await flushWith(t), head);
 }
 
 function realDeps() {
@@ -365,4 +455,4 @@ if (require.main === module) {
   });
 }
 
-module.exports = { main, parseArgs, readTranscript, usageItems, newestTranscript, readLogSince };
+module.exports = { main, parseArgs, readTranscript, usageItems, newestTranscript, readLogSince, versionOlder, sessionKey };
