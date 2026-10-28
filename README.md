@@ -33,6 +33,7 @@ Example, with synthetic values:
 - `agent.email` must end in `@agents.invalid`.
 - `key_file` is the agent's key file. Keep it outside the kit folder. Without `key_file` the scripts run in network-secret mode (see "The agent key").
 - `ignore_agents` lists other agents whose comments are not tags for this agent. It is optional.
+- `transport` chooses how the listener talks to Firestore: `"node"` (the default, the way the kit has always worked) or `"webchannel"`. Use `"webchannel"` only when the listener never hears a comment through a cloud proxy. It uses the browser build of the Firebase SDK with long polling, which some proxies allow where the Node build's connection is reset. Node 22.21 or newer is required for the listener in both transports: `start.sh` refuses to run on an older Node. `start.sh` sets `NODE_USE_ENV_PROXY=1` for you. Running the listener yourself with `webchannel` and a proxy needs that variable set too. Any other value is refused.
 
 A template is in `templates/org-repo/spm-agent.config.example.json`.
 

@@ -42,6 +42,17 @@ if git -C "$PROBE" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 2
 fi
 
+# Node 22.21 or newer: older Node ignores the proxy agent's proxyEnv, so calls would skip the proxy. Refused before anything runs.
+NODE_VER_RAW="$(node --version 2>/dev/null || true)"
+NODE_VER="${NODE_VER_RAW#v}"
+IFS=. read -r NODE_MAJ NODE_MIN _ <<<"$NODE_VER"
+case "$NODE_MAJ" in ''|*[!0-9]*) NODE_OK=0 ;; *) case "$NODE_MIN" in ''|*[!0-9]*) NODE_OK=0 ;; *)
+  if [ "$NODE_MAJ" -gt 22 ] || { [ "$NODE_MAJ" -eq 22 ] && [ "$NODE_MIN" -ge 21 ]; }; then NODE_OK=1; else NODE_OK=0; fi ;; esac ;; esac
+if [ "$NODE_OK" -ne 1 ]; then
+  echo "start.sh: Node 22.21 or newer is needed (found ${NODE_VER_RAW:-none})" >&2
+  exit 2
+fi
+
 # 1. Selfcheck. Its output is captured: on success only the start line is printed.
 if [ -n "${SPM_AGENT_START_SELFCHECK_CMD:-}" ]; then
   SC_CMD="$SPM_AGENT_START_SELFCHECK_CMD"
@@ -79,4 +90,6 @@ if [ -n "${SPM_AGENT_START_LISTENER_CMD:-}" ]; then
 else
   L_CMD="node $(printf '%q' "$KIT/agent-listen.cjs") --config $(printf '%q' "$CONFIG") --inbox --cursor-file $(printf '%q' "$STATE/cursor.json") --mode stream"
 fi
+# NODE_USE_ENV_PROXY=1: Node 22.21+ reads HTTPS_PROXY at start; the "webchannel" transport needs it (agent-listen.cjs refuses without it).
+export NODE_USE_ENV_PROXY=1
 exec bash "$KIT/agent-keepalive.sh" "$LOG" "$L_CMD"

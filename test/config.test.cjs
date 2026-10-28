@@ -89,3 +89,22 @@ test('ignore_agents is empty when absent', () => {
   const c = loadConfig({ argv: ['--config', write('plain.json', good)], env: {} });
   assert.deepEqual(c.ignoreAgents, []);
 });
+
+test('transport defaults to node when the key is absent', () => {
+  const c = loadConfig({ argv: ['--config', write('no-transport.json', good)], env: {} });
+  assert.equal(c.transport, 'node');
+});
+
+test('transport accepts node and webchannel', () => {
+  const n = loadConfig({ argv: ['--config', write('t-node.json', { ...good, transport: 'node' })], env: {} });
+  assert.equal(n.transport, 'node');
+  const w = loadConfig({ argv: ['--config', write('t-web.json', { ...good, transport: 'webchannel' })], env: {} });
+  assert.equal(w.transport, 'webchannel');
+});
+
+test('any other transport value is refused with one line', () => {
+  for (const bad of ['grpc', 'Node', '', null, 3]) {
+    const p = write(`t-bad-${String(bad)}.json`, { ...good, transport: bad });
+    assert.throws(() => loadConfig({ argv: ['--config', p], env: {} }), (e) => e instanceof ConfigError && e.message === 'transport must be "node" or "webchannel"', `value ${JSON.stringify(bad)}`);
+  }
+});

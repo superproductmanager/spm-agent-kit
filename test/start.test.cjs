@@ -117,3 +117,53 @@ test('start.sh: the default state dir comes from SPM_AGENT_STATE_DIR when no --s
   assert.equal(JSON.parse(r.stdout.trim()).log, path.join(state, 'listener.log'));
   assert.ok(fs.existsSync(path.join(state, 'listener.log')));
 });
+
+test('start.sh: the listener command sees NODE_USE_ENV_PROXY=1 (set before the listener starts)', () => {
+  const dir = workdir('envproxy');
+  const seen = path.join(dir, 'seen');
+  const r = runStart(['--config', CONFIG, '--state-dir', path.join(dir, 'state')], {
+    SPM_AGENT_START_SELFCHECK_CMD: `echo 'ok spm-key'; exit 0`,
+    SPM_AGENT_START_LISTENER_CMD: `printf '%s' "$NODE_USE_ENV_PROXY" > ${seen}`,
+    KEEPALIVE_MAX_RUNS: '1',
+  });
+  assert.equal(r.status, 0, `status ${r.status}, stderr ${r.stderr}`);
+  assert.equal(fs.readFileSync(seen, 'utf8'), '1');
+});
+
+// Node 22.21 or newer: the proxy agent is ignored by older Node, so start.sh refuses before the selfcheck.
+function fakeNodeDir(label, version) {
+  const bin = path.join(workdir(label), 'bin');
+  fs.mkdirSync(bin);
+  fs.writeFileSync(path.join(bin, 'node'), `#!/usr/bin/env bash\nif [ "$1" = "--version" ]; then echo ${version}; exit 0; fi\nexit 0\n`, { mode: 0o755 });
+  return bin;
+}
+
+for (const version of ['v20.20.2', 'v22.20.9']) {
+  test(`start.sh: Node ${version} is refused with exit 2, one line, and nothing starts`, () => {
+    const dir = workdir('oldnode');
+    const marker = path.join(dir, 'marker');
+    const r = runStart(['--config', CONFIG, '--state-dir', path.join(dir, 'state')], {
+      PATH: `${fakeNodeDir('oldnode-bin', version)}:${process.env.PATH}`,
+      SPM_AGENT_START_SELFCHECK_CMD: `echo selfcheck >> ${marker}; exit 0`,
+      SPM_AGENT_START_LISTENER_CMD: `echo started >> ${marker}`,
+      KEEPALIVE_MAX_RUNS: '1',
+    });
+    assert.equal(r.status, 2, `status ${r.status}, stderr ${r.stderr}`);
+    assert.equal(r.stderr.trim(), `start.sh: Node 22.21 or newer is needed (found ${version})`);
+    assert.equal(r.stdout, '');
+    assert.ok(!fs.existsSync(marker), 'the selfcheck or the listener ran on an old Node');
+  });
+}
+
+test('start.sh: Node 22.21.0 passes the version check and the selfcheck runs', () => {
+  const dir = workdir('newnode');
+  const marker = path.join(dir, 'marker');
+  const r = runStart(['--config', CONFIG, '--state-dir', path.join(dir, 'state')], {
+    PATH: `${fakeNodeDir('newnode-bin', 'v22.21.0')}:${process.env.PATH}`,
+    SPM_AGENT_START_SELFCHECK_CMD: `echo selfcheck >> ${marker}; exit 0`,
+    SPM_AGENT_START_LISTENER_CMD: `echo started >> ${marker}`,
+    KEEPALIVE_MAX_RUNS: '1',
+  });
+  assert.equal(r.status, 0, `status ${r.status}, stderr ${r.stderr}`);
+  assert.equal(fs.readFileSync(marker, 'utf8'), 'selfcheck\nstarted\n');
+});

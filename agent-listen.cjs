@@ -11,6 +11,7 @@
  *   (INBOX MODE, --inbox: event-driven, reads the feed only when its signal moves. See below.)
  *   GOAL PIPELINE: node agent-listen.cjs --config <abs path> --inbox --cursor-file <abs path> --mode once | node agent-ack.cjs --config <abs path> (exits after the first notice, having posted the Seen ack)
  *   node agent-listen.cjs --selftest OFFLINE: local FAKE servers on 127.0.0.1 only, a fake clock, fake secrets; no production call, no real key file read.
+ * TRANSPORT (settings key "transport"): "node" (default: the Node build of the Firebase Firestore SDK, the same calls as always) or "webchannel" (the browser build, loaded by its absolute path, with long polling, for a cloud proxy that resets the Node build's gRPC). webchannel also adds firestore.googleapis.com to the SDK's fetch allow-list (node mode keeps the two sign-in hosts only); with HTTPS_PROXY set it needs NODE_USE_ENV_PROXY=1 at start, else it exits 2 before any call (start.sh sets it).
  *
  * INBOX MODE. --inbox listens to the agent's OWN notice feed instead of a fixed list of items: no per-item list, no 20-item limit, and a tag on an item the
  * agent has never seen wakes it (the server routes a notice for every tag of the agent on an item it can open: INBOX_ROUTING_KINDS=agent). --inbox is EXCLUSIVE with --document, --board and --map (both is a usage
@@ -300,28 +301,37 @@ function sdkMissing() {
   return sdkPackageJson() ? null : `agent-listen: the Firebase SDK is not installed in ${RUNTIME_DIR} (nothing was called; run cloud-agent-setup.sh --apply first)`;
 }
 
-function loadSdk() {
+// the transport check, before any call: webchannel with a proxy needs NODE_USE_ENV_PROXY=1 at process start (the Node proxy agent reads it then)
+function transportRefusal(transport, env) {
+  if (transport !== 'webchannel') return null;
+  if ((env.HTTPS_PROXY || env.https_proxy) && env.NODE_USE_ENV_PROXY !== '1') return 'agent-listen: transport webchannel needs NODE_USE_ENV_PROXY=1 at start (start.sh sets it)';
+  return null;
+}
+function loadSdk(transport) {
   if (SDK) return SDK;
   // : the emulator and defaults variables go before the first require of any firebase module
   delete process.env.__FIREBASE_DEFAULTS__; delete process.env.FIRESTORE_EMULATOR_HOST; delete process.env.FIREBASE_AUTH_EMULATOR_HOST;
   // : default-deny. Only the two Google sign-in hosts pass, each with the script's Referer and no redirects; any other fetch throws. Auth captures fetch at load, so this runs first.
   const realFetch = globalThis.fetch;
+  const allowed = transport === 'webchannel' ? [...SIGNIN_HOSTS, FS_HOST] : SIGNIN_HOSTS;
   globalThis.fetch = (input, init = {}) => {
     const url = typeof input === 'string' ? input : (input && input.url) || String(input);
     let host = null;
     try { host = new URL(url).hostname; } catch (_) { host = null; }
-    if (!SIGNIN_HOSTS.includes(host)) return Promise.reject(new Error('refused: the SDK may only reach the sign-in hosts'));
+    if (!allowed.includes(host)) return Promise.reject(new Error('refused: the SDK may only reach the sign-in hosts'));
     const h = new Headers(init.headers || {}); h.set('Referer', REFERER);
     return realFetch(input, { ...init, headers: h, redirect: 'error' });
   };
   const req = createRequire(sdkPackageJson());
-  const app = req('firebase/app'); const auth = req('firebase/auth'); const fsdk = req('firebase/firestore');
+  const app = req('firebase/app'); const auth = req('firebase/auth');
+  // webchannel: the browser build of Firestore, loaded by its absolute path (long polling survives a cloud proxy that resets the Node build's gRPC)
+  const fsdk = transport === 'webchannel' ? require(path.join(path.dirname(req.resolve('@firebase/firestore/package.json')), 'dist', 'index.cjs.js')) : req('firebase/firestore');
   for (const m of [app, fsdk]) if (typeof m.setLogLevel === 'function') m.setLogLevel('silent');
   SDK = { app, auth, fs: fsdk, appInst: null, authInst: null, db: null };
   return SDK;
 }
 function realDeps() {
-  return {
+  const d = {
     io: { out: (s) => process.stdout.write(s + '\n'), err: (s) => process.stderr.write(s + '\n') },
     proc: process,
     now: () => Date.now(),
@@ -333,21 +343,22 @@ function realDeps() {
     sdkMissing,
     // the SDK sign-in with the custom token
     signIn: async (customToken, webKey) => {
-      const s = loadSdk();
+      const s = loadSdk(d.transport);
       if (!s.appInst) {
         s.appInst = s.app.initializeApp({ apiKey: webKey, projectId: PROJECT }, 'agent-listen');
         s.authInst = s.auth.initializeAuth(s.appInst, { persistence: s.auth.inMemoryPersistence });
-        s.db = s.fs.getFirestore(s.appInst);
+        s.db = d.transport === 'webchannel' ? s.fs.initializeFirestore(s.appInst, { experimentalForceLongPolling: true, useFetchStreams: true }) : s.fs.getFirestore(s.appInst);
       }
       await s.auth.signInWithCustomToken(s.authInst, customToken);
     },
     // onSnapshot on signals/<sid> with metadata changes; returns the unsubscribe
-    listen: (sid, onNext, onError) => { const s = loadSdk(); return s.fs.onSnapshot(s.fs.doc(s.db, 'signals', sid), { includeMetadataChanges: true }, onNext, onError); },
+    listen: (sid, onNext, onError) => { const s = loadSdk(d.transport); return s.fs.onSnapshot(s.fs.doc(s.db, 'signals', sid), { includeMetadataChanges: true }, onNext, onError); },
     // : the stream and the Auth timers end here, so the process can exit by itself
     close: async () => { const s = SDK; if (!s || !s.appInst) return; await s.fs.terminate(s.db).catch(() => {}); await s.app.deleteApp(s.appInst).catch(() => {}); },
     // : the one local clock check (a timer that makes no request; it only compares Date.now)
     interval: (fn, ms) => { const h = setInterval(fn, ms); return () => clearInterval(h); },
   };
+  return d;
 }
 
 // : the SDK close gets a hard limit. A close that never resolves (an SDK handle left open) can no longer hold a finished run: after CLOSE_LIMIT_MS the run ends anyway. The cursor is saved before the close, so nothing is lost.
@@ -973,6 +984,9 @@ async function main(argv, deps) {
   try { conf = loadConfig({ argv }); } catch (e) { deps.io.err(`agent-listen: ${e.message}`); return 2; }
   const mode = keyMode(conf, { HTTPS_PROXY: process.env.HTTPS_PROXY, https_proxy: process.env.https_proxy }); // K-A3 item 1: no key_file means network-secret mode, which needs the proxy
   if (mode.mode === 'refused') { deps.io.err(`agent-listen: ${mode.message}`); return 2; }
+  deps.transport = conf.transport; // realDeps' sign-in and listen read it
+  const tRefusal = transportRefusal(conf.transport, { HTTPS_PROXY: process.env.HTTPS_PROXY, https_proxy: process.env.https_proxy, NODE_USE_ENV_PROXY: process.env.NODE_USE_ENV_PROXY }); // refused before any key read or call
+  if (tRefusal) { deps.io.err(tRefusal); return 2; }
   const cfg = parsed.cfg;
   const kind = cursorKindOf(cfg.cursorFile); // before any key read or call: a cursor file of the other kind is refused (exit 2), never overwritten
   if (cfg.inbox ? (kind === 'items' || kind === 'mixed') : (kind === 'inbox' || kind === 'mixed')) {
@@ -1892,12 +1906,12 @@ function defineCases(cases, env) {
     const impl = src.slice(src.indexOf('// ==== IMPLEMENTATION-BEGIN'), src.indexOf('// ==== IMPLEMENTATION-END'));
     const names = [...impl.matchAll(/process\.env\.([A-Z_a-z0-9]+)/g)].map((m) => m[1]);
     const DELETED = ['__FIREBASE_DEFAULTS__', 'FIRESTORE_EMULATOR_HOST', 'FIREBASE_AUTH_EMULATOR_HOST']; // A1: deleted before the SDK loads, never read
-    const PROXY_NAMES = ['HTTPS_PROXY', 'https_proxy']; // R1: the proxy URL only (proxyAgentFor), names no base host
+    const PROXY_NAMES = ['HTTPS_PROXY', 'https_proxy', 'NODE_USE_ENV_PROXY']; // R1: the proxy URL only (proxyAgentFor), names no base host; NODE_USE_ENV_PROXY is the Node switch that makes the proxy agent work (transport webchannel), not a host
     check(names.every((n) => n === 'SPM_AGENT_RUNTIME_DIR' || DELETED.includes(n) || PROXY_NAMES.includes(n)) && DELETED.every((n) => impl.includes(`delete process.env.${n};`)), `process.env names: ${names}`);
     const rest = impl.replace(/process\.env\.[A-Z_a-z0-9]+/g, '').replace('loadWebKeyFrom(process.env)', '');
     check(!/process\.env\[/.test(impl) && !/process\.env\b/.test(rest), 'process.env used as a whole object (only the web key loader may take it)');
     const envNames = [...impl.matchAll(/\benv\.([A-Z_a-z0-9]+)/g)].map((m) => m[1]);
-    check(envNames.every((n) => ['VITE_FIREBASE_API_KEY', 'FIREBASE_API_KEY', 'HOME', '__FIREBASE_DEFAULTS__', 'FIRESTORE_EMULATOR_HOST', 'FIREBASE_AUTH_EMULATOR_HOST', 'HTTPS_PROXY', 'https_proxy'].includes(n)), `env.* names: ${envNames}`);
+    check(envNames.every((n) => ['VITE_FIREBASE_API_KEY', 'FIREBASE_API_KEY', 'HOME', '__FIREBASE_DEFAULTS__', 'FIRESTORE_EMULATOR_HOST', 'FIREBASE_AUTH_EMULATOR_HOST', 'HTTPS_PROXY', 'https_proxy', 'NODE_USE_ENV_PROXY'].includes(n)), `env.* names: ${envNames}`);
     for (const flag of ['--base', '--base-url', '--host', '--functions-base', '--firestore', '--idt', '--url', '--proxy', '--resolve']) {
       const res = parseArgs(['--config', cfgFile('alpha'), '--document', DOC_A, '--cursor-file', '/tmp/x.json', flag, 'http://127.0.0.1:1']);
       check(res && res.ok === false, `${flag} was accepted`);
@@ -2942,7 +2956,7 @@ async function selftest() {
   return fail === 0 ? 0 : 1;
 }
 
-module.exports = { parseArgs, guardRequest, GuardError, readCursorFile, writeCursorAtomic, makeTransport, loadWebKeyFrom, readKeyFile, createListener, createInboxListener, noticeLine, cursorKindOf, installSignalHandlers, exitWhenDone, realDeps, main, selftestChild, selftest, istIso, FUTURE_SINCE };
+module.exports = { transportRefusal, loadSdk, parseArgs, guardRequest, GuardError, readCursorFile, writeCursorAtomic, makeTransport, loadWebKeyFrom, readKeyFile, createListener, createInboxListener, noticeLine, cursorKindOf, installSignalHandlers, exitWhenDone, realDeps, main, selftestChild, selftest, istIso, FUTURE_SINCE };
 
 if (require.main === module) {
   const argv = process.argv.slice(2);
