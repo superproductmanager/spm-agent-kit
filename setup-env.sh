@@ -195,7 +195,7 @@ try {
   // 3. skill: the two literal paths replaced
   const skillText = fs.readFileSync(path.join(KIT, 'skill', 'spm-agent', 'SKILL.md'), 'utf8')
     .split('/root/spm-agent-kit').join(KIT)
-    .split('/root/.spm-agent-state').join('$HOME/.spm-agent-state');
+    .split('/root/.spm-agent-state').join(configDir);
   fs.mkdirSync(skillDir, { recursive: true });
   writeAtomic(path.join(skillDir, 'SKILL.md'), skillText, 0o644);
 

@@ -318,15 +318,19 @@ test('a name with allowed punctuation is stored as the same text (JSON is built 
 function expectedSkill(sb) {
   return fs.readFileSync(SKILL_SRC, 'utf8')
     .split('/root/spm-agent-kit').join(sb.kit)
-    .split('/root/.spm-agent-state').join('$HOME/.spm-agent-state');
+    .split('/root/.spm-agent-state').join(path.join(sb.home, '.spm-agent-state'));
 }
 
-test('the skill is copied with the two literal paths replaced (kit folder and $HOME state folder)', () => {
+test('the skill is copied with the two literal paths replaced (kit folder and the real state folder)', () => {
   const sb = sandbox();
   try {
     const r = runSetup(sb, ok(['--no-sdk']));
     assert.equal(r.status, 0, r.stderr);
-    assert.equal(fs.readFileSync(SKILL_DEST(sb), 'utf8'), expectedSkill(sb));
+    const text = fs.readFileSync(SKILL_DEST(sb), 'utf8');
+    assert.equal(text, expectedSkill(sb));
+    // the file tool does not expand variables, so the skill must name the real folder
+    assert.equal(text.includes('$HOME'), false, 'the skill must not contain a literal $HOME');
+    assert.ok(text.includes(path.join(sb.home, '.spm-agent-state', 'config.json')), 'the skill names the real config path');
   } finally { cleanup(sb); }
 });
 

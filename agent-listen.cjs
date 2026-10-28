@@ -2009,6 +2009,8 @@ function defineCases(cases, env) {
     check(loadWebKeyFrom({ FIREBASE_API_KEY: 'example-env-plain-app-id-000000000' }) === 'example-env-plain-app-id-000000000', 'env FIREBASE_API_KEY');
     let threw = false; try { loadWebKeyFrom({}); } catch (_) { threw = true; }
     check(threw, 'no env key: throws, nothing is read from disk');
+    check(loadWebKeyFrom({}, 'example-config-app-id-000000000000') === 'example-config-app-id-000000000000', 'no env key: the settings file app_id is used');
+    check(loadWebKeyFrom({ FIREBASE_API_KEY: 'example-env-plain-app-id-000000000' }, 'example-config-app-id-000000000000') === 'example-env-plain-app-id-000000000', 'env wins over the settings file app_id');
     const kf = path.join(root, 'k.key'); fs.writeFileSync(kf, `  ${FAKE.key}\n`);
     check(readKeyFile(kf) === FAKE.key, 'key file trimmed');
     let missing = false; try { readKeyFile(path.join(root, 'nope.key')); } catch (_) { missing = true; }

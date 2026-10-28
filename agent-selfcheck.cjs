@@ -197,7 +197,7 @@ async function checkSpmKey(ctx) {
 async function checkSignIn(ctx) {
   let webKey;
   try { webKey = loadWebKeyFrom(process.env, ctx.appId); } catch (_) {
-    return { ok: false, name: 'sign-in', cause: 'no app id (web API key) is set on this machine', fix: 'set FIREBASE_API_KEY in the environment to the public SPM app id' };
+    return { ok: false, name: 'sign-in', cause: 'no app id (web API key) is set on this machine', fix: 'run setup-env.sh again with --app-id <the public SPM app id>, or set FIREBASE_API_KEY in the environment' };
   }
   const url = `${ctx.bases.idt}/v1/accounts:signInWithCustomToken?key=${encodeURIComponent(webKey)}`;
   const r = await call(url, 'POST', { Referer: REFERER, 'Content-Type': 'application/json' }, JSON.stringify({ token: ctx.customToken, returnSecureToken: true }));
@@ -208,7 +208,7 @@ async function checkSignIn(ctx) {
   }
   const message = r.json && r.json.error && typeof r.json.error.message === 'string' ? r.json.error.message : '';
   if (r.status === 400 && /API key not valid|API_KEY_INVALID|API key/i.test(message)) {
-    return { ok: false, name: 'sign-in', cause: 'the app id (web API key) is wrong', fix: 'set FIREBASE_API_KEY to the public SPM app id' };
+    return { ok: false, name: 'sign-in', cause: 'the app id (web API key) is wrong', fix: 'check the --app-id given to setup-env.sh (or FIREBASE_API_KEY, which wins) against the public SPM app id' };
   }
   if (r.status === 400 && /^[A-Z_]{3,60}$/.test(message)) {
     return { ok: false, name: 'sign-in', cause: `sign-in refused the token (${message})`, fix: UNEXPECTED_FIX };
