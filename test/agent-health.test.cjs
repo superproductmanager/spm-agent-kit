@@ -16,8 +16,8 @@ const KIT_SRC = path.join(__dirname, '..');
 const FAKE_SPM_KEY = ['spm', 'k', 'test', 'health', 'fixture'].join('_') + '0123456789';
 const SPM_NAME = 'Example agent';
 const SPM_ADDRESS = 'spm-example-agent@agents.invalid';
-const SESSION_A = '3f2a9c10-1111-4aaa-8bbb-000000000001';
-const SESSION_B = '3f2a9c10-2222-4aaa-8bbb-000000000002';
+const SESSION_A = '00000000-0000-4000-8000-000000000001';
+const SESSION_B = '00000000-0000-4000-8000-000000000002';
 // The salted session key (Addendum A2): first 16 hex of sha256(salt + sessionId), salt = <state>/report-salt.
 const saltOf = (home) => fs.readFileSync(path.join(home, '.spm-agent-state', 'report-salt'), 'utf8').trim();
 const KEY_OF = (home, sid) => crypto.createHash('sha256').update(saltOf(home) + sid).digest('hex').slice(0, 16);

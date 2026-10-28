@@ -60,7 +60,7 @@ const LONG_TIER_TOKENS = 100000;
 const IDENTIFY_TIMEOUT_MS = 10000;
 const CALL_TRIES = 2;
 const COMMANDS = ['start', 'usage', 'heartbeat', 'flush', 'session-start', 'settings'];
-const USAGE = 'usage: node agent-health.cjs start|usage --role main|listener --config <absolute path> [--transcript <absolute path>] | heartbeat --config <absolute path> [--main-status <word>] [--transcript <absolute path>] | flush --config <absolute path> | session-start --config <absolute path> | settings --config <absolute path> [--autostart on|off] [--reports on|off]';
+const USAGE = 'usage: node agent-health.cjs start|usage --role main|listener --config <absolute path> [--transcript <absolute path>] [--session <id>] | heartbeat --config <absolute path> [--main-status <word>] [--transcript <absolute path>] [--session <id>] | flush --config <absolute path> | session-start --config <absolute path> | settings --config <absolute path> [--autostart on|off] [--reports on|off]';
 const COULD_NOT_REACH = 'could not reach SPM, run again';
 
 // The command line. Reads nothing. { ok: true, ...fields } or { ok: false, error }.
