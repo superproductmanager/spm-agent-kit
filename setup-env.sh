@@ -457,7 +457,7 @@ fi
 # The setup check (no key needed). Its result never changes the exit code; its lines go to the spool only.
 node "$KIT/agent-selfcheck.cjs" --setup --config "$HOME/.spm-agent-state/config.json" >/dev/null 2>&1 || true
 
-# 0.2.1: with reports off nothing waits to be sent. The config this run wrote (or kept) says report false, so the setup
+# 0.2.0: with reports off nothing waits to be sent. The config this run wrote (or kept) says report false, so the setup
 # report spool is removed now, after every step has run. With reports on the file is left as it is.
 if node -e "let c; try { c = JSON.parse(require('node:fs').readFileSync(process.argv[1], 'utf8')); } catch (_) { process.exit(1); } process.exit(c && c.report === false ? 0 : 1);" "$HOME/.spm-agent-state/config.json" >/dev/null 2>&1; then
   rm -f "$HOME/.spm-agent-state/setup-report.jsonl"

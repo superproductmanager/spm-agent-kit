@@ -1051,11 +1051,11 @@ test('no --name: the final line says the name and address come from SPM at first
   } finally { cleanup(sb); }
 });
 
-// ---------------------------------------------------------------- 0.2.1: report off removes the spool at the end of setup; report on keeps it
+// ---------------------------------------------------------------- 0.2.0: report off removes the spool at the end of setup; report on keeps it
 const STATE_DIR = (sb) => path.join(sb.home, '.spm-agent-state');
 const OLD_LINE = '{"id":"0123456789abcdef0123456789abcdef","kind":"usage","role":"main","stale":true}\n';
 
-test('0.2.1 --report off with an unsent report already in the spool: setup removes setup-report.jsonl at the end, exit 0', () => {
+test('0.2.0 --report off with an unsent report already in the spool: setup removes setup-report.jsonl at the end, exit 0', () => {
   const sb = sandbox({ version: '0.2.0\n' });
   try {
     fs.mkdirSync(STATE_DIR(sb), { recursive: true });
@@ -1066,7 +1066,7 @@ test('0.2.1 --report off with an unsent report already in the spool: setup remov
   } finally { cleanup(sb); }
 });
 
-test('0.2.1 a config that already says report false (no --report flag) also removes the spool at the end of setup', () => {
+test('0.2.0 a config that already says report false (no --report flag) also removes the spool at the end of setup', () => {
   const sb = sandbox({ version: '0.2.0\n' });
   try {
     fs.mkdirSync(STATE_DIR(sb), { recursive: true });
@@ -1079,7 +1079,7 @@ test('0.2.1 a config that already says report false (no --report flag) also remo
   } finally { cleanup(sb); }
 });
 
-test('0.2.1 report on: setup keeps the spool, including a report already waiting in it', () => {
+test('0.2.0 report on: setup keeps the spool, including a report already waiting in it', () => {
   const sb = sandbox({ version: '0.2.0\n' });
   try {
     fs.mkdirSync(STATE_DIR(sb), { recursive: true });

@@ -159,7 +159,7 @@ const noSecret = (r, label) => { for (const s of SECRETS) assert.ok(!allOut(r).i
 // ---------------------------------------------------------------- usage
 test('usage: no settings file exits 2 with one plain line', async () => {
   const w = await world();
-  // 0.2.1: the base value must be an allowed one (http://127.0.0.1), so this stays a no-settings-file test.
+  // 0.2.0: the base value must be an allowed one (http://127.0.0.1), so this stays a no-settings-file test.
   const r = await runSelfcheck({ args: ['--base-idt', 'http://127.0.0.1:9'], bases: w.bases, keyDir: keyDirWith() });
   assert.equal(r.code, 2);
   assert.equal(r.stdout, '');
@@ -656,7 +656,7 @@ test('setup (B6): with HTTPS_PROXY set, the checks go through the proxy (CONNECT
   }
 });
 
-// ---------------------------------------------------------------- 0.2.1: the --base-* test flags take 127.0.0.1 or the slot's default only
+// ---------------------------------------------------------------- 0.2.0: the --base-* test flags take 127.0.0.1 or the slot's default only
 const FS_DEFAULT = 'https://firestore.asia-southeast1.rep.googleapis.com';
 const SHARED_DEFAULT = 'https://firestore.googleapis.com';
 const FN_DEFAULT = 'https://asia-south1-litethink.cloudfunctions.net';
@@ -705,7 +705,7 @@ function runCounted(args) {
   });
 }
 
-test('0.2.1 --base-fn https://other.example exits 2 with one usage line; the key file is never read; no local fake gets a request', async () => {
+test('0.2.0 --base-fn https://other.example exits 2 with one usage line; the key file is never read; no local fake gets a request', async () => {
   const w = await world();
   const keyDir = keyDirWith();
   const args = ['--config', path.join(keyDir, 'agent.json'), '--base-regional', w.bases.regional, '--base-shared', w.bases.shared,
@@ -719,7 +719,7 @@ test('0.2.1 --base-fn https://other.example exits 2 with one usage line; the key
   assert.equal(w.regional.log.length + w.shared.log.length + w.fn.log.length + w.idt.log.length, 0, 'a local fake got a request');
 });
 
-test('0.2.1 each --base-* flag refuses other addresses with exit 2 before any read or request', async () => {
+test('0.2.0 each --base-* flag refuses other addresses with exit 2 before any read or request', async () => {
   const w = await world();
   const bad = ['https://other.example', 'http://10.0.0.1:80', 'https://127.0.0.1:9', 'http://localhost:9', 'http://127.0.0.1.example:9'];
   for (const flag of ['--base-regional', '--base-shared', '--base-fn', '--base-idt']) {
@@ -738,7 +738,7 @@ test('0.2.1 each --base-* flag refuses other addresses with exit 2 before any re
   assert.equal(w.regional.log.length + w.shared.log.length + w.fn.log.length + w.idt.log.length, 0, 'a local fake got a request');
 });
 
-test('0.2.1 parseArgs: http://127.0.0.1 (any port and path) and each slot default are accepted; any other value gives one usage line', () => {
+test('0.2.0 parseArgs: http://127.0.0.1 (any port and path) and each slot default are accepted; any other value gives one usage line', () => {
   const { parseArgs } = require(SCRIPT);
   const local = parseArgs(['--base-regional', 'http://127.0.0.1:1234/x', '--base-shared', 'http://127.0.0.1:5/', '--base-fn', 'http://127.0.0.1:6', '--base-idt', 'http://127.0.0.1']);
   assert.equal(local.usage, undefined);

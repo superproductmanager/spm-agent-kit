@@ -302,7 +302,7 @@ test('spmBase: default production base, a local http override, and refusals for 
   assert.throws(() => report.spmBase({ SPM_AGENT_API_BASE: 'not a url' }));
 });
 
-test('spmBase (0.2.1): only the default base or http://127.0.0.1 (any port, any path) is accepted; the key never goes elsewhere', () => {
+test('spmBase (0.2.0): only the default base or http://127.0.0.1 (any port, any path) is accepted; the key never goes elsewhere', () => {
   const DEFAULT = 'https://asia-south1-litethink.cloudfunctions.net/accountApi';
   assert.equal(report.spmBase({ SPM_AGENT_API_BASE: DEFAULT }), DEFAULT);
   assert.equal(report.spmBase({ SPM_AGENT_API_BASE: 'http://127.0.0.1:1234/x' }), 'http://127.0.0.1:1234/x');

@@ -16,7 +16,7 @@
  *   Key modes: a settings file with key_file reads the key from that file (as before). With no key_file the key is a
  *   network secret in the Claude cloud environment: the header value is the fixed placeholder, every https call goes
  *   through HTTPS_PROXY, and with no proxy the script refuses (exit 2). The first stdout line is the kit version.
- *        [--base-regional <url>] [--base-shared <url>] [--base-fn <url>] [--base-idt <url>] (tests only; 0.2.1: each value is
+ *        [--base-regional <url>] [--base-shared <url>] [--base-fn <url>] [--base-idt <url>] (tests only; 0.2.0: each value is
  *        http://127.0.0.1 (any port and path) or exactly that host's default; any other value exits 2 before the key file is read)
  *
  * CHECKS
@@ -320,7 +320,7 @@ async function mainSetup(argv) {
 
 // ---------------------------------------------------------------- arguments and main
 
-// The test-only --base-* flags (0.2.1): a value must be http on 127.0.0.1 (any port and path) or exactly that slot's default.
+// The test-only --base-* flags (0.2.0): a value must be http on 127.0.0.1 (any port and path) or exactly that slot's default.
 const BASE_FLAGS = {
   '--base-regional': `https://${FS_HOST}`,
   '--base-shared': `https://${SHARED_FS_HOST}`,
