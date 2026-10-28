@@ -22,7 +22,7 @@ const FAKE_KEY = 'spm_k_test_selfcheck_5d1e9a77';
 const FAKE_CUSTOM = 'FAKECUSTOMTOKEN-selfcheck-4421';
 const FAKE_ID = 'FAKEIDTOKEN-selfcheck-8803';
 const FAKE_REFRESH = 'FAKEREFRESH-selfcheck-7710';
-const FAKE_WEB = 'AIzaFAKEWEBKEY0selfcheck0000000000000';
+const FAKE_WEB = 'example-web-app-id-selfcheck-000000';
 const SIGNAL = 'ab'.repeat(32);
 const SECRETS = [FAKE_KEY, FAKE_CUSTOM, FAKE_ID, FAKE_REFRESH, FAKE_WEB];
 
@@ -317,7 +317,7 @@ test('sign-in ok: custom token exchanged at identitytoolkit with the web key and
 
 test('sign-in FAIL app id wrong: a bad web key gives the app id cause (400 API key error)', async () => {
   const w = await world();
-  const r = await runSelfcheck({ keyDir: keyDirWith(), bases: w.bases, webKey: 'AIzaWRONGWEBKEY000000000000000000000' });
+  const r = await runSelfcheck({ keyDir: keyDirWith(), bases: w.bases, webKey: 'example-wrong-web-app-id-00000000' });
   assert.equal(r.code, 1);
   assert.ok(hasLine(r.stdout, /^FAIL sign-in: the app id \(web API key\) is wrong\. Fix: /), r.stdout);
   noSecret(r, 'wrong app id');

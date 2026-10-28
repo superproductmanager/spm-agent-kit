@@ -534,7 +534,7 @@ function defineCases(cases, S) {
   });
 
   rc('R04', 'key-like text is refused with exit 2 and NOTHING is sent (every pattern); ordinary words that merely contain "sk-" pass', async () => {
-    const bads = ['my key is sk-abcdef1234567890', 'ghp_abcdefghij1234567890', 'AKIA' + 'ABCDEFGHIJKLMNOP', 'sbp_0123456789abcdef', `hash ${'a1b2c3d4e5'.repeat(4)}`, 'X-SPM-API-Key: abcdefghijklmnopqrstuv', 'Authorization: Bearer abcdefghijklmnop1234', `${FAKE_KEY}`, 'token eyJhbGciOiJSUzI1NiJ9.eyJ1aWQiOiJ4In0.sig', 'AIzaSyA-0123456789abcdefghijklmnop', 'github_pat_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6', 'xoxb-' + '1234567890-abcdefghij'];
+    const bads = ['my key is sk-abcdef1234567890', 'ghp_abcdefghij1234567890', 'AKIA' + 'ABCDEFGHIJKLMNOP', 'sbp_0123456789abcdef', `hash ${'a1b2c3d4e5'.repeat(4)}`, 'X-SPM-API-Key: abcdefghijklmnopqrstuv', 'Authorization: Bearer abcdefghijklmnop1234', `${FAKE_KEY}`, 'token eyJhbGciOiJSUzI1NiJ9.eyJ1aWQiOiJ4In0.sig', 'AI' + 'zaSyA-0123456789abcdefghijklmnop', 'github_pat_' + 'A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6', 'xoxb-' + '1234567890-abcdefghij'];
     for (const t of bads) {
       S.reset();
       const r = await runCli(S, base(TOP, t));
@@ -1139,7 +1139,7 @@ function defineCases(cases, S) {
   });
 
   rc('R37', 'the secret scan applies to --new text exactly as in reply mode: every pattern is refused (exit 2, nothing sent), also in --dry-run; ordinary words that merely contain "sk-" pass', async () => {
-    const bads = ['my key is sk-abcdef1234567890', 'ghp_abcdefghij1234567890', 'AKIA' + 'ABCDEFGHIJKLMNOP', 'sbp_0123456789abcdef', `hash ${'a1b2c3d4e5'.repeat(4)}`, 'X-SPM-API-Key: abcdefghijklmnopqrstuv', 'Authorization: Bearer abcdefghijklmnop1234', `${FAKE_KEY}`, 'token eyJhbGciOiJSUzI1NiJ9.eyJ1aWQiOiJ4In0.sig', 'AIzaSyA-0123456789abcdefghijklmnop'];
+    const bads = ['my key is sk-abcdef1234567890', 'ghp_abcdefghij1234567890', 'AKIA' + 'ABCDEFGHIJKLMNOP', 'sbp_0123456789abcdef', `hash ${'a1b2c3d4e5'.repeat(4)}`, 'X-SPM-API-Key: abcdefghijklmnopqrstuv', 'Authorization: Bearer abcdefghijklmnop1234', `${FAKE_KEY}`, 'token eyJhbGciOiJSUzI1NiJ9.eyJ1aWQiOiJ4In0.sig', 'AI' + 'zaSyA-0123456789abcdefghijklmnop'];
     for (const t of bads) {
       S.reset();
       const r = await runCli(S, baseN(t));

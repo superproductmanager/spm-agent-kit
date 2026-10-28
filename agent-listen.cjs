@@ -1036,7 +1036,7 @@ const BACKEND_EMAIL = TEST_IDENTITIES.alpha.email;
 const UI_EMAIL = TEST_IDENTITIES.beta.email;
 const FAKE = {
   key: 'spm_k_test_fakekey0123456789abcdef0123',
-  webKey: 'AIzaFAKEWEBKEY00112233445566778899aabbccdd',
+  webKey: 'example-web-app-id-0000000000000000',
   refresh: 'AMf-vBFAKEREFRESHTOKEN0123456789abcdef',
   uid: 'fakeuid000000000000000001',
   humanEmail: 'person@example.com',
@@ -2005,8 +2005,8 @@ function defineCases(cases, env) {
 
   tc('T23', 'web key from the environment only; key file read trimmed', async () => {
     const root = path.join(RUN_DIR, 'T23'); fs.mkdirSync(path.join(root, 'a/scripts'), { recursive: true }); fs.mkdirSync(path.join(root, 'b'), { recursive: true }); fs.mkdirSync(path.join(root, 'c/scripts'), { recursive: true });
-    check(loadWebKeyFrom({ VITE_FIREBASE_API_KEY: 'AIzaFROMENVVARIABLE0000000000000' }) === 'AIzaFROMENVVARIABLE0000000000000', 'env VITE_FIREBASE_API_KEY');
-    check(loadWebKeyFrom({ FIREBASE_API_KEY: 'AIzaENVPLAIN000000000000000000' }) === 'AIzaENVPLAIN000000000000000000', 'env FIREBASE_API_KEY');
+    check(loadWebKeyFrom({ VITE_FIREBASE_API_KEY: 'example-env-var-app-id-0000000000' }) === 'example-env-var-app-id-0000000000', 'env VITE_FIREBASE_API_KEY');
+    check(loadWebKeyFrom({ FIREBASE_API_KEY: 'example-env-plain-app-id-000000000' }) === 'example-env-plain-app-id-000000000', 'env FIREBASE_API_KEY');
     let threw = false; try { loadWebKeyFrom({}); } catch (_) { threw = true; }
     check(threw, 'no env key: throws, nothing is read from disk');
     const kf = path.join(root, 'k.key'); fs.writeFileSync(kf, `  ${FAKE.key}\n`);
