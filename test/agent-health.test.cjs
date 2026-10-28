@@ -582,7 +582,8 @@ test('B1 settings.reports false from SPM: nothing is sent until the next identif
     assert.equal(srv.seen.length, 1, 'only the identify call');
     assert.ok(hasLine(r.lines, /reports off/), JSON.stringify(r.lines));
     assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, false);
-    assert.equal(fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).length, 3, 'usage queued locally, one item per model and tier');
+    assert.equal(spoolText(home), '', 'reports off from SPM: nothing queued');
+    assert.equal(readLines(path.join(stateDir(home), 'usage-local.jsonl')).length, 3, 'usage counted locally, one item per model and tier');
     srv.seen.length = 0;
     const f = await run(kit, home, ['flush', '--config', config], srv.base);
     assert.equal(f.code, 0, f.err);
@@ -710,8 +711,8 @@ test('A4 settings report false: no network call at all, local files written, one
     assert.match(fl.lines[0], /reports off/);
     assert.equal(srv.seen.length, 1, 'the only network call is the identify at start');
     assert.equal(readJson(config).agent.name, SPM_NAME, 'identify at start writes the agent name');
-    const queued = fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-    assert.ok(queued.some((x) => x.kind === 'usage') && queued.some((x) => x.kind === 'heartbeat'));
+    assert.equal(spoolText(home), '', 'reports off in the settings file: nothing queued');
+    assert.equal(readLines(path.join(stateDir(home), 'usage-local.jsonl')).length, 3, 'usage counted locally');
     assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, true, 'SPM answer stored by start; local off still sends nothing');
   } finally { await srv.close(); }
 });
@@ -887,27 +888,137 @@ test('B4 listener_starts counts wrapper.start lines only, and the heartbeat id i
     const hb = reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0];
     assert.equal(hb.numbers.listener_starts, 2);
     const boot = (() => { try { return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); } catch (_) { return ''; } })();
-    const expected = crypto.createHash('sha256').update(saltOf(home) + (boot || '') + '0' + Buffer.byteLength(body)).digest('hex').slice(0, 64);
+    const expected = crypto.createHash('sha256').update(saltOf(home) + (boot || '') + '0' + Buffer.byteLength(body) + ':0').digest('hex').slice(0, 64);
     assert.equal(hb.id, expected);
   } finally { await srv.close(); }
 });
 
-test('B4 a retried heartbeat after a crash (same offsets) queues nothing new locally', async () => {
+// H1: SPM stores the first item per id and ignores repeats (as its ON CONFLICT DO NOTHING does).
+test('H1 four heartbeats with an unchanged listener.log are four distinct items that SPM stores', async () => {
   const kit = makeKit(); const { home, config } = makeHome();
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   fs.mkdirSync(stateDir(home), { recursive: true });
   fs.writeFileSync(path.join(stateDir(home), 'listener.log'), '{"kind":"wrapper.start","t":"x"}\n');
-  fs.writeFileSync(path.join(stateDir(home), 'setup-report.jsonl'), '');
-  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }));
+  const stored = new Map();
+  const srv = await server((rec) => {
+    if (!rec.url.endsWith('/agent/reports')) return null;
+    let accepted = 0; let duplicates = 0;
+    for (const it of rec.json.reports) { if (stored.has(it.id)) duplicates++; else { stored.set(it.id, it); accepted++; } }
+    return { status: 202, body: { accepted, duplicates } };
+  });
+  try {
+    for (let i = 0; i < 4; i++) {
+      const r = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
+      assert.equal(r.code, 0, r.err);
+    }
+    assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat').length, 4, 'four heartbeats were sent');
+    assert.equal(stored.size, 4, `distinct stored ids: ${JSON.stringify([...stored.keys()])}`);
+  } finally { await srv.close(); }
+});
+
+// H2: a crash after queueing and before the state save. The retry must make the same id (one spool line).
+test('H2 a crash after queueing, before the state save: the retry makes the same heartbeat id, one line', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(home), 'listener.log'), '{"kind":"wrapper.start","t":"x"}\n');
+  const healthFile = path.join(stateDir(home), 'health.json');
+  const base = await deadBase(); // reports on, SPM unreachable: the item stays in the spool
+  const hbIds = () => readLines(spoolOf(home)).map((l) => JSON.parse(l)).filter((x) => x.kind === 'heartbeat').map((x) => x.id);
+  await run(kit, home, ['heartbeat', '--config', config], base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
+  const first = hbIds();
+  assert.equal(first.length, 1, 'first run queued one heartbeat');
+  fs.rmSync(healthFile, { force: true }); // restore the earlier state: there was no health.json before the first run
+  await run(kit, home, ['heartbeat', '--config', config], base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
+  assert.deepEqual(hbIds(), first, 'same id, one line');
+});
+
+// O1: reports off in the settings file. Usage is counted locally, never queued, and never sent later.
+test('O1 config report false: usage writes usage-local.jsonl, queues nothing, and a flush after reports on sends no usage', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }) + '\n');
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const srv = await server();
   try {
-    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
-    const healthFile = path.join(stateDir(home), 'health.json');
-    const st = readJson(healthFile);
-    fs.writeFileSync(healthFile, JSON.stringify({ ...st, logOffset: 0 })); // as if the state save was lost
-    await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
-    const hbLines = fs.readFileSync(path.join(stateDir(home), 'setup-report.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.kind === 'heartbeat');
-    assert.equal(hbLines.length, 1, 'one heartbeat line, not two');
+    const u = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
+    assert.equal(u.code, 0, u.err);
+    assert.equal(spoolText(home), '', 'no spool line');
+    const local = readLines(path.join(stateDir(home), 'usage-local.jsonl')).map((l) => JSON.parse(l));
+    assert.equal(local.length, 3, 'one item per model and tier');
+    assert.ok(local.every((x) => x.kind === 'usage'));
+    assert.deepEqual(u.lines, ['health: reports off; nothing sent, usage counted 3 (local only, usage-local.jsonl)']);
+    assert.equal(srv.seen.length, 0, 'no network call while off');
+    fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: true }) + '\n');
+    const f = await run(kit, home, ['flush', '--config', config], srv.base);
+    assert.equal(f.code, 0, f.err);
+    assert.equal(usageRows(srv).length, 0, 'the local usage is never sent');
+  } finally { await srv.close(); }
+});
+
+// O2: heartbeat with reports off queues nothing, keeps hbSeq, and still moves the log offset on.
+test('O2 heartbeat with reports off: no spool line, logOffset moves on, hbSeq unchanged', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }) + '\n');
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  const logText = '{"kind":"wrapper.start","t":"x"}\n';
+  fs.writeFileSync(path.join(stateDir(home), 'listener.log'), logText);
+  fs.writeFileSync(path.join(stateDir(home), 'health.json'), JSON.stringify({ hbSeq: 5 }) + '\n');
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(r.lines, ['health: reports off; nothing sent']);
+    assert.equal(spoolText(home), '', 'no spool line');
+    const h = readJson(path.join(stateDir(home), 'health.json'));
+    assert.equal(h.logOffset, Buffer.byteLength(logText), 'the log offset moved on');
+    assert.equal(h.hbSeq, 5, 'hbSeq not bumped');
+    assert.ok(typeof h.containerStartedAt === 'string', 'container start saved');
+    assert.equal(srv.seen.length, 0, 'no network call while off');
+  } finally { await srv.close(); }
+});
+
+// O3: reports off from SPM (health.json reportOn false), config report not false.
+test('O3 reports off from SPM: usage goes to usage-local.jsonl, heartbeat queues nothing', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(home), 'health.json'), JSON.stringify({ reportOn: false }) + '\n');
+  const srv = await server();
+  try {
+    const u = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
+    assert.equal(u.code, 0, u.err);
+    assert.deepEqual(u.lines, ['health: reports off from SPM; nothing sent, usage counted 3 (local only, usage-local.jsonl)']);
+    assert.equal(readLines(path.join(stateDir(home), 'usage-local.jsonl')).length, 3);
+    const hb = await run(kit, home, ['heartbeat', '--config', config], srv.base, { CLAUDE_CODE_SESSION_ID: SESSION_A });
+    assert.equal(hb.code, 0, hb.err);
+    assert.deepEqual(hb.lines, ['health: reports off from SPM; nothing sent']);
+    assert.equal(spoolText(home), '', 'nothing queued');
+    assert.equal(srv.seen.length, 0, 'no network call while off');
+  } finally { await srv.close(); }
+});
+
+// O4: settings --reports off deletes the unsent spool only after SPM answers 2xx with reports off.
+test('O4 settings --reports off: spool deleted after a 2xx answer, kept on 403 and on a network failure', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  const reset = () => fs.writeFileSync(spoolOf(home), '{"kind":"usage"}\n');
+  reset();
+  const srv403 = await server(settingsHandler(403, {}));
+  try {
+    const r = await run(kit, home, ['settings', '--reports', 'off', '--config', config], srv403.base);
+    assert.equal(r.code, 6, r.err);
+    assert.ok(fs.existsSync(spoolOf(home)), 'refused: spool kept');
+  } finally { await srv403.close(); }
+  const dead = await deadBase();
+  const rd = await run(kit, home, ['settings', '--reports', 'off', '--config', config], dead);
+  assert.equal(rd.code, 7, rd.err);
+  assert.ok(fs.existsSync(spoolOf(home)), 'network failure: spool kept');
+  const srv = await server(settingsHandler(200, { autostart: true, reports: false }));
+  try {
+    const r = await run(kit, home, ['settings', '--reports', 'off', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(fs.existsSync(spoolOf(home)), false, 'answered off: spool deleted');
   } finally { await srv.close(); }
 });
 

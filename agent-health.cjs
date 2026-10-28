@@ -382,14 +382,25 @@ function usageItems(parsed, role, meta, salt) {
   return items;
 }
 
+// The usage items of one transcript (none when there is no transcript). Nothing is queued here.
+async function buildUsage({ files, role, meta, salt }) {
+  if (!files || files.length === 0) return [];
+  let parsed;
+  try { parsed = await readTranscript(files); } catch (_) { return []; }
+  return usageItems(parsed, role, meta, salt);
+}
+
 // Queues the usage items of one transcript. Returns how many were queued (0 when there is no transcript).
 async function queueUsage({ files, role, spool, meta, now, salt }) {
-  if (!files || files.length === 0) return 0;
-  let parsed;
-  try { parsed = await readTranscript(files); } catch (_) { return 0; }
   let n = 0;
-  for (const item of usageItems(parsed, role, meta, salt)) { if (R.queueItem(spool, item, now).ok) n++; }
+  for (const item of await buildUsage({ files, role, meta, salt })) { if (R.queueItem(spool, item, now).ok) n++; }
   return n;
+}
+
+// Reports off (kit 0.2.0): the counted items replace usage-local.jsonl. They are never queued and never sent.
+function writeUsageLocal(sdir, items) {
+  R.writeFileAtomic(path.join(sdir, 'usage-local.jsonl'), items.map((i) => JSON.stringify(i) + '\n').join(''), 0o600);
+  return items.length;
 }
 
 const readHealth = (file) => {
@@ -506,6 +517,12 @@ async function settingsCommand(p, c, deps) {
   const sdir = R.stateDir(env);
   const st = readHealth(path.join(sdir, 'health.json'));
   R.writeFileAtomic(path.join(sdir, 'health.json'), JSON.stringify({ ...(st || {}), reportOn: answer.reports }) + '\n', 0o600);
+  // Kit 0.2.0: SPM says reports off, so the unsent report spool is never sent later. Only that file; ENOENT is fine.
+  if (answer.reports === false) {
+    try { fs.unlinkSync(path.join(sdir, 'setup-report.jsonl')); } catch (e) {
+      if (e.code !== 'ENOENT') io.err('health: could not delete the unsent report file; run settings again');
+    }
+  }
   io.out(`settings: autostart ${answer.autostart ? 'on' : 'off'}, reports ${answer.reports ? 'on' : 'off'}`);
   return 0;
 }
@@ -559,10 +576,15 @@ async function main(argv, deps) {
 
   if (p.cmd === 'usage') {
     const offNow = settingsOff || offFromSpm;
-    let t = null;
-    if (!offNow) { t = sendTarget(c, env); if (t.error) { io.err(`health: ${t.error}`); return 2; } }
+    if (offNow) {
+      // Kit 0.2.0: reports off means nothing is queued. The counted items go to usage-local.jsonl only.
+      const items = await buildUsage({ files, role: p.role, meta: metaOf(), salt: sa.salt });
+      const counted = writeUsageLocal(sdir, items);
+      return offLine(io, `usage counted ${counted} (local only, usage-local.jsonl)`, offFromSpm);
+    }
+    const t = sendTarget(c, env);
+    if (t.error) { io.err(`health: ${t.error}`); return 2; }
     const queued = await queueUsage({ files, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
-    if (offNow) return offLine(io, `usage queued ${queued}`, offFromSpm);
     return finish(io, await flushWith(t), `usage queued ${queued}`);
   }
 
@@ -573,6 +595,8 @@ async function main(argv, deps) {
     const bootId = readBootId();
     const fresh = !st || st.bootId !== bootId;
     const offsetIn = fresh ? 0 : (Number.isSafeInteger(st.logOffset) && st.logOffset >= 0 ? st.logOffset : 0);
+    // Kit 0.2.0: hbSeq counts the heartbeats queued so far. It makes each heartbeat id unique, even when the log is unchanged.
+    const hbSeqIn = st && Number.isSafeInteger(st.hbSeq) && st.hbSeq >= 0 ? st.hbSeq : 0;
     const log = readLogSince(path.join(sdir, 'listener.log'), offsetIn);
     const mainNow = readMainId(path.join(sdir, 'main-session-id'));
     const mainStored = fresh ? null : (typeof st.lastMainId === 'string' ? st.lastMainId : null);
@@ -580,13 +604,21 @@ async function main(argv, deps) {
     const containerStartedAt = fresh ? meta.at : (typeof st.containerStartedAt === 'string' ? st.containerStartedAt : meta.at);
     const started = Date.parse(containerStartedAt);
     const uptime = fresh || !Number.isFinite(started) ? 0 : Math.max(0, Math.floor((now - started) / 1000));
+    const savedState = {
+      ...(st || {}), bootId, containerStartedAt, logOffset: log.offset, lastMainId: mainNow !== null ? mainNow : mainStored,
+    };
     if (files.length === 0) {
       const head = 'no session transcript yet; heartbeat not queued';
       return offNow ? offLine(io, head, offFromSpm) : finish(io, await flushWith(t), head);
     }
+    if (offNow) {
+      // Kit 0.2.0: reports off queues no heartbeat and does not bump hbSeq, but the log offset still moves on.
+      R.writeFileAtomic(healthFile, JSON.stringify(savedState) + '\n', 0o600);
+      return offLine(io, null, offFromSpm);
+    }
     const sid = (await readTranscript(files)).primary;
-    // B4: the id is fixed by the salt, the boot id and the log offsets, so a retry after a crash is a duplicate.
-    const id = crypto.createHash('sha256').update(sa.salt + (bootId || '') + String(offsetIn) + String(log.offset)).digest('hex').slice(0, 64);
+    // B4: the id is fixed by the salt, the boot id, the log offsets and hbSeq, so a retry after a crash (same state) is a duplicate.
+    const id = crypto.createHash('sha256').update(sa.salt + (bootId || '') + String(offsetIn) + String(log.offset) + ':' + String(hbSeqIn)).digest('hex').slice(0, 64);
     const item = {
       id, kind: 'heartbeat', role: 'listener', ...meta, session_key: sessionKey(sid, sa.salt),
       numbers: {
@@ -597,10 +629,8 @@ async function main(argv, deps) {
     if (p.mainStatus) item.main_status = p.mainStatus;
     const q = R.queueItem(spool, item, now);
     if (!q.ok) { io.err(`health: ${q.error}; nothing queued`); return 1; }
-    R.writeFileAtomic(healthFile, JSON.stringify({
-      ...(st || {}), bootId, containerStartedAt, logOffset: log.offset, lastMainId: mainNow !== null ? mainNow : mainStored,
-    }) + '\n', 0o600);
-    if (offNow) return offLine(io, 'heartbeat queued', offFromSpm);
+    // The same write saves the offsets and the next hbSeq, and only a queued heartbeat gets here.
+    R.writeFileAtomic(healthFile, JSON.stringify({ ...savedState, hbSeq: hbSeqIn + 1 }) + '\n', 0o600);
     return finish(io, await flushWith(t), 'heartbeat queued');
   }
 
@@ -635,8 +665,13 @@ async function main(argv, deps) {
     io.out(`health: warning: kit ${kv.version} is older than the minimum ${id.minKit} that SPM asks for`);
   }
   if (settingsOff) { io.out(`health: identified ${id.name}; reports off; nothing sent`); return 0; }
-  const queued = kv.version ? await queueUsage({ files, role: p.role, spool, meta: metaOf(), now, salt: sa.salt }) : 0;
-  if (!id.reportOn) return offLine(io, `identified ${id.name}; usage queued ${queued}`, true);
+  // Kit 0.2.0: SPM says reports off, so usage is counted locally and nothing is queued.
+  const usageItemsNow = kv.version ? await buildUsage({ files, role: p.role, meta: metaOf(), salt: sa.salt }) : [];
+  if (!id.reportOn) {
+    const counted = writeUsageLocal(sdir, usageItemsNow);
+    return offLine(io, `identified ${id.name}; usage counted ${counted} (local only, usage-local.jsonl)`, true);
+  }
+  for (const item of usageItemsNow) R.queueItem(spool, item, now);
   const head = `identified ${id.name}` + (kv.version ? '' : '; kit VERSION missing, usage not queued');
   return finish(io, await flushWith(t), head);
 }
