@@ -61,7 +61,7 @@ const FILES = textFiles();
 test('scans files found on disk at run time (not a fixed list)', () => {
   const names = FILES.map((f) => f.rel);
   assert.ok(names.includes('README.md'), 'README.md should be in the scan');
-  assert.ok(names.includes('templates/org-repo/spm-agent.config.example.json'), 'templates should be in the scan');
+  assert.ok(names.includes('setup-env.sh'), 'the kit scripts should be in the scan');
   assert.ok(!names.includes('LICENSE'), 'LICENSE skips itself');
 });
 

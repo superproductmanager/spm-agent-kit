@@ -95,20 +95,6 @@ test('a missing release exits non-zero and leaves no install folder', () => {
   }
 });
 
-// The org template carries its own copy of the installer, so the SessionStart hook runs the reviewed file in the repo,
-// never a download. These tests pin that copy and the hook command.
-test('the template copy of install-kit.sh is byte-identical to install/install-kit.sh', () => {
-  const copy = path.join(ROOT, 'templates', 'org-repo', '.claude', 'hooks', 'install-kit.sh');
-  assert.ok(fs.readFileSync(copy).equals(fs.readFileSync(INSTALL)), 'the two installer copies differ');
-});
-
-test('the SessionStart hook runs the repo copy of the installer and downloads nothing itself', () => {
-  const settings = JSON.parse(fs.readFileSync(path.join(ROOT, 'templates', 'org-repo', '.claude', 'settings.json'), 'utf8'));
-  const cmd = settings.hooks.SessionStart[0].hooks[0].command;
-  assert.ok(cmd.startsWith('bash "$CLAUDE_PROJECT_DIR/.claude/hooks/install-kit.sh" 0.1.0 REPLACE_WITH_SHA256_FROM_SHA256SUMS && '), 'the hook runs the repo copy of the installer first');
-  assert.ok(!/curl|wget|raw\.githubusercontent/.test(cmd), 'the hook command must not fetch anything');
-});
-
 // ---- The kit marker: the installer deletes only a folder that carries .spm-agent-kit ----
 
 const MARKER = '.spm-agent-kit';

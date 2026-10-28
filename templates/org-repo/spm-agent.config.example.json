@@ -1,8 +1,0 @@
-{
-  "agent": {
-    "name": "Example agent",
-    "email": "spm-example-agent@agents.invalid"
-  },
-  "ignore_agents": ["Other example agent"],
-  "main_session_id": "session_EXAMPLE0000000000000000"
-}
