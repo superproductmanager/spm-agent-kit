@@ -5,7 +5,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { loadConfig, ConfigError } = require('../lib/config.cjs');
+const { loadConfig, loadConfigOptionalAgent, ConfigError } = require('../lib/config.cjs');
 
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spm-kit-config-'));
 const good = { agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' }, key_file: path.join(dir, 'example.key') };
@@ -150,4 +150,56 @@ test('with no env value, the settings file app_id is used', () => {
 test('with neither env nor app_id, loadWebKeyFrom still throws (today\'s failure)', () => {
   assert.throws(() => loadWebKeyFrom({}, null), /no firebase web api key found/);
   assert.throws(() => loadWebKeyFrom({}), /no firebase web api key found/);
+});
+
+// ---- 0.2.0: the agent may be absent (identity comes from SPM with agent-health.cjs start) ----
+const APP = 'example-app-id-0000000000000000';
+
+test('strict loader refuses a settings file with no agent, with the exact message', () => {
+  const p = write('noagent.json', { app_id: APP });
+  const kit = path.resolve(__dirname, '..');
+  assert.throws(() => loadConfig({ argv: ['--config', p], env: {} }), (e) => e instanceof ConfigError && e.message === `the agent is not identified yet: run node ${kit}/agent-health.cjs start --config ${p}`);
+});
+
+test('optional loader accepts a settings file with no agent and returns null identity', () => {
+  const p = write('noagent-optional.json', { app_id: APP });
+  const c = loadConfigOptionalAgent({ argv: ['--config', p], env: {} });
+  assert.equal(c.name, null);
+  assert.equal(c.email, null);
+  assert.equal(c.appId, APP);
+  assert.equal(c.configPath, p);
+});
+
+test('optional loader still validates an agent block that is present', () => {
+  const p = write('badagent-optional.json', { agent: { email: 'spm-example-agent@agents.invalid' }, app_id: APP });
+  assert.throws(() => loadConfigOptionalAgent({ argv: ['--config', p], env: {} }), (e) => e instanceof ConfigError && /agent\.name is missing/.test(e.message));
+});
+
+test('optional loader refuses a missing settings file and a relative path', () => {
+  assert.throws(() => loadConfigOptionalAgent({ argv: ['--config', path.join(dir, 'nope.json')], env: {} }), (e) => e instanceof ConfigError && /cannot read the settings file/.test(e.message));
+  assert.throws(() => loadConfigOptionalAgent({ argv: ['--config', 'rel.json'], env: {} }), (e) => e instanceof ConfigError && /must be absolute/.test(e.message));
+});
+
+test('strict loader still accepts a settings file that has an agent', () => {
+  const p = write('withagent.json', { agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' }, app_id: APP });
+  assert.equal(loadConfig({ argv: ['--config', p], env: {} }).name, 'Example agent');
+});
+
+// ---- Addendum A (28 Oct): report opt-out flag; app_id may be absent ----
+test('report defaults to true when absent, and false is read as false', () => {
+  const on = write('report-absent.json', { agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' } });
+  assert.equal(loadConfig({ argv: ['--config', on], env: {} }).report, true);
+  const off = write('report-off.json', { agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' }, report: false });
+  assert.equal(loadConfig({ argv: ['--config', off], env: {} }).report, false);
+  assert.equal(loadConfigOptionalAgent({ argv: ['--config', off], env: {} }).report, false);
+});
+
+test('a report value that is not a boolean is refused', () => {
+  const p = write('report-bad.json', { app_id: APP, report: 'off' });
+  assert.throws(() => loadConfigOptionalAgent({ argv: ['--config', p], env: {} }), (e) => e instanceof ConfigError && /report must be true or false/.test(e.message));
+});
+
+test('app_id may be absent: the strict loader accepts it and reports null', () => {
+  const p = write('noappid.json', { agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' } });
+  assert.equal(loadConfig({ argv: ['--config', p], env: {} }).appId, null);
 });

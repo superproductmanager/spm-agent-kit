@@ -11,6 +11,8 @@
  * server's short code is read, and it is mapped to a fixed plain cause line.
  *
  *   node agent-selfcheck.cjs --config <abs path> (or the SPM_AGENT_CONFIG environment variable; see lib/config.cjs)
+ *   node agent-selfcheck.cjs --setup --config <abs path>   (0.2.0, run by setup-env.sh) the two no-key checks (spm-host, google-host), each
+ *        one line in ~/.spm-agent-state/setup-report.jsonl (kind check, role setup); no stdout; always exit 0. Needs a VERSION file beside this script.
  *   Key modes: a settings file with key_file reads the key from that file (as before). With no key_file the key is a
  *   network secret in the Claude cloud environment: the header value is the fixed placeholder, every https call goes
  *   through HTTPS_PROXY, and with no proxy the script refuses (exit 2). The first stdout line is the kit version.
@@ -48,7 +50,8 @@ const https = require('node:https');
 const os = require('node:os');
 const path = require('node:path');
 const { loadWebKeyFrom, readKeyFile } = require('./agent-listen.cjs');
-const { loadConfig } = require('./lib/config.cjs');
+const crypto = require('node:crypto');
+const { loadConfig, loadConfigOptionalAgent } = require('./lib/config.cjs');
 const { keyMode, proxyUrl } = require('./lib/key-mode.cjs');
 
 const PROJECT = 'litethink';
@@ -89,7 +92,9 @@ const UNEXPECTED_FIX = 'run again; if it repeats, send this line to SPM';
 const SECRET_NOT_REACHED_CODES = ['missing_credential', 'invalid_credential', 'untrusted_origin'];
 const SECRET_NOT_REACHED = ['the network secret did not reach SPM: check the secret\'s host is exactly asia-south1-litethink.cloudfunctions.net and its header is X-SPM-API-Key', 'set the network secret for host asia-south1-litethink.cloudfunctions.net with header X-SPM-API-Key, then run again'];
 
-function out(line) { process.stdout.write(line + '\n'); }
+// --setup prints nothing on stdout; its results go to the spool only.
+let QUIET = false;
+function out(line) { if (!QUIET) process.stdout.write(line + '\n'); }
 
 /** The kit version: the VERSION file next to this script, else "dev". */
 function kitVersion() {
@@ -173,12 +178,14 @@ function agentHeaders(ctx) {
 async function checkGoogleHost(ctx) {
   const probe = (base) => call(`${base}${FS_ROOT}/signals/${'0'.repeat(64)}`, 'GET', { Authorization: 'Bearer abc' });
   const r = await probe(ctx.bases.regional);
-  if (r.status === null) return { ok: false, name: 'google-host', cause: `cannot reach ${FS_HOST}`, fix: 'check that this machine may reach that host' };
-  if (r.status === 403) { const w = wildcardCause(FS_HOST); return { ok: false, name: 'google-host', ...w }; }
-  if (r.status !== 401) return { ok: false, name: 'google-host', cause: `unexpected ${r.status}`, fix: UNEXPECTED_FIX };
-  const s = await probe(ctx.bases.shared);
-  if (s.status === null) out(`info google-host (${SHARED_FS_HOST}): no answer, not used by the listener any more`);
-  else out(`info google-host (${SHARED_FS_HOST}): HTTP ${s.status}, not used by the listener any more`);
+  if (r.status === null) return { ok: false, name: 'google-host', code: 'no_answer', cause: `cannot reach ${FS_HOST}`, fix: 'check that this machine may reach that host' };
+  if (r.status === 403) { const w = wildcardCause(FS_HOST); return { ok: false, name: 'google-host', code: 'wildcard_secret', ...w }; }
+  if (r.status !== 401) return { ok: false, name: 'google-host', code: 'unexpected_status', cause: `unexpected ${r.status}`, fix: UNEXPECTED_FIX };
+  if (!ctx.setup) {
+    const s = await probe(ctx.bases.shared);
+    if (s.status === null) out(`info google-host (${SHARED_FS_HOST}): no answer, not used by the listener any more`);
+    else out(`info google-host (${SHARED_FS_HOST}): HTTP ${s.status}, not used by the listener any more`);
+  }
   out('ok google-host');
   return { ok: true };
 }
@@ -229,6 +236,85 @@ async function checkSignalRead(ctx) {
   return { ok: false, name: 'signal-read', cause: `unexpected ${r.status}`, fix: UNEXPECTED_FIX };
 }
 
+// ---------------------------------------------------------------- 0.2.0: the three no-key checks for --setup
+
+/** spm-host: a GET to the SPM API host. Any HTTP status is an answer (pass); no answer is a fail. */
+async function checkSpmHost(ctx) {
+  const r = await call(`${ctx.bases.fn}/accountApi/agent/self`, 'GET', {});
+  if (r.status === null) return { ok: false, name: 'spm-host', code: 'no_answer', cause: `cannot reach ${FN_HOST}`, fix: 'check that this machine may reach that host' };
+  return { ok: true };
+}
+
+/** The kit version for the spool: the first line of VERSION when it is a release number, else null (no spool line). */
+function strictKitVersion() {
+  try {
+    const v = fs.readFileSync(path.join(__dirname, 'VERSION'), 'utf8').split('\n')[0].trim();
+    if (/^\d+\.\d+\.\d+$/.test(v)) return v;
+  } catch (_) { /* no VERSION file */ }
+  return null;
+}
+
+/** The run id shared by one setup run: reused while setup-run-id is younger than one hour, else a new one is written. */
+function isLink(p) { try { return fs.lstatSync(p).isSymbolicLink(); } catch (_) { return false; } }
+
+function setupRunId(dir) {
+  const f = path.join(dir, 'setup-run-id');
+  try {
+    const st = fs.lstatSync(f);
+    const v = st.isFile() ? fs.readFileSync(f, 'utf8').trim() : '';
+    if (Date.now() - st.mtimeMs < 3600000 && /^[a-f0-9-]{8,64}$/.test(v)) return v;
+  } catch (_) { /* no run id yet */ }
+  const id = crypto.randomBytes(16).toString('hex');
+  try {
+    if (!isLink(f)) {
+      fs.writeFileSync(f, id + '\n', { mode: 0o600 });
+      fs.chmodSync(f, 0o600);
+    }
+  } catch (_) { /* the id still goes into this run's lines */ }
+  return id;
+}
+
+/** Appends one check line to the spool. Never throws, never prints. */
+function spoolCheck(step, status, code) {
+  const kv = strictKitVersion();
+  if (!kv) return;
+  try {
+    const dir = path.join(process.env.HOME || os.homedir(), '.spm-agent-state');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    fs.chmodSync(dir, 0o700);
+    const file = path.join(dir, 'setup-report.jsonl');
+    if (isLink(file)) return;
+    const item = { id: crypto.randomBytes(16).toString('hex'), kind: 'check', role: 'setup', run_id: setupRunId(dir), step, status };
+    if (code) item.code = code;
+    item.at = new Date().toISOString();
+    item.kit_version = kv;
+    fs.appendFileSync(file, JSON.stringify(item) + '\n', { mode: 0o600 });
+    fs.chmodSync(file, 0o600);
+  } catch (_) { /* a spool write never stops the check */ }
+}
+
+/** --setup: the three no-key checks, each one spool line. Never exits non-zero. */
+async function mainSetup(argv) {
+  QUIET = true;
+  const a = parseArgs(argv);
+  let conf = null;
+  if (!a.usage) {
+    try { conf = loadConfigOptionalAgent({ argv, env: process.env }); } catch (_) { conf = null; }
+  }
+  if (!conf) {
+    for (const s of ['spm-host', 'google-host']) spoolCheck(s, 'fail', 'no_config');
+    return 0;
+  }
+  const ctx = { email: conf.email || '', appId: conf.appId, bases: a.bases, key: null, customToken: null, idToken: null, secret: false, setup: true };
+  // Addendum A1: the app-id test is dropped (SPM now returns the app id at identify).
+  for (const [name, check] of [['spm-host', checkSpmHost], ['google-host', checkGoogleHost]]) {
+    let r;
+    try { r = await check(ctx); } catch (_) { r = { ok: false, code: 'unexpected_error' }; }
+    spoolCheck(name, r.ok ? 'pass' : 'fail', r.ok ? null : r.code);
+  }
+  return 0;
+}
+
 // ---------------------------------------------------------------- arguments and main
 
 /** Returns { bases } or { usage } with the one line to print. The settings file is read in main (lib/config.cjs). */
@@ -251,6 +337,7 @@ function parseArgs(argv) {
 }
 
 async function main(argv) {
+  if (argv.includes('--setup')) return mainSetup(argv.filter((x) => x !== '--setup'));
   const a = parseArgs(argv);
   if (a.usage) { process.stderr.write(a.usage + '\n'); return 2; }
   let conf;
@@ -269,9 +356,14 @@ async function main(argv) {
 }
 
 if (require.main === module) {
+  const SETUP = process.argv.includes('--setup');
   main(process.argv.slice(2)).then(
     (code) => process.exit(code),
-    () => { out('FAIL selfcheck: the check itself stopped unexpectedly. Fix: run again; if it repeats, send this line to the script owner.'); process.exit(1); },
+    () => {
+      if (SETUP) process.exit(0); // --setup never exits non-zero and never prints
+      out('FAIL selfcheck: the check itself stopped unexpectedly. Fix: run again; if it repeats, send this line to the script owner.');
+      process.exit(1);
+    },
   );
 }
 

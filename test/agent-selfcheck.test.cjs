@@ -436,3 +436,189 @@ test('no secret in output when the app id is wrong and identitytoolkit echoes th
   assert.ok(hasLine(r.stdout, /^FAIL sign-in: the app id \(web API key\) is wrong/), `the run must reach the sign-in cause: ${r.stdout}`);
   noSecret(r, 'idt echo');
 });
+
+// ---------------------------------------------------------------- 0.2.0: --setup (no key, three setup lines in the spool)
+// --setup needs a VERSION file beside the script (the spool carries kit_version), so each setup test runs a copy of the
+// script and its lib folder in a temp kit folder. Hosts are the local fakes above, or a closed port.
+const SETUP_CONFIG_APP = 'example-web-app-id-selfcheck-000000';
+const SPOOL_RE = { id: /^[a-f0-9-]{16,64}$/, run_id: /^[a-f0-9-]{8,64}$/, step: /^[a-z0-9-]{1,32}$/, code: /^[a-z0-9_]{1,64}$/ };
+
+function setupKit(version = '0.2.0\n') {
+  const kit = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-kit-'));
+  fs.copyFileSync(path.join(__dirname, '..', 'agent-selfcheck.cjs'), path.join(kit, 'agent-selfcheck.cjs'));
+  fs.copyFileSync(path.join(__dirname, '..', 'agent-listen.cjs'), path.join(kit, 'agent-listen.cjs'));
+  fs.cpSync(path.join(__dirname, '..', 'lib'), path.join(kit, 'lib'), { recursive: true });
+  if (version !== null) fs.writeFileSync(path.join(kit, 'VERSION'), version);
+  return kit;
+}
+
+function setupConfig(obj) {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-setup-cfg-'));
+  const p = path.join(d, 'config.json');
+  fs.writeFileSync(p, JSON.stringify(obj));
+  return p;
+}
+
+/** Runs the kit copy with --setup. HOME is a temp folder; the env carries no proxy and no key. */
+function runSetupMode({ kit, home, config, bases, args }) {
+  const argv = args || ['--setup', '--config', config];
+  const extra = [];
+  if (bases) extra.push('--base-regional', bases.regional, '--base-shared', bases.shared, '--base-fn', bases.fn, '--base-idt', bases.idt);
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [path.join(kit, 'agent-selfcheck.cjs'), ...argv, ...extra], { env: { PATH: process.env.PATH, HOME: home } });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    const killer = setTimeout(() => child.kill('SIGKILL'), 30000);
+    child.on('error', reject);
+    child.on('close', (code) => { clearTimeout(killer); resolve({ code, stdout, stderr }); });
+  });
+}
+
+function spoolOf(home) {
+  const f = path.join(home, '.spm-agent-state', 'setup-report.jsonl');
+  if (!fs.existsSync(f)) return [];
+  return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+}
+
+function newHome() { return fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-setup-home-')); }
+
+/** Healthy fakes for the three setup checks: regional 401, functions 404 (any status is an answer), identity 400 invalid custom token. */
+async function setupFakes(opts = {}) {
+  const regional = await serve(fakeServer(() => ({ status: opts.regional ?? 401, body: { error: { code: 401 } } })));
+  const fn = await serve(fakeServer(() => ({ status: opts.fn ?? 404, body: { error: { code: 404 } } })));
+  const idt = await serve(fakeServer(() => ({ status: opts.idtStatus ?? 400, body: { error: { message: opts.idtMessage ?? 'INVALID_CUSTOM_TOKEN' } } })));
+  return { regional: regional.base, shared: regional.base, fn: fn.base, idt: idt.base };
+}
+
+const SETUP_STEPS = ['spm-host', 'google-host'];
+
+test('setup: two check lines in the spool, both pass on healthy hosts; stdout empty; exit 0; no key or proxy used', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const bases = await setupFakes();
+    const r = await runSetupMode({ kit, home, config: setupConfig({ app_id: SETUP_CONFIG_APP }), bases });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, '');
+    const lines = spoolOf(home);
+    assert.deepEqual(lines.map((l) => [l.step, l.status]), SETUP_STEPS.map((s) => [s, 'pass']));
+    const runId = fs.readFileSync(path.join(home, '.spm-agent-state', 'setup-run-id'), 'utf8').trim();
+    for (const l of lines) {
+      assert.equal(l.kind, 'check');
+      assert.equal(l.role, 'setup');
+      assert.match(l.id, SPOOL_RE.id);
+      assert.equal(l.run_id, runId);
+      assert.match(l.run_id, SPOOL_RE.run_id);
+      assert.match(l.step, SPOOL_RE.step);
+      assert.equal(l.code, undefined, 'a pass has no code');
+      assert.equal(l.kit_version, '0.2.0');
+      assert.match(l.at, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
+    }
+    assert.equal(new Set(lines.map((l) => l.id)).size, 2);
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: every host refusing gives two fails with code no_answer, and still exits 0', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const dead = await deadBase();
+    const r = await runSetupMode({ kit, home, config: setupConfig({ app_id: SETUP_CONFIG_APP }), bases: { regional: dead, shared: dead, fn: dead, idt: dead } });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, '');
+    assert.deepEqual(spoolOf(home).map((l) => [l.step, l.status, l.code]), SETUP_STEPS.map((s) => [s, 'fail', 'no_answer']));
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: spm-host passes on any HTTP status (a 500 is an answer)', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: setupConfig({ app_id: SETUP_CONFIG_APP }), bases: await setupFakes({ fn: 500 }) });
+    assert.equal(r.code, 0);
+    assert.equal(spoolOf(home).find((l) => l.step === 'spm-host').status, 'pass');
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: no app-id line is written even when the config has no app_id (Addendum A1)', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: setupConfig({}), bases: await setupFakes() });
+    assert.equal(r.code, 0);
+    assert.deepEqual(spoolOf(home).map((l) => l.step), ['spm-host', 'google-host']);
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: google-host fails with code wildcard_secret on a regional 403, and passes are not affected', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: setupConfig({ app_id: SETUP_CONFIG_APP }), bases: await setupFakes({ regional: 403 }) });
+    assert.equal(r.code, 0);
+    const lines = spoolOf(home);
+    assert.equal(lines.find((l) => l.step === 'google-host').code, 'wildcard_secret');
+    assert.equal(lines.find((l) => l.step === 'spm-host').status, 'pass');
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: google-host fails with code unexpected_status on a regional 500', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: setupConfig({ app_id: SETUP_CONFIG_APP }), bases: await setupFakes({ regional: 500 }) });
+    assert.equal(r.code, 0);
+    const line = spoolOf(home).find((l) => l.step === 'google-host');
+    assert.deepEqual([line.status, line.code], ['fail', 'unexpected_status']);
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: an unreadable config still exits 0 and records two fails with code no_config', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: path.join(home, 'missing.json'), bases: await setupFakes() });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, '');
+    assert.deepEqual(spoolOf(home).map((l) => [l.step, l.status, l.code]), SETUP_STEPS.map((s) => [s, 'fail', 'no_config']));
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: a kit with no VERSION file writes no spool lines (kit_version cannot be filled in) and exits 0', async () => {
+  const kit = setupKit(null);
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: setupConfig({ app_id: SETUP_CONFIG_APP }), bases: await setupFakes() });
+    assert.equal(r.code, 0, r.stderr);
+    assert.equal(r.stdout, '');
+    assert.equal(fs.existsSync(path.join(home, '.spm-agent-state', 'setup-report.jsonl')), false);
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: the spool holds no secret, no address and no host name from the answers', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: setupConfig({ app_id: SETUP_CONFIG_APP }), bases: await setupFakes({ idtMessage: 'API key not valid ' + FAKE_WEB, idtStatus: 400 }) });
+    assert.equal(r.code, 0);
+    const text = fs.readFileSync(path.join(home, '.spm-agent-state', 'setup-report.jsonl'), 'utf8');
+    assert.equal(text.includes('@'), false);
+    assert.equal(text.includes(FAKE_WEB), false, 'the app id must not reach the spool');
+    assert.equal(text.includes('127.0.0.1'), false);
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('setup: a second run inside the hour reuses the run id', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const bases = await setupFakes();
+    const cfg = setupConfig({ app_id: SETUP_CONFIG_APP });
+    assert.equal((await runSetupMode({ kit, home, config: cfg, bases })).code, 0);
+    assert.equal((await runSetupMode({ kit, home, config: cfg, bases })).code, 0);
+    const ids = new Set(spoolOf(home).map((l) => l.run_id));
+    assert.equal(ids.size, 1, 'one run id across both runs');
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
