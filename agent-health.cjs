@@ -605,11 +605,8 @@ async function main(argv, deps) {
     return finish(io, await flushWith(t), 'heartbeat queued');
   }
 
-  // start
-  if (settingsOff) {
-    const queued = await queueUsage({ files, role: p.role, spool, meta: metaOf(), now, salt: sa.salt });
-    return offLine(io, `usage queued ${queued}`, false);
-  }
+  // start: always identifies (the agent name and address are needed even with reports off); local report off only
+  // decides that nothing is sent or queued after identify.
   const t = sendTarget(c, env);
   if (t.error) { io.err(`health: ${t.error}`); return 2; }
   const id = await identify({ base: t.base, key: t.key, timeoutMs: identifyTimeout(env) });
@@ -638,6 +635,7 @@ async function main(argv, deps) {
   if (id.minKit && kv.version && versionOlder(kv.version, id.minKit)) {
     io.out(`health: warning: kit ${kv.version} is older than the minimum ${id.minKit} that SPM asks for`);
   }
+  if (settingsOff) { io.out(`health: identified ${id.name}; reports off; nothing sent`); return 0; }
   const queued = kv.version ? await queueUsage({ files, role: p.role, spool, meta: metaOf(), now, salt: sa.salt }) : 0;
   if (!id.reportOn) return offLine(io, `identified ${id.name}; usage queued ${queued}`, true);
   const head = `identified ${id.name}` + (kv.version ? '' : '; kit VERSION missing, usage not queued');

@@ -690,14 +690,15 @@ test('A3 over 1 MB the sent log keeps its newest half of the lines', async () =>
 test('A4 settings report false: no network call at all, local files written, one line says reports off, no key needed', async () => {
   const kit = makeKit(); const home = tmpdir('home-off');
   const config = path.join(home, 'agent.json');
-  fs.writeFileSync(config, JSON.stringify({ report: false }) + '\n');
+  fs.writeFileSync(path.join(home, 'agent.key'), FAKE_SPM_KEY + '\n', { mode: 0o600 });
+  fs.writeFileSync(config, JSON.stringify({ report: false, key_file: path.join(home, 'agent.key') }) + '\n');
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const srv = await server();
   try {
     const start = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
     assert.equal(start.code, 0, start.err);
-    assert.equal(start.lines.length, 1, JSON.stringify(start.lines));
-    assert.match(start.lines[0], /reports off/);
+    assert.deepEqual(start.lines, ['health: identified Example agent; reports off; nothing sent']);
+    assert.equal(srv.seen.length, 1, 'start identifies once (A4 review: reports off does not skip identify)');
     const usage = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
     assert.equal(usage.code, 0, usage.err);
     assert.match(usage.lines[0], /reports off/);
@@ -707,11 +708,11 @@ test('A4 settings report false: no network call at all, local files written, one
     const fl = await run(kit, home, ['flush', '--config', config], srv.base);
     assert.equal(fl.code, 0, fl.err);
     assert.match(fl.lines[0], /reports off/);
-    assert.equal(srv.seen.length, 0, 'no network call of any kind');
-    assert.equal(readJson(config).agent, undefined, 'identify did not run, so no agent name is written');
+    assert.equal(srv.seen.length, 1, 'the only network call is the identify at start');
+    assert.equal(readJson(config).agent.name, SPM_NAME, 'identify at start writes the agent name');
     const queued = fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
     assert.ok(queued.some((x) => x.kind === 'usage') && queued.some((x) => x.kind === 'heartbeat'));
-    assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, undefined);
+    assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, true, 'SPM answer stored by start; local off still sends nothing');
   } finally { await srv.close(); }
 });
 
@@ -1092,5 +1093,49 @@ test('C5 settings omits session_key with no transcript or no salt, still sends k
     const last = srv.seen.filter((q) => q.url.endsWith('/agent/settings')).pop().json;
     assert.deepEqual(last, { autostart: true, kit_version: '0.2.0' });
     assert.equal(fs.existsSync(path.join(stateDir(home), 'report-salt')), false, 'settings does not create the salt');
+  } finally { await srv.close(); }
+});
+
+// ---------------------------------------------------------------- start identifies even with local report off (review finding on 3746ff9)
+test('start with local "report": false still identifies: name and address are written, one GET /agent/self, nothing sent', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }) + '\n');
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, 'health: identified Example agent; reports off; nothing sent\n');
+    assert.equal(readJson(config).agent.name, SPM_NAME);
+    assert.equal(readJson(config).agent.email, SPM_ADDRESS);
+    assert.equal(srv.seen.length, 1, JSON.stringify(srv.seen.map((q) => q.url)));
+    assert.equal(srv.seen[0].method, 'GET');
+    assert.ok(srv.seen[0].url.endsWith('/agent/self'));
+    assert.equal(reportsOf(srv).length, 0, 'no POST /agent/reports');
+    assert.equal(spoolText(home), '', 'nothing queued');
+  } finally { await srv.close(); }
+});
+
+test('start with local "report": false and SPM unreachable exits 7 and changes nothing', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }) + '\n');
+  const before = fs.readFileSync(config, 'utf8');
+  const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], await deadBase());
+  assert.equal(r.code, 7, r.err);
+  assert.ok(hasLine(r.lines, /could not reach SPM/), JSON.stringify(r.lines));
+  assert.equal(fs.readFileSync(config, 'utf8'), before);
+});
+
+test('start with local "report": false and a refused key exits 6 and changes nothing', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }) + '\n');
+  const before = fs.readFileSync(config, 'utf8');
+  const srv = await server((rec) => (rec.url.endsWith('/agent/self') ? { status: 401, body: {} } : null));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
+    assert.equal(r.code, 6, r.err);
+    assert.ok(hasLine(r.lines, /refused the key/), JSON.stringify(r.lines));
+    assert.equal(fs.readFileSync(config, 'utf8'), before);
+    assert.equal(reportsOf(srv).length, 0);
   } finally { await srv.close(); }
 });
