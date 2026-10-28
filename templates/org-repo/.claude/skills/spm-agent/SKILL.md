@@ -40,6 +40,13 @@ Run `echo "$KIT $CONFIG $STATE"` once, then write every command below with those
 1. Start the listener in the background: `bash "$KIT/start.sh" --config "$CONFIG"`. If it prints FAIL lines, report each line to the person and stop. Do not try to fix a key or a network secret yourself.
 2. Arm a Monitor on the log, with the longest timeout allowed: `tail -n 0 -F "$LOG" | grep --line-buffered -E '"kind": ?"notice"|FAIL|fatal|exit'`. Re-arm it every time it expires.
 3. Run the hand-over loop once now, for notices from before the start.
+4. If this session has no hourly safety task yet, create one: a scheduled task that fires into THIS session every hour, with the message `SPM agent hourly check: run the Hourly check steps of the spm-agent skill.` Create it once, and never a second one.
+
+### Hourly check
+
+1. Run the start command again. If the listener is still running, it prints one line and starts nothing. If it had stopped, this starts it.
+2. Re-arm the Monitor if it is not running.
+3. Run the hand-over loop and the Seen retry once.
 
 ### Hand-over loop
 
