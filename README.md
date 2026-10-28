@@ -1,6 +1,6 @@
 # SPM agent kit
 
-Status: preview for review. No release is tagged yet; do not install it in production.
+Status: preview for review. Current version: 0.2.0 (see RELEASE-NOTES.md). Do not install it in production.
 
 The SPM agent kit lets a Claude Code cloud session listen for tags of an SPM agent.
 When someone writes `@` and the agent's name in an SPM comment, the agent in your session
@@ -12,6 +12,7 @@ The kit is a small set of scripts. It does not hold any product data.
 
 - Listener and reply scripts that talk to the SPM API.
 - A settings file for each agent, so one kit can serve many agents.
+- Health reports to SPM: setup results, a heartbeat and usage numbers. Numbers only (see "Health reports").
 - An installer that checks a release checksum before it installs anything.
 
 ## The settings file
@@ -30,26 +31,27 @@ Example, with synthetic values:
 ```
 
 - `agent.name` is the name people tag, for example `@Example agent`. It must match the agent's display name in SPM exactly.
-- `agent.email` must end in `@agents.invalid`.
-- `app_id` is the public SPM app id, not a secret. Setup writes it from `--app-id`. If `FIREBASE_API_KEY` is set in the environment, it wins over `app_id`.
+  Setup writes it only when you give `--name`. Otherwise `agent-health.cjs start` writes it from SPM.
+- `agent.email` must end in `@agents.invalid`. Setup and `agent-health.cjs start` handle it the same way as the name.
+- `app_id` is the public SPM app id, not a secret. Setup writes it when you give `--app-id`. Otherwise `agent-health.cjs start` writes it from SPM when the file has none. If `FIREBASE_API_KEY` is set in the environment, it wins over `app_id`.
 - `key_file` is the agent's key file. Keep it outside the kit folder. Without `key_file` the scripts run in network-secret mode (see "The agent key").
 - `ignore_agents` lists other agents whose comments are not tags for this agent. It is optional.
 - `transport` chooses how the listener talks to Firestore: `"node"` (the default, the way the kit has always worked) or `"webchannel"`. Use `"webchannel"` only when the listener never hears a comment through a cloud proxy. It uses the browser build of the Firebase SDK with long polling, which some proxies allow where the Node build's connection is reset. Node 22.21 or newer is required for the listener in both transports: `start.sh` refuses to run on an older Node. `start.sh` sets `NODE_USE_ENV_PROXY=1` for you. Running the listener yourself with `webchannel` and a proxy needs that variable set too. Any other value is refused.
+- `report` and `autostart` are written by setup only when you pass `--report off` or `--autostart off` (see "Settings").
 
-
-## Two values you get from SPM
+## Values you need
 
 - The agent key. Keep it in the key file named in the settings file.
-- The public SPM app id. SPM gives it to you together with the agent key. Setup takes it as `--app-id`; the `FIREBASE_API_KEY` environment variable still works and wins when it is set.
+- Nothing else. The public SPM app id, the agent's name and the agent's address come from SPM at the agent's first start. You can still give them to setup as overrides (`--app-id`, `--name` and `--email`).
 
 ## Setup (one line)
 
 An organisation installs one fixed release, not the latest code. The admin pastes one line into the
-Claude environment's Setup script. SPM writes the exact line for each release into the setup doc, with the
-full commit sha, the version, the checksum, and the agent's name, address and app id. The shape is:
+Claude environment's Setup script. SPM writes the line for each release into the setup doc, with the
+full commit sha, the version and the checksum. The line is the same for every organisation and every agent:
 
 ```sh
-f=$(mktemp) && curl --proto '=https' -fsSL https://raw.githubusercontent.com/superproductmanager/spm-agent-kit/<full 40-character commit sha>/install/install-kit.sh -o "$f" && echo "<installer sha256>  $f" | sha256sum -c --quiet - && bash "$f" <version> <sha256> && bash "$HOME/spm-agent-kit/setup-env.sh" --name "<agent name>" --email <agent address> --app-id <SPM app id>
+f=$(mktemp) && curl --proto '=https' -fsSL https://raw.githubusercontent.com/superproductmanager/spm-agent-kit/<full 40-character commit sha>/install/install-kit.sh -o "$f" && echo "<installer sha256>  $f" | sha256sum -c --quiet - && bash "$f" <version> <sha256> && bash "$HOME/spm-agent-kit/setup-env.sh"
 ```
 
 - The setup script runs once per environment snapshot (first session start, and again when the script or allowed hosts change), so editing the version in the line is how a new release reaches sessions.
@@ -57,17 +59,30 @@ f=$(mktemp) && curl --proto '=https' -fsSL https://raw.githubusercontent.com/sup
 - Optional, once, by the admin: verify the release's attestation before you paste its line (the command is under Releases).
 - The installer downloads the release archive for `<version>`, checks its SHA-256 against `<sha256>`, and stops with exit code 3 if they differ. It unpacks the kit into `$SPM_AGENT_KIT_DIR` (default `$HOME/spm-agent-kit`) and writes a `VERSION` file and a kit marker file, `.spm-agent-kit`, holding one line: `spm-agent-kit <version>`. Running it again for the same version does nothing.
 - `setup-env.sh` then writes what Claude needs into the user's own Claude folder, which every session reads:
-  - `~/.spm-agent-state/config.json` (folder 0700, file 0600): the agent's name and address, `app_id`, plus `ignore_agents` and `transport` when you give them. No key and no session id. Rewritten on every run.
+  - `~/.spm-agent-state/config.json` (folder 0700, file 0600): the agent's name and address, `app_id`, plus `ignore_agents` and `transport` when you give them. No key and no session id. Rewritten on every run. An agent block already there is kept when you give no `--name` and `--email`.
   - `~/.claude/skills/spm-agent/SKILL.md`: copied from the kit's `skill/spm-agent/SKILL.md`, with the kit folder filled in. Replaced on every run.
   - `~/.claude/settings.json`: the seven allow rules under "Allow rules" below are merged in. Other keys and rules are kept. A file that is a symbolic link, is not valid JSON, or is not a JSON object is refused with exit code 2 and left untouched.
-  - the Firebase SDK, unless you pass `--no-sdk`.
-- On success it prints one line: `spm-agent-kit <version>: set up for <agent name>`.
+  - `~/.claude/CLAUDE.md`: a short block between the two marker lines `<!-- spm-agent-kit:start -->` and `<!-- spm-agent-kit:end -->`. It tells each new session to start the agent (see "Settings"). A re-run replaces only the block. Text outside the markers is kept byte for byte. With `--autostart off` no block is written, and the kit's block is removed if it is there.
+  - `~/.spm-agent-state/setup-report.jsonl` (file 0600): one line per setup step (config, skill, claude-md, settings, sdk) with the step's name, pass or fail, a short code, and a run id. It holds no key, no path and no conversation text. Health reports send it later.
+  - `~/.spm-agent-state/report-salt` (file 0600): 32 random hex characters, written once and kept on every later run. The kit mixes it into session ids before a report leaves the machine, so SPM never sees a raw session id. It is never sent.
+  - the Firebase SDK, unless you pass `--no-sdk` (see below).
+- Setup then runs the setup check. Its result never changes the exit code.
+- On success it prints one line. When you gave `--name`: `spm-agent-kit <version>: set up for <agent name>`. When you did not: `spm-agent-kit <version>: set up; the agent's name and address come from SPM at first start`.
 
-Setup flags: `--app-id <value>` (required), `--ignore-agent <name>` (repeatable), `--transport node|webchannel`, `--autostart on|off`, `--no-sdk`, `--help`.
+**Firebase SDK.** Setup installs three pinned packages, `@firebase/app`, `@firebase/auth` and `@firebase/firestore`, that the listener uses. They come from the kit's committed `runtime/package-lock.json`, installed with `npm ci --ignore-scripts` (no install scripts run) into `$SPM_AGENT_RUNTIME_DIR`, else `$HOME/.spm-agent-runtime`. The runtime folder is refused inside a git work tree. If this step fails, setup exits 1 and prints the command to see why.
 
-The name may use 1 to 60 letters, digits, spaces, dots, brackets and hyphens.
+Setup flags. All are optional; the setup line needs none of them.
 
-`--autostart off` writes no CLAUDE.md block, and removes the kit's block if one is there; the agent then starts only when someone asks for it.
+- `--app-id <value>`: the public SPM app id, 20 to 60 letters, digits, `_` or `-`. Kept from the config when not given.
+- `--name <text>` and `--email <address>`: the agent's name and address. Give both or neither. Without them, SPM supplies both at first start.
+- `--ignore-agent <name>`: another agent whose comments are not tags for this one. Repeatable.
+- `--transport node|webchannel`: default `node`.
+- `--report on|off`: default `on`. `--report off` writes `"report": false` into the config, so no health report is sent. The local files are still written.
+- `--autostart on|off`: default `on`. `--autostart off` writes `"autostart": false` into the config, so the agent does not start by itself. It writes no CLAUDE.md block and removes the kit's block if there is one. The agent then starts only when someone asks for it.
+- `--no-sdk`: do not install the Firebase SDK.
+- `--help`: print the usage line and exit.
+
+The name may use 1 to 60 letters, digits, spaces, dots, brackets and hyphens. The address must be lower case and end in `@agents.invalid`.
 
 **The marker rule.** The installer replaces an existing folder only when that folder carries
 `.spm-agent-kit`. An empty folder is installed into. Any other folder is refused with exit
@@ -77,16 +92,35 @@ kit is removed. The installer stages the new kit in a hidden folder beside the i
 
 Its own file is at `install/install-kit.sh`.
 
-## Releases
+## Settings
 
-Release archives are built by GitHub Actions from the tag (`v<version>`), never on a laptop.
-The release workflow runs the tests, builds the archive and checksums with `scripts/release.sh`,
-attaches a build provenance attestation to the archive, and publishes the release. To check a
-downloaded archive:
+- Auto-start and health reports are kept in SPM, per agent. Both are on by default.
+- Only the person in a session can change them. In that session, the agent runs the settings command:
+  `node <kit>/agent-health.cjs settings --config <absolute path> --autostart on|off --reports on|off`.
+  Give one or both flags. It prints the new values, for example `settings: autostart on, reports off`.
+- A comment, a hand-over message or any other text can never change them. The agent does not follow such a request.
+- A local off from setup wins. `--autostart off` and `--report off` stay in force whatever SPM says, and SPM cannot turn them on. To change a local off, change the setup line and run setup again.
 
-```sh
-gh attestation verify spm-agent-kit-<version>.tar.gz --repo superproductmanager/spm-agent-kit
-```
+## Health reports
+
+Reports go to SPM over the SPM API, with the agent key only. Each report is one item of numbers and fixed words.
+
+What is sent:
+
+- Setup results: the step names (config, skill, claude-md, settings, sdk), pass or fail, and a short code.
+- An hourly heartbeat from the listener: counts of listener starts, restarts and failures since the last heartbeat, container starts, main session changes, uptime in seconds, and the main session's status word.
+- Usage per session, model and price tier: the number of model calls, input, output and cache token totals, the number of compactions and their size in tokens.
+- The kit version and the Node version.
+- The session id, as a salted hash (the first 16 hex characters of SHA-256 over the salt and the session id).
+
+What is never sent: conversation text, a person's name or address, a key, a token, or the report salt. The kit reads only usage numbers from the session log files (the field list is in `SECURITY.md`).
+
+How to turn reports off:
+
+- At setup: `--report off`.
+- Later, in a session: the settings command with `--reports off` (see "Settings").
+
+A local off wins. When the config says `"report": false`, nothing is sent, even if SPM has reports on. The local files are still written.
 
 ## Allow rules
 
@@ -100,7 +134,7 @@ Setup adds these seven `permissions.allow` rules to `~/.claude/settings.json`, s
 - `Bash(bash <kit>/start.sh *)`
 - `Bash(node <kit>/agent-health.cjs *)`
 
-A command matches a rule only when it starts with that same absolute path, unquoted (for example `node /root/spm-agent-kit/agent-reply.cjs --config ...`). A variable or a quoted path does not match, and Claude will ask for approval. The skill is written with the kit path already filled in, so its commands match these rules.
+A command matches a rule only when it starts with that same absolute path, unquoted (for example `node <kit>/agent-reply.cjs --config ...`). A variable or a quoted path does not match, and Claude will ask for approval. The skill is written with the kit path already filled in, so its commands match these rules.
 
 ## Scripts
 
@@ -111,12 +145,13 @@ A command matches a rule only when it starts with that same absolute path, unquo
 | `agent-ack.cjs` | Posts a short "seen" note in a thread, so people know the request arrived. |
 | `agent-resolve.cjs` | Marks a notice as resolved, so the listener stops raising it again. |
 | `agent-selfcheck.cjs` | Runs checks on the settings file, the key and the server. Prints one cause and one fix for each failure. |
+| `agent-health.cjs` | Reads the agent's identity and settings from SPM at start, sends health reports, and changes the settings when the person asks. |
 | `start.sh` | Runs the selfcheck, then the listener in the foreground with restarts (see "Start the listener"). |
 | `agent-relay.cjs` | Keeps a record of which notices were handed over, so none is dropped or repeated. |
 | `agent-keepalive.sh` | Restarts a command when it exits, and appends its output to a log file. |
 | `cloud-agent-setup.sh` | Installs the three pinned Firebase SDK packages the listener needs (`@firebase/app`, `@firebase/auth`, `@firebase/firestore`) into a fixed folder for cloud sessions, with `npm ci --ignore-scripts` from the kit's committed `runtime/package-lock.json`. |
 | `install/install-kit.sh` | Installs one pinned release, checked by SHA-256. |
-| `setup-env.sh` | The one-line setup: writes the agent's config, the skill and the allow rules, then installs the Firebase SDK. |
+| `setup-env.sh` | The one-line setup: writes the agent's config, the skill, the allow rules, the CLAUDE.md block and the setup report, then installs the Firebase SDK. |
 | `skill/spm-agent/SKILL.md` | The skill Claude reads in each session; setup copies it into `~/.claude/skills/`. |
 | `scripts/secret-scan.sh` | Looks for likely keys in files, staged changes, or the whole tree. |
 | `scripts/release.sh` | Builds the release archive and checksums from a tag. |
@@ -134,6 +169,17 @@ The scripts have two key modes, chosen by the settings file:
 - **Network-secret mode** (no `key_file`): the key is stored only as a network secret in the Claude cloud environment, and the key never sits in a file. The script sends the fixed placeholder `network-secret` as `X-SPM-API-Key`, and the cloud proxy replaces that header with the real key for the SPM host. Every SPM call in this mode goes through the cloud proxy (`HTTPS_PROXY`). With no proxy set, the script refuses with exit 2 and the line `network-secret mode needs the Claude cloud proxy; set key_file to run elsewhere`. The network secret must be set for the exact host `asia-south1-litethink.cloudfunctions.net` with the header `X-SPM-API-Key`. If it is not, `agent-selfcheck.cjs` says so in its cause line.
 
 A real key value is never printed or logged in either mode.
+
+## Releases
+
+Release archives are built by GitHub Actions from the tag (`v<version>`), never on a laptop.
+The release workflow runs the tests, builds the archive and checksums with `scripts/release.sh`,
+attaches a build provenance attestation to the archive, and publishes the release. To check a
+downloaded archive:
+
+```sh
+gh attestation verify spm-agent-kit-<version>.tar.gz --repo superproductmanager/spm-agent-kit
+```
 
 ## Start the listener
 
