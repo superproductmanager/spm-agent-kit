@@ -297,7 +297,7 @@ let SDK = null; // { app, auth, fs, appInst, authInst, db } once loaded
 // : the first of the checkout's package.json and the cloud runtime folder's that resolves the SDK; null when neither does.
 function sdkPackageJson() {
   const pj = path.join(RUNTIME_DIR, 'package.json');
-  try { createRequire(pj).resolve('firebase/firestore'); return pj; } catch (_) { return null; }
+  try { createRequire(pj).resolve('@firebase/firestore'); return pj; } catch (_) { return null; }
 }
 function sdkMissing() {
   return sdkPackageJson() ? null : `agent-listen: the Firebase SDK is not installed in ${RUNTIME_DIR} (nothing was called; run cloud-agent-setup.sh --apply first)`;
@@ -325,9 +325,9 @@ function loadSdk(transport) {
     return realFetch(input, { ...init, headers: h, redirect: 'error' });
   };
   const req = createRequire(sdkPackageJson());
-  const app = req('firebase/app'); const auth = req('firebase/auth');
+  const app = req('@firebase/app'); const auth = req('@firebase/auth');
   // webchannel: the browser build of Firestore, loaded by its absolute path (long polling survives a cloud proxy that resets the Node build's gRPC)
-  const fsdk = transport === 'webchannel' ? require(path.join(path.dirname(req.resolve('@firebase/firestore/package.json')), 'dist', 'index.cjs.js')) : req('firebase/firestore');
+  const fsdk = transport === 'webchannel' ? require(path.join(path.dirname(req.resolve('@firebase/firestore/package.json')), 'dist', 'index.cjs.js')) : req('@firebase/firestore');
   for (const m of [app, fsdk]) if (typeof m.setLogLevel === 'function') m.setLogLevel('silent');
   SDK = { app, auth, fs: fsdk, appInst: null, authInst: null, db: null };
   return SDK;

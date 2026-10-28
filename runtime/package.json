@@ -1,0 +1,1 @@
+{"name":"spm-agent-runtime","private":true,"dependencies":{"@firebase/app":"0.14.4","@firebase/auth":"1.11.0","@firebase/firestore":"4.9.2"}}

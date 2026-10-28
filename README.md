@@ -114,7 +114,7 @@ A command matches a rule only when it starts with that same absolute path, unquo
 | `start.sh` | Runs the selfcheck, then the listener in the foreground with restarts (see "Start the listener"). |
 | `agent-relay.cjs` | Keeps a record of which notices were handed over, so none is dropped or repeated. |
 | `agent-keepalive.sh` | Restarts a command when it exits, and appends its output to a log file. |
-| `cloud-agent-setup.sh` | Installs the Firebase SDK the listener needs into a fixed folder for cloud sessions. |
+| `cloud-agent-setup.sh` | Installs the three pinned Firebase SDK packages the listener needs (`@firebase/app`, `@firebase/auth`, `@firebase/firestore`) into a fixed folder for cloud sessions, with `npm ci --ignore-scripts` from the kit's committed `runtime/package-lock.json`. |
 | `install/install-kit.sh` | Installs one pinned release, checked by SHA-256. |
 | `setup-env.sh` | The one-line setup: writes the agent's config, the skill and the allow rules, then installs the Firebase SDK. |
 | `skill/spm-agent/SKILL.md` | The skill Claude reads in each session; setup copies it into `~/.claude/skills/`. |
