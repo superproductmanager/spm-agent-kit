@@ -66,10 +66,11 @@ const RUN = '0123abcd-ef01';
 let seq = 0;
 const uid = () => { seq++; return `a1b2c3d4-0000-4000-8000-${String(seq).padStart(12, '0')}`; };
 const setupItem = (over = {}) => ({ id: uid(), kind: 'setup', role: 'setup', at: iso(NOW), kit_version: VERSION, run_id: RUN, step: 'config', status: 'pass', ...over });
-const usageItem = (over = {}) => ({ id: uid(), kind: 'usage', role: 'listener', at: iso(NOW), kit_version: VERSION, session_key: '0123456789abcdef', model: 'claude-test-model-1', numbers: { calls: 2, input_tokens: 30, output_tokens: 12, cache_write_tokens: 100, cache_read_tokens: 3000, compactions: 0, compaction_pre_tokens: 0 }, ...over });
+const usageItem = (over = {}) => ({ id: uid(), kind: 'usage', role: 'listener', at: iso(NOW), kit_version: VERSION, session_key: '0123456789abcdef', model: 'claude-test-model-1', price_tier: 'standard', numbers: { calls: 2, input_tokens: 30, output_tokens: 12, cache_write_5m_tokens: 100, cache_write_1h_tokens: 0, cache_read_tokens: 3000, compactions: 0, compaction_pre_tokens: 0 }, ...over });
 const heartbeatItem = (over = {}) => ({ id: uid(), kind: 'heartbeat', role: 'listener', at: iso(NOW), kit_version: VERSION, session_key: '0123456789abcdef', numbers: { listener_starts: 1, listener_restarts: 0, listener_failing: 0, container_starts: 1, main_changes: 0, uptime_s: 60 }, ...over });
 
 function spoolFile() { return path.join(tmpdir('spool'), 'setup-report.jsonl'); }
+const rejectedFile = (spool) => path.join(path.dirname(spool), 'setup-report.rejected.jsonl');
 const readLines = (file) => (fs.existsSync(file) ? fs.readFileSync(file, 'utf8').split('\n').filter((l) => l.length > 0) : []);
 
 // ---------------------------------------------------------------- item rules
@@ -186,6 +187,7 @@ test('flushSpool sends the batch with only the key header, then removes the sent
     assert.equal(req.url, '/accountApi/agent/reports');
     assert.equal(req.headers['x-spm-api-key'], FAKE_SPM_KEY);
     assert.equal(req.headers['x-spm-user-email'], undefined);
+    assert.equal(req.headers['content-type'], 'application/json');
     assert.equal(req.json.reports.length, 3);
     assert.equal(req.json.reports[0].kit_version, VERSION); // a line without kit_version gets the kit version
     assert.deepEqual(readLines(file), []);
@@ -223,13 +225,16 @@ test('flushSpool drops a batch SPM answers 400 to, and drops invalid lines local
   report.queueItem(file, setupItem(), NOW);
   fs.appendFileSync(file, JSON.stringify({ ...setupItem(), extra: 1 }) + '\n');
   fs.appendFileSync(file, 'garbage\n');
-  const srv = await server(() => ({ status: 400, body: { error: 'bad' } }));
+  const srv = await server(() => ({ status: 400, body: { error: 'bad', code: 'bad_thing' } }));
   try {
     const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
-    assert.equal(r.refused, 3);
+    assert.equal(r.refused, 2, 'the two invalid lines');
+    assert.equal(r.rejected, 1, 'the batch SPM answered 400 to');
+    assert.deepEqual(r.rejectedCodes, ['bad_thing']);
     assert.equal(r.sent, 0);
     assert.equal(r.kept, 0);
     assert.deepEqual(readLines(file), []);
+    assert.equal(readLines(rejectedFile(file)).length, 1);
   } finally { await srv.close(); }
 });
 
@@ -274,14 +279,15 @@ test('flushSpool keeps a line queued while the send was in flight', async () => 
   } finally { await srv.close(); }
 });
 
-test('flushSpool refuses an item older than 8 days when it is finally sent', async () => {
+test('flushSpool drops an item older than 7 days before sending it', async () => {
   const file = spoolFile();
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, JSON.stringify(setupItem({ at: iso(NOW - 9 * 24 * 3600 * 1000) })) + '\n');
   const srv = await server();
   try {
     const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
-    assert.equal(r.refused, 1);
+    assert.equal(r.expired, 1);
+    assert.equal(r.refused, 0);
     assert.equal(srv.seen.length, 0);
     assert.deepEqual(readLines(file), []);
   } finally { await srv.close(); }
@@ -313,5 +319,120 @@ test('A3 flushSpool appends each 2xx item to the sent log, and a missing kit ver
     const r2 = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW, sentLog });
     assert.equal(r2.sent, 1);
     assert.equal(readLines(sentLog).length, 2);
+  } finally { await srv.close(); }
+});
+
+// ---------------------------------------------------------------- Addendum B (28 Oct, b9d1c271) in lib/report.cjs
+test('B3 lines older than 7 days are dropped before sending; a 6-day-old line is sent', async () => {
+  const file = spoolFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, JSON.stringify(setupItem({ at: iso(NOW - 8 * 24 * 3600 * 1000) })) + '\n' + JSON.stringify(setupItem({ at: iso(NOW - 6 * 24 * 3600 * 1000) })) + '\n');
+  const srv = await server();
+  try {
+    const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
+    assert.equal(r.expired, 1);
+    assert.equal(r.sent, 1);
+    assert.equal(srv.seen[0].json.reports.length, 1);
+  } finally { await srv.close(); }
+});
+
+test('B3 the spool holds at most 1,000 lines: queueItem drops the oldest', () => {
+  const file = spoolFile();
+  const rid = (i) => 'a' + i.toString(16).padStart(4, '0') + 'beef';
+  for (let i = 0; i < 1005; i++) report.queueItem(file, setupItem({ step: 'cap', run_id: rid(i) }), NOW);
+  const lines = readLines(file).map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1000);
+  assert.equal(lines[0].run_id, rid(5), 'the five oldest are gone');
+  assert.equal(lines[999].run_id, rid(1004));
+});
+
+test('B3 a 400 or 413 batch moves to setup-report.rejected.jsonl with its code; a 413 is rejected too', async () => {
+  for (const status of [400, 413]) {
+    const file = spoolFile();
+    report.queueItem(file, setupItem(), NOW);
+    const srv = await server(() => ({ status, body: { code: status === 413 ? 'body_too_large' : 'field_not_for_kind' } }));
+    try {
+      const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
+      assert.equal(r.rejected, 1, `status ${status}`);
+      assert.deepEqual(r.rejectedCodes, [status === 413 ? 'body_too_large' : 'field_not_for_kind']);
+      assert.equal(r.kept, 0);
+      assert.deepEqual(readLines(file), []);
+      assert.equal(readLines(rejectedFile(file)).length, 1);
+    } finally { await srv.close(); }
+  }
+});
+
+test('B3 the rejected log keeps its newest 200 lines', async () => {
+  const file = spoolFile();
+  const rej = rejectedFile(file);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(rej, Array.from({ length: 200 }, (_, i) => JSON.stringify({ old: i })).join('\n') + '\n');
+  report.queueItem(file, setupItem({ step: 'fresh' }), NOW);
+  const srv = await server(() => ({ status: 400, body: { code: 'field_not_for_kind' } }));
+  try {
+    await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
+    const lines = readLines(rej).map((l) => JSON.parse(l));
+    assert.equal(lines.length, 200);
+    assert.equal(lines[199].step, 'fresh');
+    assert.equal(lines[0].old, 1);
+  } finally { await srv.close(); }
+});
+
+test('B3 a sending copy left by a process that is gone is recovered and sent', async () => {
+  const file = spoolFile();
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const leftover = `${file}.sending.999999`;
+  fs.writeFileSync(leftover, JSON.stringify(setupItem({ step: 'orphan' })) + '\n');
+  const srv = await server();
+  try {
+    const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
+    assert.equal(r.sent, 1);
+    assert.equal(srv.seen[0].json.reports[0].step, 'orphan');
+    assert.equal(fs.existsSync(leftover), false);
+    assert.deepEqual(fs.readdirSync(path.dirname(file)).filter((n) => n.includes('.sending.')), []);
+  } finally { await srv.close(); }
+});
+
+test('B4 queueItem with an id that is already queued adds nothing (a retried heartbeat is a duplicate)', () => {
+  const file = spoolFile();
+  const id = 'f'.repeat(64);
+  report.queueItem(file, setupItem({ id }), NOW);
+  report.queueItem(file, setupItem({ id }), NOW);
+  assert.equal(readLines(file).length, 1);
+});
+
+test('B5 usage numbers take cache_write_5m_tokens and cache_write_1h_tokens, not cache_write_tokens; price_tier is standard or long', () => {
+  assert.equal(report.validateItem(usageItem({ numbers: { cache_write_tokens: 1 } }), NOW).ok, false);
+  assert.equal(report.validateItem(usageItem({ numbers: { cache_write_5m_tokens: 1, cache_write_1h_tokens: 2 } }), NOW).ok, true);
+  assert.equal(report.validateItem(usageItem({ price_tier: 'long' }), NOW).ok, true);
+  assert.equal(report.validateItem(usageItem({ price_tier: 'cheap' }), NOW).ok, false);
+  assert.equal(report.validateItem(setupItem({ price_tier: 'long' }), NOW).ok, false, 'price_tier is a usage field only');
+  assert.equal(report.validateItem(heartbeatItem({ numbers: { cache_write_5m_tokens: 1 } }), NOW).ok, false);
+});
+
+test('B1 a detail with an @ is refused (secret check), an ordinary detail is accepted', () => {
+  assert.equal(report.validateItem(setupItem({ kind: 'check', step: 'app-id', status: 'fail', detail: 'contact someone@example.invalid' }), NOW).ok, false);
+  assert.equal(report.validateItem(setupItem({ kind: 'check', step: 'app-id', status: 'fail', detail: 'HTTP 503' }), NOW).ok, true);
+});
+
+test('B3 a network error keeps every line; a 429 or 5xx keeps every line; 2xx counts as sent', async () => {
+  for (const status of [429, 500, 503]) {
+    const file = spoolFile();
+    report.queueItem(file, setupItem(), NOW);
+    const srv = await server(() => ({ status, body: { code: 'busy' } }));
+    try {
+      const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
+      assert.equal(readLines(file).length, 1, `status ${status}`);
+      assert.equal(r.unreachable, true);
+      assert.equal(r.kept, 1);
+    } finally { await srv.close(); }
+  }
+  const file = spoolFile();
+  report.queueItem(file, setupItem(), NOW);
+  const srv = await server(() => ({ status: 200, body: { accepted: 1 } }));
+  try {
+    const r = await report.flushSpool({ spoolFile: file, base: srv.base, key: FAKE_SPM_KEY, kitVersion: VERSION, now: NOW });
+    assert.equal(r.sent, 1);
+    assert.deepEqual(readLines(file), []);
   } finally { await srv.close(); }
 });

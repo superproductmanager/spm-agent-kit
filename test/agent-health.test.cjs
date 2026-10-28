@@ -36,7 +36,7 @@ function makeKit({ version = '0.2.0\n' } = {}) {
 
 // A self answer with extra fields (Addendum A1: app_id, min_kit_version, report).
 const selfWith = (extra = {}) => (rec) => (rec.url.endsWith('/agent/self')
-  ? { status: 200, body: { address: SPM_ADDRESS, name: SPM_NAME, workspaces: [], ...extra } } : null);
+  ? { status: 200, body: { address: SPM_ADDRESS, name: SPM_NAME, app_id: null, min_kit_version: null, report_interval_s: 3600, settings: { autostart: true, reports: true }, ...extra } } : null);
 const APP_ID = 'appid-test-0123456789abcdef';
 
 // A temp HOME with a key file and a settings file that names no agent yet (unless `agent` is given).
@@ -105,6 +105,7 @@ function run(kit, home, args, base, extraEnv = {}) {
 
 const stateDir = (home) => path.join(home, '.spm-agent-state');
 const spoolOf = (home) => path.join(stateDir(home), 'setup-report.jsonl');
+const spoolText = (home) => (fs.existsSync(spoolOf(home)) ? fs.readFileSync(spoolOf(home), 'utf8') : ''); // an emptied spool is removed
 const readJson = (f) => JSON.parse(fs.readFileSync(f, 'utf8'));
 const reportsOf = (srv) => srv.seen.filter((r) => r.url.endsWith('/agent/reports')).flatMap((r) => r.json.reports);
 const bootId = () => { try { return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); } catch (_) { return null; } };
@@ -120,9 +121,11 @@ function writeTranscript(home, folder, sid, lines, ageSeconds = 0) {
 }
 
 // The fixture for session A: 9 lines. Hand count (last line per message id, <synthetic> skipped):
-//   claude-test-model-1: calls 2 (msg-1, msg-2); input 10+20=30; output 5+7=12; cache write 100; cache read 1000+2000=3000
-//   claude-test-model-2: calls 1 (msg-3); input 3; output 4; cache write 5; cache read 6
-//   compactions 2 (preTokens 150000 + 50000 = 200000), attached to claude-test-model-1 (the model with most calls)
+//   claude-test-model-1 standard: calls 2 (msg-1, msg-2); input 10+20=30; output 5+7=12; cache 5m 100, 1h 0 (no breakdown:
+//     all of cache_creation_input_tokens is 5m); cache read 1000+2000=3000
+//   claude-test-model-2 standard: calls 1 (msg-3); input 3; output 4; 5m 5; 1h 0; cache read 6
+//   claude-test-model-2 long (msg-5: 95000 + 10000 + 7 = 105007 > 100000): calls 1; input 95000; output 10; 5m 0; 1h 7; cache read 10000
+//   compactions 2 (preTokens 150000 + 50000 = 200000), attached to claude-test-model-1 standard (the group with most calls)
 function fixtureA() {
   return [
     { type: 'user', sessionId: SESSION_A, message: { role: 'user', content: 'synthetic user text that must never be sent' } },
@@ -133,6 +136,7 @@ function fixtureA() {
     { type: 'assistant', sessionId: SESSION_A, message: { id: 'msg-2', model: 'claude-test-model-1', usage: { input_tokens: 20, output_tokens: 7, cache_creation_input_tokens: 0, cache_read_input_tokens: 2000 } } },
     { type: 'assistant', sessionId: SESSION_A, message: { id: 'msg-3', model: 'claude-test-model-2', usage: { input_tokens: 3, output_tokens: 4, cache_creation_input_tokens: 5, cache_read_input_tokens: 6 } } },
     { type: 'assistant', sessionId: SESSION_A, message: { id: 'msg-4', model: '<synthetic>', usage: { input_tokens: 999, output_tokens: 999, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } } },
+    { type: 'assistant', sessionId: SESSION_A, message: { id: 'msg-5', model: 'claude-test-model-2', usage: { input_tokens: 95000, output_tokens: 10, cache_creation_input_tokens: 7, cache_read_input_tokens: 10000, cache_creation: { ephemeral_5m_input_tokens: 0, ephemeral_1h_input_tokens: 7 } } } },
     { type: 'system', subtype: 'compact_boundary', sessionId: SESSION_A, compactMetadata: { trigger: 'manual', preTokens: 50000, postTokens: 8000, durationMs: 900 } },
   ];
 }
@@ -203,25 +207,59 @@ test('start exits 6 with one line and changes nothing when SPM refuses the key (
   }
 });
 
-test('start with SPM not reachable exits 0 with one kept line and changes nothing', async () => {
+test('start with SPM not reachable exits 7 with one line, runs twice, and changes nothing (B2)', async () => {
   const kit = makeKit(); const { home, config } = makeHome();
   const before = fs.readFileSync(config, 'utf8');
   const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], await deadBase());
-  assert.equal(r.code, 0, r.err);
+  assert.equal(r.code, 7, r.err);
   assert.ok(oneLine(r), JSON.stringify(r.lines));
-  assert.match(r.lines[0], /^health: kept \d+ for later$/);
+  assert.equal(r.lines[0], 'health: could not reach SPM, run again');
   assert.equal(fs.readFileSync(config, 'utf8'), before);
+  assert.equal(fs.existsSync(spoolOf(home)), false);
 });
 
-test('start treats an identity answer with a bad name or address as not reachable and changes nothing', async () => {
+test('start exits 6 when SPM gives no valid agent name (null, or outside the pattern), and changes nothing (B2)', async () => {
+  for (const name of [null, 'x'.repeat(61), 'bad/name']) {
+    const kit = makeKit(); const { home, config } = makeHome();
+    const before = fs.readFileSync(config, 'utf8');
+    const srv = await server((rec) => (rec.url.endsWith('/agent/self') ? { status: 200, body: { address: SPM_ADDRESS, name, app_id: null } } : null));
+    try {
+      const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
+      assert.equal(r.code, 6, `${name}: ${r.err}`);
+      assert.equal(r.lines.length, 1);
+      assert.equal(fs.readFileSync(config, 'utf8'), before);
+    } finally { await srv.close(); }
+  }
+});
+
+test('B2 identify tries twice on a 503 and then exits 7; a 401 is not retried', async () => {
   const kit = makeKit(); const { home, config } = makeHome();
-  const before = fs.readFileSync(config, 'utf8');
-  const srv = await server((rec) => (rec.url.endsWith('/agent/self') ? { status: 200, body: { address: 'person@example.invalid', name: 'x'.repeat(61), workspaces: [] } } : null));
+  let srv = await server(() => ({ status: 503, body: { code: 'busy' } }));
   try {
     const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
-    assert.equal(r.code, 0, r.err);
-    assert.match(r.lines[0], /^health: kept \d+ for later$/);
-    assert.equal(fs.readFileSync(config, 'utf8'), before);
+    assert.equal(r.code, 7, r.err);
+    assert.equal(srv.seen.filter((q) => q.url.endsWith('/agent/self')).length, 2);
+  } finally { await srv.close(); }
+  srv = await server(() => ({ status: 401, body: { code: 'nope' } }));
+  try {
+    await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base);
+    assert.equal(srv.seen.filter((q) => q.url.endsWith('/agent/self')).length, 1);
+  } finally { await srv.close(); }
+});
+
+test('B2 identify uses a 10 second timeout, shortened only by SPM_AGENT_IDENTIFY_TIMEOUT_MS in tests, and tries twice', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  let hits = 0;
+  const srv = await new Promise((resolve) => {
+    const h = http.createServer(() => { hits++; }); // never answers
+    h.listen(0, '127.0.0.1', () => resolve({ base: `http://127.0.0.1:${h.address().port}/accountApi`, close: () => new Promise((r) => { h.closeAllConnections(); h.close(() => r()); }) }));
+  });
+  try {
+    const t0 = Date.now();
+    const r = await run(kit, home, ['start', '--role', 'listener', '--config', config], srv.base, { SPM_AGENT_IDENTIFY_TIMEOUT_MS: '200' });
+    assert.equal(r.code, 7, r.err);
+    assert.equal(hits, 2);
+    assert.ok(Date.now() - t0 < 5000);
   } finally { await srv.close(); }
 });
 
@@ -234,11 +272,14 @@ test('usage counts the fixture by hand: last line per message id, <synthetic> sk
     const r = await run(kit, home, ['usage', '--role', 'listener', '--config', config], srv.base);
     assert.equal(r.code, 0, r.err);
     const usage = reportsOf(srv).filter((x) => x.kind === 'usage');
-    assert.equal(usage.length, 2, JSON.stringify(usage));
+    assert.equal(usage.length, 3, JSON.stringify(usage));
     const m1 = usage.find((x) => x.model === 'claude-test-model-1');
-    const m2 = usage.find((x) => x.model === 'claude-test-model-2');
-    assert.deepEqual(m1.numbers, { calls: 2, input_tokens: 30, output_tokens: 12, cache_write_tokens: 100, cache_read_tokens: 3000, compactions: 2, compaction_pre_tokens: 200000 });
-    assert.deepEqual(m2.numbers, { calls: 1, input_tokens: 3, output_tokens: 4, cache_write_tokens: 5, cache_read_tokens: 6, compactions: 0, compaction_pre_tokens: 0 });
+    const m2 = usage.find((x) => x.model === 'claude-test-model-2' && x.price_tier === 'standard');
+    const m2long = usage.find((x) => x.model === 'claude-test-model-2' && x.price_tier === 'long');
+    assert.equal(m1.price_tier, 'standard');
+    assert.deepEqual(m1.numbers, { calls: 2, input_tokens: 30, output_tokens: 12, cache_write_5m_tokens: 100, cache_write_1h_tokens: 0, cache_read_tokens: 3000, compactions: 2, compaction_pre_tokens: 200000 });
+    assert.deepEqual(m2.numbers, { calls: 1, input_tokens: 3, output_tokens: 4, cache_write_5m_tokens: 5, cache_write_1h_tokens: 0, cache_read_tokens: 6, compactions: 0, compaction_pre_tokens: 0 });
+    assert.deepEqual(m2long.numbers, { calls: 1, input_tokens: 95000, output_tokens: 10, cache_write_5m_tokens: 0, cache_write_1h_tokens: 7, cache_read_tokens: 10000, compactions: 0, compaction_pre_tokens: 0 });
     assert.equal(m1.session_key, KEY_OF(home, SESSION_A));
     assert.equal(m1.role, 'listener');
     assert.equal(m1.kit_version, '0.2.0');
@@ -291,9 +332,9 @@ test('usage with SPM down keeps its items in the spool file, one line each', asy
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], await deadBase());
   assert.equal(r.code, 0, r.err);
-  assert.deepEqual(r.lines, ['health: kept 2 for later']);
+  assert.deepEqual(r.lines, ['health: kept 3 for later']);
   const lines = fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-  assert.equal(lines.length, 2);
+  assert.equal(lines.length, 3, 'one item per model and tier');
   assert.ok(lines.every((x) => x.kind === 'usage' && x.role === 'main' && typeof x.id === 'string'));
 });
 
@@ -311,7 +352,7 @@ test('flush sends the spool with the key header and no identity call, and emptie
     assert.equal(srv.seen.length, 1);
     assert.equal(srv.seen[0].headers['x-spm-api-key'], FAKE_SPM_KEY);
     assert.equal(srv.seen[0].json.reports[0].kit_version, '0.2.0');
-    assert.equal(fs.readFileSync(spoolOf(home), 'utf8'), '');
+    assert.equal(spoolText(home), '');
     assert.match(r.lines[0], /^health: sent 3, kept 0$/);
   } finally { await srv.close(); }
 });
@@ -322,7 +363,7 @@ test('heartbeat: the first run counts the whole log, the next run counts only ne
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   fs.mkdirSync(stateDir(home), { recursive: true });
   const log = path.join(stateDir(home), 'listener.log');
-  fs.writeFileSync(log, ['{"kind":"start","t":"x"}', '{"kind":"listener.restart","t":"x","exit_code":1,"delay_s":2}', '{"kind":"listener.failing","t":"x","restarts":3}'].join('\n') + '\n');
+  fs.writeFileSync(log, ['{"kind":"wrapper.start","t":"x"}', '{"kind":"start","t":"x"}', '{"kind":"listener.restart","t":"x","exit_code":1,"delay_s":2}', '{"kind":"listener.failing","t":"x","restarts":3}'].join('\n') + '\n');
   const srv = await server();
   try {
     const r1 = await run(kit, home, ['heartbeat', '--config', config], srv.base);
@@ -333,7 +374,7 @@ test('heartbeat: the first run counts the whole log, the next run counts only ne
     assert.equal(hb1[0].session_key, KEY_OF(home, SESSION_A));
     assert.equal(hb1[0].role, 'listener');
     assert.equal(hb1[0].main_status, undefined);
-    fs.appendFileSync(log, '{"kind":"listener.restart","t":"y"}\n{"kind":"start","t":"y"}\n{"kind":"start","t":"z"\n');
+    fs.appendFileSync(log, '{"kind":"listener.restart","t":"y"}\n{"kind":"wrapper.start","t":"y"}\n{"kind":"wrapper.start","t":"z"\n');
     srv.seen.length = 0;
     const r2 = await run(kit, home, ['heartbeat', '--config', config], srv.base);
     assert.equal(r2.code, 0, r2.err);
@@ -377,7 +418,7 @@ test('heartbeat with no transcript queues nothing and keeps the log position', a
   const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
   fs.mkdirSync(stateDir(home), { recursive: true });
   const log = path.join(stateDir(home), 'listener.log');
-  fs.writeFileSync(log, '{"kind":"start","t":"x"}\n');
+  fs.writeFileSync(log, '{"kind":"wrapper.start","t":"x"}\n');
   const srv = await server();
   try {
     const r = await run(kit, home, ['heartbeat', '--config', config], srv.base);
@@ -390,14 +431,15 @@ test('heartbeat with no transcript queues nothing and keeps the log position', a
   } finally { await srv.close(); }
 });
 
-test('heartbeat --main-status accepts a listed word and writes it on the item', async () => {
+test('heartbeat --main-status accepts a listed word; an unknown word becomes unknown (B4)', async () => {
   const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
   const srv = await server();
   try {
     const bad = await run(kit, home, ['heartbeat', '--main-status', 'sleeping', '--config', config], srv.base);
-    assert.equal(bad.code, 2);
-    assert.equal(srv.seen.length, 0);
+    assert.equal(bad.code, 0, bad.err);
+    assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat').at(-1).main_status, 'unknown');
+    srv.seen.length = 0;
     const ok = await run(kit, home, ['heartbeat', '--main-status', 'review_ready', '--config', config], srv.base);
     assert.equal(ok.code, 0, ok.err);
     assert.equal(reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0].main_status, 'review_ready');
@@ -418,7 +460,7 @@ test('the CLI sends 120 queued items in batches of at most 50, each body at most
     assert.ok(srv.seen.length >= 3);
     for (const q of srv.seen) { assert.ok(q.json.reports.length <= 50); assert.ok(Buffer.byteLength(q.text) <= 16384); }
     assert.equal(reportsOf(srv).length, 120);
-    assert.equal(fs.readFileSync(spoolOf(home), 'utf8'), '');
+    assert.equal(spoolText(home), '');
   } finally { await srv.close(); }
 });
 
@@ -434,7 +476,7 @@ test('the CLI refuses a spool line that carries an unknown field, sends nothing 
     assert.equal(r.code, 0, r.err);
     assert.equal(reportsOf(srv).length, 1);
     assert.doesNotMatch(JSON.stringify(srv.seen.map((q) => q.text)), /owner_email/);
-    assert.equal(fs.readFileSync(spoolOf(home), 'utf8'), '');
+    assert.equal(spoolText(home), '');
   } finally { await srv.close(); }
 });
 
@@ -474,7 +516,7 @@ test('no request body or output carries the key, and no body carries a secret-sh
     outs.push(await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base));
     outs.push(await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base));
     outs.push(await run(kit, home, ['heartbeat', '--config', config], srv.base));
-    assert.equal(srv.seen.length >= 4, true);
+    assert.equal(srv.seen.length >= 4, true, JSON.stringify(srv.seen.map((q) => [q.method, q.url, q.text.length])));
     for (const q of srv.seen) {
       assert.equal(q.text.includes(FAKE_SPM_KEY), false, 'the key is never in a body');
       assert.deepEqual(findSecrets(q.text), [], 'no secret-shaped string in a body');
@@ -485,7 +527,7 @@ test('no request body or output carries the key, and no body carries a secret-sh
     for (const q of srv.seen) assert.equal(q.text.includes(salt), false, 'the report salt is never sent');
     for (const o of outs) assert.equal((o.out + o.err).includes(FAKE_SPM_KEY), false);
     for (const q of srv.seen.filter((x) => x.url.endsWith('/agent/reports'))) {
-      for (const item of q.json.reports) assert.equal(Object.keys(item).every((k) => ['id', 'kind', 'role', 'at', 'kit_version', 'node_version', 'session_key', 'model', 'numbers', 'main_status', 'code', 'detail', 'run_id', 'step', 'status'].includes(k)), true);
+      for (const item of q.json.reports) assert.equal(Object.keys(item).every((k) => ['id', 'kind', 'role', 'at', 'kit_version', 'node_version', 'session_key', 'model', 'numbers', 'main_status', 'code', 'detail', 'run_id', 'step', 'status', 'price_tier'].includes(k)), true);
     }
   } finally { await srv.close(); }
 });
@@ -530,17 +572,17 @@ test('A1 identify writes app_id when the file has none, keeps an existing one, a
   } finally { await srv.close(); }
 });
 
-test('A1 report.on false from SPM: nothing is sent until the next identify, local files are still written', async () => {
+test('B1 settings.reports false from SPM: nothing is sent until the next identify, local files are still written', async () => {
   const kit = makeKit(); const { home, config } = makeHome();
   writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
-  let srv = await server(selfWith({ report: { on: false, interval_s: 3600 } }));
+  let srv = await server(selfWith({ settings: { autostart: true, reports: false } }));
   try {
     const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
     assert.equal(r.code, 0, r.err);
     assert.equal(srv.seen.length, 1, 'only the identify call');
     assert.ok(hasLine(r.lines, /reports off/), JSON.stringify(r.lines));
     assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, false);
-    assert.equal(fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).length, 2, 'usage queued locally');
+    assert.equal(fs.readFileSync(spoolOf(home), 'utf8').split('\n').filter(Boolean).length, 3, 'usage queued locally, one item per model and tier');
     srv.seen.length = 0;
     const f = await run(kit, home, ['flush', '--config', config], srv.base);
     assert.equal(f.code, 0, f.err);
@@ -550,7 +592,7 @@ test('A1 report.on false from SPM: nothing is sent until the next identify, loca
     assert.equal(u.code, 0, u.err);
     assert.equal(srv.seen.length, 0, 'usage sends nothing while off');
   } finally { await srv.close(); }
-  srv = await server(selfWith({ report: { on: true, interval_s: 3600 } }));
+  srv = await server(selfWith({ settings: { autostart: true, reports: true } }));
   try {
     const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
     assert.equal(r.code, 0, r.err);
@@ -618,7 +660,7 @@ test('A3 every item SPM accepts is appended to health-sent.jsonl (0600); nothing
     const r = await run(kit, home, ['usage', '--role', 'main', '--config', config], srv.base);
     assert.equal(r.code, 0, r.err);
     const lines = fs.readFileSync(sent, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
-    assert.equal(lines.length, 4, 'the two items kept while down, and the two queued now');
+    assert.equal(lines.length, 6, 'the three items kept while down, and the three queued now');
     assert.equal(fs.statSync(sent).mode & 0o777, 0o600);
     assert.deepEqual(lines.map((x) => x.id).sort(), reportsOf(srv).map((x) => x.id).sort());
   } finally { await srv.close(); }
@@ -706,3 +748,177 @@ test('A6 a missing kit VERSION does not stop identify; queueing commands exit 2;
   } finally { await srv.close(); }
 });
 function readLines(f) { return fs.readFileSync(f, 'utf8').split('\n').filter(Boolean); }
+
+// ---------------------------------------------------------------- Addendum B (28 Oct, b9d1c271) in agent-health.cjs
+const settingsHandler = (status, body) => (rec) => (rec.url.endsWith('/agent/settings') ? { status, body } : null);
+
+test('B1 session-start prints exactly "autostart on" from SPM and exits 0 (no writes to the settings file)', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  const before = fs.readFileSync(config, 'utf8');
+  const srv = await server(selfWith({ settings: { autostart: true, reports: true } }));
+  try {
+    const r = await run(kit, home, ['session-start', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, 'autostart on\n');
+    assert.equal(fs.readFileSync(config, 'utf8'), before);
+  } finally { await srv.close(); }
+});
+
+test('B1 session-start prints "autostart off" when SPM says off', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  const srv = await server(selfWith({ settings: { autostart: false, reports: true } }));
+  try {
+    const r = await run(kit, home, ['session-start', '--config', config], srv.base);
+    assert.equal(r.code, 0);
+    assert.equal(r.out, 'autostart off\n');
+  } finally { await srv.close(); }
+});
+
+test('B1 local "autostart": false always wins, whatever SPM says', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), autostart: false }));
+  const srv = await server(selfWith({ settings: { autostart: true, reports: true } }));
+  try {
+    const r = await run(kit, home, ['session-start', '--config', config], srv.base);
+    assert.equal(r.code, 0);
+    assert.equal(r.out, 'autostart off\n');
+  } finally { await srv.close(); }
+});
+
+test('B1 session-start with SPM not reached prints the default with the fallback note and exits 0', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  let r = await run(kit, home, ['session-start', '--config', config], await deadBase());
+  assert.equal(r.code, 0);
+  assert.equal(r.out, 'autostart on (SPM not reached, using the default)\n');
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), autostart: false }));
+  r = await run(kit, home, ['session-start', '--config', config], await deadBase());
+  assert.equal(r.code, 0);
+  assert.equal(r.out, 'autostart off (SPM not reached, using the default)\n');
+});
+
+test('B1 session-start with a refused key still prints one line and exits 0', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  const srv = await server(() => ({ status: 401, body: { code: 'nope' } }));
+  try {
+    const r = await run(kit, home, ['session-start', '--config', config], srv.base);
+    assert.equal(r.code, 0);
+    assert.equal(r.out, 'autostart on (SPM not reached, using the default)\n');
+  } finally { await srv.close(); }
+});
+
+test('B1 session-start with local "report": false makes no network call and prints the local answer', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }));
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['session-start', '--config', config], srv.base);
+    assert.equal(r.code, 0);
+    assert.equal(r.out, 'autostart on\n');
+    assert.equal(srv.seen.length, 0);
+  } finally { await srv.close(); }
+});
+
+test('B1 settings posts only the given keys as booleans with the key header only, and prints the answer', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  const srv = await server(settingsHandler(200, { autostart: false, reports: true }));
+  try {
+    const r = await run(kit, home, ['settings', '--autostart', 'off', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, 'settings: autostart off, reports on\n');
+    const post = srv.seen.find((q) => q.url.endsWith('/agent/settings'));
+    assert.equal(post.method, 'POST');
+    assert.deepEqual(post.json, { autostart: false });
+    assert.equal(post.headers['x-spm-api-key'], FAKE_SPM_KEY);
+    assert.equal(post.headers['x-spm-user-email'], undefined);
+    assert.equal(post.headers['content-type'], 'application/json');
+  } finally { await srv.close(); }
+  const srv2 = await server(settingsHandler(200, { autostart: true, reports: false }));
+  try {
+    const r = await run(kit, home, ['settings', '--autostart', 'on', '--reports', 'off', '--config', config], srv2.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(r.out, 'settings: autostart on, reports off\n');
+    assert.deepEqual(srv2.seen.find((q) => q.url.endsWith('/agent/settings')).json, { autostart: true, reports: false });
+    assert.equal(readJson(path.join(stateDir(home), 'health.json')).reportOn, false, 'the answer is stored until the next identify');
+  } finally { await srv2.close(); }
+});
+
+test('B1 settings: 401, 403 and 404 exit 6; a network failure exits 7; no flag or a bad value exits 2', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  for (const status of [401, 403, 404]) {
+    const srv = await server(settingsHandler(status, { code: 'nope' }));
+    try {
+      const r = await run(kit, home, ['settings', '--reports', 'on', '--config', config], srv.base);
+      assert.equal(r.code, 6, `status ${status}`);
+    } finally { await srv.close(); }
+  }
+  const down = await run(kit, home, ['settings', '--reports', 'on', '--config', config], await deadBase());
+  assert.equal(down.code, 7, down.err);
+  assert.equal(down.lines.length, 1);
+  const none = await run(kit, home, ['settings', '--config', config], await deadBase());
+  assert.equal(none.code, 2);
+  const bad = await run(kit, home, ['settings', '--autostart', 'maybe', '--config', config], await deadBase());
+  assert.equal(bad.code, 2);
+});
+
+test('B1 settings with local "report": false sends nothing and says so', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }));
+  const srv = await server(settingsHandler(200, { autostart: true, reports: true }));
+  try {
+    const r = await run(kit, home, ['settings', '--autostart', 'on', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.match(r.out, /reports off/);
+    assert.equal(srv.seen.length, 0);
+  } finally { await srv.close(); }
+});
+
+test('B4 listener_starts counts wrapper.start lines only, and the heartbeat id is sha256(salt + boot id + from + to) in 64 hex', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  const log = path.join(stateDir(home), 'listener.log');
+  const body = '{"kind":"start","t":"x"}\n{"kind":"wrapper.start","t":"x"}\n{"kind":"wrapper.start","t":"y"}\n';
+  fs.writeFileSync(log, body);
+  const srv = await server();
+  try {
+    const r = await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const hb = reportsOf(srv).filter((x) => x.kind === 'heartbeat')[0];
+    assert.equal(hb.numbers.listener_starts, 2);
+    const boot = (() => { try { return fs.readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim(); } catch (_) { return ''; } })();
+    const expected = crypto.createHash('sha256').update(saltOf(home) + (boot || '') + '0' + Buffer.byteLength(body)).digest('hex').slice(0, 64);
+    assert.equal(hb.id, expected);
+  } finally { await srv.close(); }
+});
+
+test('B4 a retried heartbeat after a crash (same offsets) queues nothing new locally', async () => {
+  const kit = makeKit(); const { home, config } = makeHome();
+  writeTranscript(home, '-work-proj', SESSION_A, fixtureA());
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  fs.writeFileSync(path.join(stateDir(home), 'listener.log'), '{"kind":"wrapper.start","t":"x"}\n');
+  fs.writeFileSync(path.join(stateDir(home), 'setup-report.jsonl'), '');
+  fs.writeFileSync(config, JSON.stringify({ ...readJson(config), report: false }));
+  const srv = await server();
+  try {
+    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const healthFile = path.join(stateDir(home), 'health.json');
+    const st = readJson(healthFile);
+    fs.writeFileSync(healthFile, JSON.stringify({ ...st, logOffset: 0 })); // as if the state save was lost
+    await run(kit, home, ['heartbeat', '--config', config], srv.base);
+    const hbLines = fs.readFileSync(path.join(stateDir(home), 'setup-report.jsonl'), 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)).filter((x) => x.kind === 'heartbeat');
+    assert.equal(hbLines.length, 1, 'one heartbeat line, not two');
+  } finally { await srv.close(); }
+});
+
+test('B3 a batch SPM answers 400 to is dropped with one line naming the code, and the command exits 0', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  fs.mkdirSync(stateDir(home), { recursive: true });
+  fs.writeFileSync(spoolOf(home), JSON.stringify({ id: crypto.randomUUID(), kind: 'setup', role: 'setup', at: new Date().toISOString(), run_id: 'abcdef12', step: 'config', status: 'pass' }) + '\n');
+  const srv = await server(() => ({ status: 400, body: { code: 'field_not_for_kind' } }));
+  try {
+    const r = await run(kit, home, ['flush', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(r.lines, ['health: dropped 1: field_not_for_kind', 'health: sent 0, kept 0']);
+    assert.equal(fs.readFileSync(path.join(stateDir(home), 'setup-report.rejected.jsonl'), 'utf8').split('\n').filter(Boolean).length, 1);
+  } finally { await srv.close(); }
+});
