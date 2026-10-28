@@ -47,6 +47,8 @@ A template is in `templates/org-repo/spm-agent.config.example.json`.
 
 An organisation installs one fixed release, not the latest code.
 
+Before you copy a release's checksum into the organisation's settings, verify that release's attestation once (the command is under Releases below). After that, the checksum pins that exact file.
+
 **If the organisation has a repository:** copy `templates/org-repo/.claude/settings.json`
 into that repository. Replace the checksum placeholder with the SHA-256 of the release
 archive, from the release's `SHA256SUMS` file. A SessionStart hook then installs the kit
@@ -153,7 +155,7 @@ Run the kit's tests from the kit folder:
 node --test test/*.test.cjs
 ```
 
-The tests use synthetic data only. A guard test fails if a real identifier, address, or key appears in any file of the repository.
+The tests use synthetic data only. A guard test fails if a real identifier, address, or key appears in any file of the repository. A private check for names runs before each release push.
 
 ## Contributing
 
