@@ -196,7 +196,7 @@ async function checkSpmKey(ctx) {
 
 async function checkSignIn(ctx) {
   let webKey;
-  try { webKey = loadWebKeyFrom(process.env); } catch (_) {
+  try { webKey = loadWebKeyFrom(process.env, ctx.appId); } catch (_) {
     return { ok: false, name: 'sign-in', cause: 'no app id (web API key) is set on this machine', fix: 'set FIREBASE_API_KEY in the environment to the public SPM app id' };
   }
   const url = `${ctx.bases.idt}/v1/accounts:signInWithCustomToken?key=${encodeURIComponent(webKey)}`;
@@ -260,7 +260,7 @@ async function main(argv) {
   VIA_PROXY = mode.mode === 'secret';
   out(`info kit version: ${kitVersion()}`);
   const secret = mode.mode === 'secret';
-  const ctx = { email: conf.email, bases: a.bases, key: secret ? mode.key : keyFor(conf.keyFile), customToken: null, idToken: null, secret };
+  const ctx = { email: conf.email, appId: conf.appId, bases: a.bases, key: secret ? mode.key : keyFor(conf.keyFile), customToken: null, idToken: null, secret };
   for (const check of [checkGoogleHost, checkSpmKey, checkSignIn, checkSignalRead]) {
     const r = await check(ctx);
     if (!r.ok) { out(`FAIL ${r.name}: ${r.cause}. Fix: ${r.fix}.`); return 1; }

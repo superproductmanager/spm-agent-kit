@@ -82,14 +82,16 @@ if [ "$(printf '%s' "$GOT" | tr 'A-F' 'a-f')" != "$(printf '%s' "$SHA" | tr 'A-F
   die "checksum does not match release $VERSION; nothing was installed" 3
 fi
 
-STAGE="$TMP/stage"
-mkdir -p "$STAGE" || die "could not create a staging folder" 4
+mkdir -p "$(dirname "$DIR")" || die "could not create the parent of $DIR" 4
+# The staging folder sits beside the install folder, so the final mv is a rename on one filesystem.
+STAGE="$(mktemp -d "$(dirname "$DIR")/.spm-agent-kit-stage.XXXXXX")" || die "could not create a staging folder" 4
+trap 'rm -rf "$TMP" "$STAGE"' EXIT
+chmod 0755 "$STAGE" || die "could not set up the staging folder" 4
 tar -xzf "$TMP/kit.tar.gz" -C "$STAGE" --strip-components=1 2>/dev/null \
   || die "could not unpack release $VERSION" 4
 printf '%s\n' "$VERSION" > "$STAGE/VERSION"
 printf 'spm-agent-kit %s\n' "$VERSION" > "$STAGE/$MARKER"
 
-mkdir -p "$(dirname "$DIR")" || die "could not create the parent of $DIR" 4
 
 # Checked again right before the delete: the folder may have changed during the download.
 STATE="$(classify_dir "$DIR")"

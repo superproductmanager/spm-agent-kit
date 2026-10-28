@@ -108,3 +108,46 @@ test('any other transport value is refused with one line', () => {
     assert.throws(() => loadConfig({ argv: ['--config', p], env: {} }), (e) => e instanceof ConfigError && e.message === 'transport must be "node" or "webchannel"', `value ${JSON.stringify(bad)}`);
   }
 });
+
+// ---- app_id: the public SPM app id, optional in the settings file ----
+const APP_ID = 'example-app-id-0000000000000000';
+
+test('a settings file with a valid app_id loads and returns appId', () => {
+  const c = loadConfig({ argv: ['--config', write('app.json', { ...good, app_id: APP_ID })], env: {} });
+  assert.equal(c.appId, APP_ID);
+});
+
+test('without app_id, appId is null and the load still succeeds', () => {
+  const c = loadConfig({ argv: ['--config', write('noapp.json', good)], env: {} });
+  assert.equal(c.appId, null);
+});
+
+test('an app_id outside ^[A-Za-z0-9_-]{20,60}$ is a ConfigError', () => {
+  for (const bad of ['short', 'has space in it 000000000000', 'a'.repeat(61), 42]) {
+    assert.throws(
+      () => loadConfig({ argv: ['--config', write('badapp.json', { ...good, app_id: bad })], env: {} }),
+      ConfigError,
+      `app_id ${JSON.stringify(bad)} should be refused`,
+    );
+  }
+});
+
+// ---- the web key: env wins, then the settings file's app_id, else no key (today's failure) ----
+const { loadWebKeyFrom } = require('../agent-listen.cjs');
+
+test('env FIREBASE_API_KEY wins over the settings file app_id', () => {
+  assert.equal(loadWebKeyFrom({ FIREBASE_API_KEY: 'example-env-app-id-00000000000' }, APP_ID), 'example-env-app-id-00000000000');
+});
+
+test('an empty env value does not win: the settings file app_id is used', () => {
+  assert.equal(loadWebKeyFrom({ FIREBASE_API_KEY: '' }, APP_ID), APP_ID);
+});
+
+test('with no env value, the settings file app_id is used', () => {
+  assert.equal(loadWebKeyFrom({}, APP_ID), APP_ID);
+});
+
+test('with neither env nor app_id, loadWebKeyFrom still throws (today\'s failure)', () => {
+  assert.throws(() => loadWebKeyFrom({}, null), /no firebase web api key found/);
+  assert.throws(() => loadWebKeyFrom({}), /no firebase web api key found/);
+});

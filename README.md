@@ -31,6 +31,7 @@ Example, with synthetic values:
 
 - `agent.name` is the name people tag, for example `@Example agent`. It must match the agent's display name in SPM exactly.
 - `agent.email` must end in `@agents.invalid`.
+- `app_id` is the public SPM app id, not a secret. Setup writes it from `--app-id`. If `FIREBASE_API_KEY` is set in the environment, it wins over `app_id`.
 - `key_file` is the agent's key file. Keep it outside the kit folder. Without `key_file` the scripts run in network-secret mode (see "The agent key").
 - `ignore_agents` lists other agents whose comments are not tags for this agent. It is optional.
 - `transport` chooses how the listener talks to Firestore: `"node"` (the default, the way the kit has always worked) or `"webchannel"`. Use `"webchannel"` only when the listener never hears a comment through a cloud proxy. It uses the browser build of the Firebase SDK with long polling, which some proxies allow where the Node build's connection is reset. Node 22.21 or newer is required for the listener in both transports: `start.sh` refuses to run on an older Node. `start.sh` sets `NODE_USE_ENV_PROXY=1` for you. Running the listener yourself with `webchannel` and a proxy needs that variable set too. Any other value is refused.
@@ -39,35 +40,36 @@ Example, with synthetic values:
 ## Two values you get from SPM
 
 - The agent key. Keep it in the key file named in the settings file.
-- `FIREBASE_API_KEY`. This is the public SPM app id, not a secret. SPM gives it to you together with the agent key.
-  Set it as an environment variable in the session until the kit has it built in.
+- The public SPM app id. SPM gives it to you together with the agent key. Setup takes it as `--app-id`; the `FIREBASE_API_KEY` environment variable still works and wins when it is set.
 
 ## Setup (one line)
 
 An organisation installs one fixed release, not the latest code. The admin pastes one line into the
-Claude environment's Setup script. SPM writes the exact line for each release into the setup doc: the commit,
-the version, the checksum and the agent's name and address. The shape is:
+Claude environment's Setup script. SPM writes the exact line for each release into the setup doc, with the
+full commit sha, the version, the checksum, and the agent's name, address and app id. The shape is:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/superproductmanager/spm-agent-kit/<commit sha>/install/install-kit.sh -o /tmp/spm-install-kit.sh && bash /tmp/spm-install-kit.sh 0.1.0 <sha256> && bash "$HOME/spm-agent-kit/setup-env.sh" --name "<agent name>" --email <agent address>
+f=$(mktemp) && curl --proto '=https' -fsSL https://raw.githubusercontent.com/superproductmanager/spm-agent-kit/<full 40-character commit sha>/install/install-kit.sh -o "$f" && echo "<installer sha256>  $f" | sha256sum -c --quiet - && bash "$f" <version> <sha256> && bash "$HOME/spm-agent-kit/setup-env.sh" --name "<agent name>" --email <agent address> --app-id <SPM app id>
 ```
 
-- The installer is fetched by commit SHA, so the line always runs the same file. `<sha256>` is the SHA-256 of the release archive, from the release's `SHA256SUMS` file. Before you paste a release's line, verify that release's attestation once (see Releases below).
-- The installer downloads the release archive, checks its SHA-256 against the value you give it, and stops with exit code 3 if they differ. It unpacks the kit into `$SPM_AGENT_KIT_DIR` (default `$HOME/spm-agent-kit`) and writes a `VERSION` file and a kit marker file, `.spm-agent-kit`, holding one line: `spm-agent-kit <version>`. Running it again for the same version does nothing.
+- The setup script runs once per environment snapshot (first session start, and again when the script or allowed hosts change), so editing the version in the line is how a new release reaches sessions.
+- The installer is fetched by the full commit sha, so the line always runs the same file. `<sha256>` is the SHA-256 of the release archive, from the release's `SHA256SUMS` file.
+- Optional, once, by the admin: verify the release's attestation before you paste its line (the command is under Releases).
+- The installer downloads the release archive for `<version>`, checks its SHA-256 against `<sha256>`, and stops with exit code 3 if they differ. It unpacks the kit into `$SPM_AGENT_KIT_DIR` (default `$HOME/spm-agent-kit`) and writes a `VERSION` file and a kit marker file, `.spm-agent-kit`, holding one line: `spm-agent-kit <version>`. Running it again for the same version does nothing.
 - `setup-env.sh` then writes what Claude needs into the user's own Claude folder, which every session reads:
-  - `~/.spm-agent-state/config.json` (folder 0700, file 0600): the agent's name and address, plus `ignore_agents` and `transport` when you give them. No key and no session id. Rewritten on every run.
-  - `~/.claude/skills/spm-agent/SKILL.md`: copied from the kit's `skill/spm-agent/SKILL.md`. Replaced on every run.
-  - `~/.claude/settings.json`: the allow rules listed under "Allow rules" below are merged in. Other keys and rules are kept. A file that is not valid JSON, or is not a JSON object, is refused with exit code 2 and left untouched.
+  - `~/.spm-agent-state/config.json` (folder 0700, file 0600): the agent's name and address, `app_id`, plus `ignore_agents` and `transport` when you give them. No key and no session id. Rewritten on every run.
+  - `~/.claude/skills/spm-agent/SKILL.md`: copied from the kit's `skill/spm-agent/SKILL.md`, with the kit folder filled in. Replaced on every run.
+  - `~/.claude/settings.json`: the six allow rules under "Allow rules" below are merged in. Other keys and rules are kept. A file that is a symbolic link, is not valid JSON, or is not a JSON object is refused with exit code 2 and left untouched.
   - the Firebase SDK, unless you pass `--no-sdk`.
 - On success it prints one line: `spm-agent-kit <version>: set up for <agent name>`.
 
-Optional setup-env flags: `--ignore-agent <name>` (repeatable), `--transport node|webchannel`, `--no-sdk`, `--help`.
+Setup flags: `--app-id <value>` (required), `--ignore-agent <name>` (repeatable), `--transport node|webchannel`, `--no-sdk`, `--help`. The name may use 1 to 60 letters, digits, spaces, dots, brackets and hyphens.
 
 **The marker rule.** The installer replaces an existing folder only when that folder carries
 `.spm-agent-kit`. An empty folder is installed into. Any other folder is refused with exit
 code 2 and nothing is deleted, including a folder that only has a `VERSION` file, and a
 symlink is refused too. The check runs before any download, and again just before the old
-kit is removed.
+kit is removed. The installer stages the new kit in a hidden folder beside the install folder, so the final move is a rename.
 
 Its own file is at `install/install-kit.sh`.
 
@@ -84,18 +86,16 @@ gh attestation verify spm-agent-kit-<version>.tar.gz --repo superproductmanager/
 
 ## Allow rules
 
-Setup adds these `permissions.allow` rules to `~/.claude/settings.json`, so the agent runs its own scripts without a prompt for each call:
+Setup adds these six `permissions.allow` rules to `~/.claude/settings.json`, so the agent runs its own scripts without a prompt for each call. Each rule is built from the kit folder that `setup-env.sh` ran from (`<kit>` below), so the rules are absolute:
 
-- `Bash(node */spm-agent-kit/agent-reply.cjs *)`
-- `Bash(node */spm-agent-kit/agent-ack.cjs *)`
-- `Bash(node */spm-agent-kit/agent-resolve.cjs *)`
-- `Bash(node */spm-agent-kit/agent-relay.cjs *)`
-- `Bash(node */spm-agent-kit/agent-selfcheck.cjs *)`
-- `Bash(bash */spm-agent-kit/start.sh *)`
+- `Bash(node <kit>/agent-reply.cjs *)`
+- `Bash(node <kit>/agent-ack.cjs *)`
+- `Bash(node <kit>/agent-resolve.cjs *)`
+- `Bash(node <kit>/agent-relay.cjs *)`
+- `Bash(node <kit>/agent-selfcheck.cjs *)`
+- `Bash(bash <kit>/start.sh *)`
 
-The rules match only when the kit folder is named `spm-agent-kit`. Commands must use the
-absolute path, unquoted (for example `node /root/spm-agent-kit/agent-reply.cjs --config ...`).
-A variable or a quoted path does not match, and Claude will ask for approval.
+A command matches a rule only when it starts with that same absolute path, unquoted (for example `node /root/spm-agent-kit/agent-reply.cjs --config ...`). A variable or a quoted path does not match, and Claude will ask for approval. The skill is written with the kit path already filled in, so its commands match these rules.
 
 ## Scripts
 

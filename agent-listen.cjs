@@ -278,9 +278,11 @@ function writeCursorAtomic(file, obj, hooks = {}) {
 
 // ---------------------------------------------------------------- key sources (names only; values are never printed)
 /** The PUBLIC Firebase web API key (the app id): env VITE_FIREBASE_API_KEY or FIREBASE_API_KEY. Nothing else is read. */
-function loadWebKeyFrom(env) {
+// The env var wins; the settings file's app_id (optional, may be null) is the fallback.
+function loadWebKeyFrom(env, appId) {
   const k = env.VITE_FIREBASE_API_KEY || env.FIREBASE_API_KEY;
   if (k) return k;
+  if (appId) return appId;
   throw new Error('no firebase web api key found');
 }
 /** The one read of an identity's key file, inside this process. */
@@ -339,7 +341,7 @@ function realDeps() {
     http: makeTransport({ lib: https, resolveTarget: (u) => ({ hostname: u.hostname, port: 443 }) }),
     requestTimeoutMs: 30000,
     readKey: (keyFile) => readKeyFile(keyFile),
-    loadWebKey: () => loadWebKeyFrom(process.env),
+    loadWebKey: (appId) => loadWebKeyFrom(process.env, appId),
     sdkMissing,
     // the SDK sign-in with the custom token
     signIn: async (customToken, webKey) => {
@@ -999,7 +1001,7 @@ async function main(argv, deps) {
   else { try { key = deps.readKey(conf.keyFile); } catch (_) { key = null; } }
   if (typeof key !== 'string' || !key) { deps.io.err('agent-listen: cannot read the key file named in the settings file'); return 1; }
   let webKey = null;
-  try { webKey = deps.loadWebKey() || null; } catch (_) { webKey = null; } // B10: the inbox listener signs in with the SDK too (the same as item mode)
+  try { webKey = deps.loadWebKey(conf.appId) || null; } catch (_) { webKey = null; } // B10: the inbox listener signs in with the SDK too (the same as item mode)
   const listener = (cfg.inbox ? createInboxListener : createListener)({ ...cfg, email: conf.email, key, webKey }, deps);
   const off = installSignalHandlers(deps.proc, listener);
   try { return await listener.run(); } finally { off(); }
@@ -1908,7 +1910,7 @@ function defineCases(cases, env) {
     const DELETED = ['__FIREBASE_DEFAULTS__', 'FIRESTORE_EMULATOR_HOST', 'FIREBASE_AUTH_EMULATOR_HOST']; // A1: deleted before the SDK loads, never read
     const PROXY_NAMES = ['HTTPS_PROXY', 'https_proxy', 'NODE_USE_ENV_PROXY']; // R1: the proxy URL only (proxyAgentFor), names no base host; NODE_USE_ENV_PROXY is the Node switch that makes the proxy agent work (transport webchannel), not a host
     check(names.every((n) => n === 'SPM_AGENT_RUNTIME_DIR' || DELETED.includes(n) || PROXY_NAMES.includes(n)) && DELETED.every((n) => impl.includes(`delete process.env.${n};`)), `process.env names: ${names}`);
-    const rest = impl.replace(/process\.env\.[A-Z_a-z0-9]+/g, '').replace('loadWebKeyFrom(process.env)', '');
+    const rest = impl.replace(/process\.env\.[A-Z_a-z0-9]+/g, '').replace('loadWebKeyFrom(process.env, appId)', '');
     check(!/process\.env\[/.test(impl) && !/process\.env\b/.test(rest), 'process.env used as a whole object (only the web key loader may take it)');
     const envNames = [...impl.matchAll(/\benv\.([A-Z_a-z0-9]+)/g)].map((m) => m[1]);
     check(envNames.every((n) => ['VITE_FIREBASE_API_KEY', 'FIREBASE_API_KEY', 'HOME', '__FIREBASE_DEFAULTS__', 'FIRESTORE_EMULATOR_HOST', 'FIREBASE_AUTH_EMULATOR_HOST', 'HTTPS_PROXY', 'https_proxy', 'NODE_USE_ENV_PROXY'].includes(n)), `env.* names: ${envNames}`);
