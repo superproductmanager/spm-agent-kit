@@ -198,8 +198,6 @@ const e = process.env;
 const KIT = e.SPM_SETUP_KIT;
 const HOME = e.SPM_SETUP_HOME;
 const KV = e.SPM_SETUP_KIT_VERSION || '';
-// Rework C1: with --autostart off the CLAUDE.md step removes the kit's block (never writes one).
-const AUTOSTART_OFF = e.SPM_SETUP_AUTOSTART === 'off';
 const RULES = [
   `Bash(node ${KIT}/agent-reply.cjs *)`,
   `Bash(node ${KIT}/agent-ack.cjs *)`,
@@ -253,6 +251,14 @@ try {
     cmMode = cmSt.mode & 0o777;
     cmRaw = fs.readFileSync(cmFile, 'utf8');
   }
+  // Rework C1 (review fix): the effective autostart value, computed once. --autostart off is off; --autostart on is on;
+  // no flag keeps the value already in the config (the same rule as the config step below).
+  let oldAuto = null;
+  try {
+    const old = JSON.parse(fs.readFileSync(configFile, 'utf8'));
+    if (old && typeof old === 'object' && !Array.isArray(old) && typeof old.autostart === 'boolean') oldAuto = old.autostart;
+  } catch (_) { /* no config yet, or not readable: nothing kept */ }
+  const AUTOSTART_OFF = e.SPM_SETUP_AUTOSTART === 'off' || (e.SPM_SETUP_AUTOSTART !== 'on' && oldAuto === false);
   let cmBlock = null;
   if (!AUTOSTART_OFF) {
     try {
@@ -341,7 +347,7 @@ try {
   if (e.SPM_SETUP_REPORT === 'off') cfg.report = false;
   else if (e.SPM_SETUP_REPORT !== 'on' && typeof oldCfg.report === 'boolean') cfg.report = oldCfg.report;
   // Addendum B1: the same rule for autostart
-  if (e.SPM_SETUP_AUTOSTART === 'off') cfg.autostart = false;
+  if (AUTOSTART_OFF) cfg.autostart = false;
   else if (e.SPM_SETUP_AUTOSTART !== 'on' && typeof oldCfg.autostart === 'boolean') cfg.autostart = oldCfg.autostart;
   try {
     fs.mkdirSync(configDir, { recursive: true, mode: 0o700 });

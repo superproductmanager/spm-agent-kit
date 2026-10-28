@@ -968,6 +968,37 @@ test('C1 --autostart off on a symlinked CLAUDE.md is refused as on is: exit 2, o
   } finally { cleanup(sb); }
 });
 
+// ---- Rework C1 (review fix): the CLAUDE.md step follows the effective autostart value, kept from the config when no flag is given ----
+test('C1 two runs: --autostart off, then no flag: the config keeps autostart false, so no block is written and the step spools skip autostart_off; a third run with --autostart on writes the block and drops the key', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    assert.equal(runSetup(sb, ok(['--autostart', 'off', '--no-sdk'])).status, 0);
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    assert.equal(readJson(CONFIG(sb)).autostart, false, 'the config lost autostart false');
+    assert.equal(fs.existsSync(CLAUDE_MD(sb)), false, 'a block was written on the run with no flag');
+    const runs = spoolLines(sb).filter((l) => l.step === 'claude-md');
+    const last = runs[runs.length - 1];
+    assert.deepEqual([last.status, last.code], ['skip', 'autostart_off']);
+    assert.equal(runSetup(sb, ok(['--autostart', 'on', '--no-sdk'])).status, 0);
+    assert.equal('autostart' in readJson(CONFIG(sb)), false, 'on did not drop autostart from the config');
+    const text = fs.readFileSync(CLAUDE_MD(sb), 'utf8');
+    assert.ok(text.includes(START_MARK) && text.includes(END_MARK), 'the block was not written by --autostart on');
+    const cl = spoolLines(sb).filter((l) => l.step === 'claude-md');
+    assert.deepEqual([cl[cl.length - 1].status, cl[cl.length - 1].code], ['pass', undefined]);
+  } finally { cleanup(sb); }
+});
+
+test('C1 a run with no flag and the config holding autostart true writes the block as before', () => {
+  const sb = sandbox({ version: '0.2.0\n', claudeMdBlock: true });
+  try {
+    fs.mkdirSync(path.join(sb.home, '.spm-agent-state'), { recursive: true });
+    fs.writeFileSync(CONFIG(sb), JSON.stringify({ autostart: true }) + '\n');
+    assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
+    assert.ok(fs.readFileSync(CLAUDE_MD(sb), 'utf8').includes(START_MARK));
+    assert.equal(readJson(CONFIG(sb)).autostart, true);
+  } finally { cleanup(sb); }
+});
+
 // ---- Rework C4: the kit never sets the permission mode ----
 test('C4 setup leaves an existing permissions.defaultMode unchanged, and adds no defaultMode when there was none', () => {
   const withMode = sandbox({ version: '0.2.0\n' });
