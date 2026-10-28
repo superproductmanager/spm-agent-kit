@@ -16,7 +16,8 @@
  *   Key modes: a settings file with key_file reads the key from that file (as before). With no key_file the key is a
  *   network secret in the Claude cloud environment: the header value is the fixed placeholder, every https call goes
  *   through HTTPS_PROXY, and with no proxy the script refuses (exit 2). The first stdout line is the kit version.
- *        [--base-regional <url>] [--base-shared <url>] [--base-fn <url>] [--base-idt <url>] (tests only)
+ *        [--base-regional <url>] [--base-shared <url>] [--base-fn <url>] [--base-idt <url>] (tests only; 0.2.1: each value is
+ *        http://127.0.0.1 (any port and path) or exactly that host's default; any other value exits 2 before the key file is read)
  *
  * CHECKS
  *   1 google-host GET <regional host>/v1/projects/litethink/databases/(default)/documents/signals/<64 zeros>, Bearer abc.
@@ -319,7 +320,24 @@ async function mainSetup(argv) {
 
 // ---------------------------------------------------------------- arguments and main
 
-/** Returns { bases } or { usage } with the one line to print. The settings file is read in main (lib/config.cjs). */
+// The test-only --base-* flags (0.2.1): a value must be http on 127.0.0.1 (any port and path) or exactly that slot's default.
+const BASE_FLAGS = {
+  '--base-regional': `https://${FS_HOST}`,
+  '--base-shared': `https://${SHARED_FS_HOST}`,
+  '--base-fn': `https://${FN_HOST}`,
+  '--base-idt': `https://${IDT_HOST}`,
+};
+function baseAllowed(value, fallback) {
+  if (value === fallback) return true;
+  let u = null;
+  try { u = new URL(value); } catch (_) { return false; }
+  return u.protocol === 'http:' && u.hostname === '127.0.0.1';
+}
+
+/**
+ * Returns { bases } or { usage } with the one line to print. The settings file is read in main (lib/config.cjs).
+ * A base flag that is not allowed is a usage error here, before the key file is read or any request is made.
+ */
 function parseArgs(argv) {
   const v = {};
   for (let i = 0; i < argv.length; i += 2) {
@@ -328,12 +346,17 @@ function parseArgs(argv) {
     if (!flag || !flag.startsWith('--') || val === undefined || val.startsWith('--')) return { usage: 'usage: agent-selfcheck.cjs --config <abs path>' };
     v[flag] = val;
   }
+  for (const [flag, fallback] of Object.entries(BASE_FLAGS)) {
+    if (v[flag] !== undefined && !baseAllowed(v[flag], fallback)) {
+      return { usage: `usage: ${flag} may only be http://127.0.0.1 (any port and path) or ${fallback}` };
+    }
+  }
   return {
     bases: {
-      regional: v['--base-regional'] || `https://${FS_HOST}`,
-      shared: v['--base-shared'] || `https://${SHARED_FS_HOST}`,
-      fn: v['--base-fn'] || `https://${FN_HOST}`,
-      idt: v['--base-idt'] || `https://${IDT_HOST}`,
+      regional: v['--base-regional'] || BASE_FLAGS['--base-regional'],
+      shared: v['--base-shared'] || BASE_FLAGS['--base-shared'],
+      fn: v['--base-fn'] || BASE_FLAGS['--base-fn'],
+      idt: v['--base-idt'] || BASE_FLAGS['--base-idt'],
     },
   };
 }

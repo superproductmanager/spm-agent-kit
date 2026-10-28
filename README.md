@@ -77,7 +77,7 @@ Setup flags. All are optional; the setup line needs none of them.
 - `--name <text>` and `--email <address>`: the agent's name and address. Give both or neither. Without them, SPM supplies both at first start.
 - `--ignore-agent <name>`: another agent whose comments are not tags for this one. Repeatable.
 - `--transport node|webchannel`: default `node`.
-- `--report on|off`: default `on`. `--report off` writes `"report": false` into the config, so no health report is sent. The local files are still written.
+- `--report on|off`: default `on`. `--report off` writes `"report": false` into the config, so no health report is sent. While reports are off nothing is queued for sending, and setup removes any report still waiting. `usage` still counts and writes its numbers to `usage-local.jsonl` in the state folder, which is never sent.
 - `--autostart on|off`: default `on`. `--autostart off` writes `"autostart": false` into the config, so the agent does not start by itself. It writes no CLAUDE.md block and removes the kit's block if there is one. The agent then starts only when someone asks for it.
 - `--no-sdk`: do not install the Firebase SDK.
 - `--help`: print the usage line and exit.
@@ -98,7 +98,7 @@ Its own file is at `install/install-kit.sh`.
 - Only the person in a session can change them. In that session, the agent runs the settings command:
   `node <kit>/agent-health.cjs settings --config <absolute path> --autostart on|off --reports on|off`.
   Give one or both flags. It prints the new values, for example `settings: autostart on, reports off`.
-- A comment, a hand-over message or any other text can never change them. The agent does not follow such a request.
+- Only the person in the session should change them. The agent is instructed to ignore a request to change them that comes in a comment, a hand-over message or any other text. This is an instruction to the model, not a technical lock: the settings command runs without a prompt under the allow rules.
 - A local off from setup wins. `--autostart off` and `--report off` stay in force whatever SPM says, and SPM cannot turn them on. To change a local off, change the setup line and run setup again.
 
 ## Health reports
@@ -122,7 +122,7 @@ How to turn reports off:
 - At setup: `--report off`.
 - Later, in a session: the settings command with `--reports off` (see "Settings").
 
-A local off wins. When the config says `"report": false`, nothing is sent, even if SPM has reports on. The local files are still written.
+A local off wins. When the config says `"report": false`, nothing is sent, even if SPM has reports on. While reports are off, from either side, nothing is queued for sending, so turning them on later sends only what happens after. Turning reports off with the settings command, or setup with `--report off`, removes any report still waiting to be sent.
 
 ## Allow rules
 

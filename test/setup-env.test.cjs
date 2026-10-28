@@ -1050,3 +1050,43 @@ test('no --name: the final line says the name and address come from SPM at first
     assert.equal(r.stdout, "spm-agent-kit 0.2.0: set up; the agent's name and address come from SPM at first start\n");
   } finally { cleanup(sb); }
 });
+
+// ---------------------------------------------------------------- 0.2.1: report off removes the spool at the end of setup; report on keeps it
+const STATE_DIR = (sb) => path.join(sb.home, '.spm-agent-state');
+const OLD_LINE = '{"id":"0123456789abcdef0123456789abcdef","kind":"usage","role":"main","stale":true}\n';
+
+test('0.2.1 --report off with an unsent report already in the spool: setup removes setup-report.jsonl at the end, exit 0', () => {
+  const sb = sandbox({ version: '0.2.0\n' });
+  try {
+    fs.mkdirSync(STATE_DIR(sb), { recursive: true });
+    fs.writeFileSync(SPOOL(sb), OLD_LINE);
+    const r = runSetup(sb, ok(['--report', 'off', '--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(fs.existsSync(SPOOL(sb)), false, 'the spool with the unsent report is still there');
+  } finally { cleanup(sb); }
+});
+
+test('0.2.1 a config that already says report false (no --report flag) also removes the spool at the end of setup', () => {
+  const sb = sandbox({ version: '0.2.0\n' });
+  try {
+    fs.mkdirSync(STATE_DIR(sb), { recursive: true });
+    fs.writeFileSync(CONFIG(sb), JSON.stringify({ report: false }) + '\n');
+    fs.writeFileSync(SPOOL(sb), OLD_LINE);
+    const r = runSetup(sb, ok(['--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(readJson(CONFIG(sb)).report, false);
+    assert.equal(fs.existsSync(SPOOL(sb)), false, 'the spool with the unsent report is still there');
+  } finally { cleanup(sb); }
+});
+
+test('0.2.1 report on: setup keeps the spool, including a report already waiting in it', () => {
+  const sb = sandbox({ version: '0.2.0\n' });
+  try {
+    fs.mkdirSync(STATE_DIR(sb), { recursive: true });
+    fs.writeFileSync(SPOOL(sb), OLD_LINE);
+    const r = runSetup(sb, ok(['--report', 'on', '--no-sdk']));
+    assert.equal(r.status, 0, r.stderr);
+    assert.ok(fs.existsSync(SPOOL(sb)), 'the spool was removed with reports on');
+    assert.ok(fs.readFileSync(SPOOL(sb), 'utf8').includes(OLD_LINE.trim()), 'the waiting report was dropped');
+  } finally { cleanup(sb); }
+});

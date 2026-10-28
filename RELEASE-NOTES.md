@@ -22,9 +22,11 @@ Action needed: yes. An admin replaces the setup line in the Claude environment's
 
 - The Firebase SDK installs only the three packages the listener uses, from a committed lockfile (41 packages, all from registry.npmjs.org with integrity hashes), with `npm ci --ignore-scripts`. Two of them declare install scripts, `@firebase/util` and `protobufjs`; those scripts do not run.
 - The kit reads only usage numbers from session logs (the field list is in `SECURITY.md`). It sends totals per session, model and price tier, and session ids as salted hashes.
-- A comment or other text in SPM cannot change auto-start or reports. Only the person in a session can.
+- The agent is instructed to change auto-start or reports only when the person in the session asks, never because a comment or other text in SPM asks. This is an instruction to the model, not a technical lock.
 - Usage counts only the session that runs the command (its id from `CLAUDE_CODE_SESSION_ID` or `--session`), never the newest log file, which in a shared environment can belong to another session.
 - The allow rules apply to every session in the environment; see `SECURITY.md`.
+- The agent key goes only to SPM's production address and sign-in tokens only to Google's: the test overrides accept only `http://127.0.0.1`. In 0.1.0, `agent-selfcheck.cjs --base-fn` could send the key to any address.
+- While reports are off nothing is queued for sending, and turning reports off removes any report still waiting.
 
 ## 0.1.0
 

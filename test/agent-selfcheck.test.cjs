@@ -159,7 +159,8 @@ const noSecret = (r, label) => { for (const s of SECRETS) assert.ok(!allOut(r).i
 // ---------------------------------------------------------------- usage
 test('usage: no settings file exits 2 with one plain line', async () => {
   const w = await world();
-  const r = await runSelfcheck({ args: ['--base-idt', '/nonexistent'], bases: w.bases, keyDir: keyDirWith() });
+  // 0.2.1: the base value must be an allowed one (http://127.0.0.1), so this stays a no-settings-file test.
+  const r = await runSelfcheck({ args: ['--base-idt', 'http://127.0.0.1:9'], bases: w.bases, keyDir: keyDirWith() });
   assert.equal(r.code, 2);
   assert.equal(r.stdout, '');
   assert.equal(r.stderr.trim().split('\n').length, 1);
@@ -653,4 +654,102 @@ test('setup (B6): with HTTPS_PROXY set, the checks go through the proxy (CONNECT
     fs.rmSync(kit, { recursive: true, force: true });
     fs.rmSync(home, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------- 0.2.1: the --base-* test flags take 127.0.0.1 or the slot's default only
+const FS_DEFAULT = 'https://firestore.asia-southeast1.rep.googleapis.com';
+const SHARED_DEFAULT = 'https://firestore.googleapis.com';
+const FN_DEFAULT = 'https://asia-south1-litethink.cloudfunctions.net';
+const IDT_DEFAULT = 'https://identitytoolkit.googleapis.com';
+
+/** A preload module: logs every read of the key file (matched by name) into READ_LOG. Counts the real fs calls in the child. */
+function readCounter(dir) {
+  const pre = path.join(dir, 'count-reads.cjs');
+  fs.writeFileSync(pre, [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    'const note = (p) => { if (typeof p === \'string\' && p.includes(process.env.READ_WATCH)) fs.appendFileSync(process.env.READ_LOG, p + \'\\n\'); };',
+    'const rf = fs.readFileSync;',
+    'fs.readFileSync = function (p, ...rest) { note(p); return rf.call(this, p, ...rest); };',
+    'const of = fs.openSync;',
+    'fs.openSync = function (p, ...rest) { note(p); return of.call(this, p, ...rest); };',
+    '',
+  ].join('\n'));
+  return pre;
+}
+
+/** Runs the real CLI with the read counter preloaded. Resolves the exit code, the output and the key-file reads it made. */
+function runCounted(args) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-count-'));
+  const log = path.join(dir, 'reads.log');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-home-'));
+  const env = {
+    PATH: process.env.PATH, HOME: home, FIREBASE_API_KEY: FAKE_WEB,
+    NODE_OPTIONS: `--require ${readCounter(dir)}`, READ_WATCH: TEST_AGENT.keyFile, READ_LOG: log,
+  };
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [SCRIPT, ...args], { env });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (c) => { stdout += c; });
+    child.stderr.on('data', (c) => { stderr += c; });
+    const killer = setTimeout(() => child.kill('SIGKILL'), 30000);
+    child.on('error', reject);
+    child.on('close', (code) => {
+      clearTimeout(killer);
+      const reads = fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim() : '';
+      fs.rmSync(home, { recursive: true, force: true });
+      fs.rmSync(dir, { recursive: true, force: true });
+      resolve({ code, stdout, stderr, reads });
+    });
+  });
+}
+
+test('0.2.1 --base-fn https://other.example exits 2 with one usage line; the key file is never read; no local fake gets a request', async () => {
+  const w = await world();
+  const keyDir = keyDirWith();
+  const args = ['--config', path.join(keyDir, 'agent.json'), '--base-regional', w.bases.regional, '--base-shared', w.bases.shared,
+    '--base-fn', 'https://other.example', '--base-idt', w.bases.idt];
+  const r = await runCounted(args);
+  assert.equal(r.code, 2);
+  assert.equal(r.stdout, '');
+  assert.equal(r.stderr.trim().split('\n').length, 1);
+  assert.match(r.stderr, /--base-fn/);
+  assert.equal(r.reads, '', 'the key file was read');
+  assert.equal(w.regional.log.length + w.shared.log.length + w.fn.log.length + w.idt.log.length, 0, 'a local fake got a request');
+});
+
+test('0.2.1 each --base-* flag refuses other addresses with exit 2 before any read or request', async () => {
+  const w = await world();
+  const bad = ['https://other.example', 'http://10.0.0.1:80', 'https://127.0.0.1:9', 'http://localhost:9', 'http://127.0.0.1.example:9'];
+  for (const flag of ['--base-regional', '--base-shared', '--base-fn', '--base-idt']) {
+    for (const v of bad) {
+      const keyDir = keyDirWith();
+      const args = ['--config', path.join(keyDir, 'agent.json'), '--base-regional', w.bases.regional, '--base-shared', w.bases.shared,
+        '--base-fn', w.bases.fn, '--base-idt', w.bases.idt];
+      const i = args.indexOf(flag);
+      args[i + 1] = v;
+      const r = await runCounted(args);
+      assert.equal(r.code, 2, `${flag} ${v}`);
+      assert.equal(r.stdout, '', `${flag} ${v}`);
+      assert.equal(r.reads, '', `${flag} ${v}: key file read`);
+    }
+  }
+  assert.equal(w.regional.log.length + w.shared.log.length + w.fn.log.length + w.idt.log.length, 0, 'a local fake got a request');
+});
+
+test('0.2.1 parseArgs: http://127.0.0.1 (any port and path) and each slot default are accepted; any other value gives one usage line', () => {
+  const { parseArgs } = require(SCRIPT);
+  const local = parseArgs(['--base-regional', 'http://127.0.0.1:1234/x', '--base-shared', 'http://127.0.0.1:5/', '--base-fn', 'http://127.0.0.1:6', '--base-idt', 'http://127.0.0.1']);
+  assert.equal(local.usage, undefined);
+  assert.equal(local.bases.regional, 'http://127.0.0.1:1234/x');
+  const defaults = parseArgs(['--base-regional', FS_DEFAULT, '--base-shared', SHARED_DEFAULT, '--base-fn', FN_DEFAULT, '--base-idt', IDT_DEFAULT]);
+  assert.equal(defaults.usage, undefined);
+  assert.equal(defaults.bases.idt, IDT_DEFAULT);
+  const refused = parseArgs(['--base-fn', 'https://other.example']);
+  assert.equal(refused.bases, undefined);
+  assert.match(refused.usage, /^usage: .*--base-fn/);
+  assert.equal(refused.usage.includes('\n'), false);
+  const crossSlot = parseArgs(['--base-regional', FN_DEFAULT]);
+  assert.ok(crossSlot.usage, 'the default of another slot is not accepted here');
 });

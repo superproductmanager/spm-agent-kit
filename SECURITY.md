@@ -31,6 +31,14 @@ From the session's log files under ~/.claude/projects/, the kit parses each line
 
 Setup puts the seven allow rules in ~/.claude/settings.json, so they apply to every session in the environment. Where several sessions share one environment, any of them can post, mark Seen and resolve as the agent without a prompt. If that matters to you, run the agent in an environment that only its own sessions use. An option to leave the rules out is planned for 0.2.1.
 
+## Where the key goes
+
+The kit sends the agent key only to SPM's production address, and sign-in tokens only to Google's. The test overrides (`SPM_AGENT_API_BASE`, and the `--base-*` flags of `agent-selfcheck.cjs`) accept only `http://127.0.0.1` addresses, so no setting or flag can send the key to another host.
+
+## Reports off
+
+While reports are off, nothing is queued for sending. Turning them off (setup with `--report off`, or the settings command) removes any report still waiting to be sent. `usage` still counts locally and writes the numbers to `usage-local.jsonl` in the state folder (file 0600, replaced on each run), which the kit never sends.
+
 ## Supported versions
 
 Only the latest release tag receives security fixes.
