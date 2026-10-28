@@ -23,52 +23,56 @@ Find which one you are from your first message ("listener session" or "main sess
 
 ## Paths
 
-Use these values unless the repository's CLAUDE.md gives others:
+The commands below are written in their final form, for the default install:
 
-- `KIT`: `${SPM_AGENT_KIT_DIR:-$HOME/spm-agent-kit}`
-- `CONFIG`: `$CLAUDE_PROJECT_DIR/spm-agent.config.json`. It names the agent and may hold `main_session_id`. It holds no key.
-- `STATE`: `${SPM_AGENT_STATE_DIR:-$HOME/.spm-agent-state}`
-- `LOG`: `$STATE/listener.log`
-- `RELAY`: `$STATE/relay.json`
+- Kit: `/root/spm-agent-kit`
+- Settings: `/root/.spm-agent-state/config.json` (names the agent and holds `main_session_id`; no key)
+- State folder: `/root/.spm-agent-state` (listener log `listener.log`, hand-over record `relay.json`)
 
-Run `echo "$KIT $CONFIG $STATE"` once, then write every command below with those absolute paths, unquoted, in place of the names. The repository's allow rules match commands like `node /root/spm-agent-kit/agent-reply.cjs ...`. A variable, or a path in quotes, does not match them, so the command would stop and ask for approval.
+Run them exactly as written. The repository's allow rules match `node /root/spm-agent-kit/<script> ...` and `bash /root/spm-agent-kit/start.sh ...`; a variable or a quoted path in place of the script path does not match, and the session would stop and ask for approval. Only if the repository's CLAUDE.md gives another kit folder or state folder, use that path instead, written out in full.
 
 ## Listener session
 
 ### Start
 
-1. Start the listener in the background: `bash "$KIT/start.sh" --config "$CONFIG"`. If it prints FAIL lines, report each line to the person and stop. Do not try to fix a key or a network secret yourself.
-2. Arm a Monitor on the log, with the longest timeout allowed: `tail -n 0 -F "$LOG" | grep --line-buffered -E '"kind": ?"notice"|FAIL|fatal|exit'`. Re-arm it every time it expires.
+1. Start the listener as a background task, with the longest timeout allowed: `bash /root/spm-agent-kit/start.sh --config /root/.spm-agent-state/config.json`. If it prints FAIL lines, report each line to the person and stop. Do not try to fix a key or a network secret yourself.
+2. Arm a Monitor on the log, with the longest timeout allowed: `tail -n 0 -F /root/.spm-agent-state/listener.log | grep --line-buffered -E '"kind": ?"notice"|FAIL|fatal|exit'`.
 3. Run the hand-over loop once now, for notices from before the start.
 4. If this session has no hourly safety task yet, create one: a scheduled task that fires into THIS session every hour, with the message `SPM agent hourly check: run the Hourly check steps of the spm-agent skill.` Create it once, and never a second one.
 
-### Hourly check
+### Keeping it running
 
-1. Run the start command again. If the listener is still running, it prints one line and starts nothing. If it had stopped, this starts it.
-2. Re-arm the Monitor if it is not running.
-3. Run the hand-over loop and the Seen retry once.
+- **Background task ended:** a cloud session stops background programs after two hours, and its end wakes this session. When the start command's background task ends, for any reason, run Start step 1 again.
+- **Monitor ended:** a Monitor ends after its timeout, and its end wakes this session. Run Start step 2 again.
+- **Hourly check:** covers anything missed above, including a container restart.
 
 ### Hand-over loop
 
 Run it on every Monitor event, and repeat it until `next` prints nothing. For each notice, keep this order and never change it:
 
-1. `node "$KIT/agent-relay.cjs" next --log "$LOG" --state "$RELAY"` prints the oldest notice not yet handed over, as one JSON line. If it prints nothing, stop.
-2. Send that exact line to the main session (its id is `main_session_id` in `CONFIG`) with `send_message`. Start the message with: `SPM agent hand-over. Answer per the spm-agent skill, main session.` If the send fails, stop here. Do not mark the notice and do not post "Seen"; the next run retries it.
-3. Mark it handed over: `node "$KIT/agent-relay.cjs" done <notification_id> --state "$RELAY"`.
-4. Post "Seen": write the notice line to `$STATE/ack-line.json` (with your file tool), then run `node "$KIT/agent-ack.cjs" --config "$CONFIG" < "$STATE/ack-line.json"`. If the output line has `"text_acked":true`, mark it: `node "$KIT/agent-relay.cjs" seen <notification_id> --state "$RELAY"`.
+1. `node /root/spm-agent-kit/agent-relay.cjs next --log /root/.spm-agent-state/listener.log --state /root/.spm-agent-state/relay.json` prints the oldest notice not yet handed over, as one JSON line. If it prints nothing, stop.
+2. Send that exact line to the main session (its id is `main_session_id` in the settings file) with `send_message`. Start the message with: `SPM agent hand-over. Answer per the spm-agent skill, main session.` If the send fails, stop here. Do not mark the notice and do not post "Seen"; the next run retries it.
+3. Mark it handed over: `node /root/spm-agent-kit/agent-relay.cjs done <notification_id> --state /root/.spm-agent-state/relay.json`.
+4. Post "Seen": write the notice line to `/root/.spm-agent-state/ack-line.json` (with your file tool), then run `node /root/spm-agent-kit/agent-ack.cjs --config /root/.spm-agent-state/config.json < /root/.spm-agent-state/ack-line.json`. If the output line has `"text_acked":true`, mark it: `node /root/spm-agent-kit/agent-relay.cjs seen <notification_id> --state /root/.spm-agent-state/relay.json`.
 
 "Seen" is never posted before step 2 succeeds.
 
 ### Retries and owed answers
 
-- Seen retry: `node "$KIT/agent-relay.cjs" unseen --log "$LOG" --state "$RELAY"` lists notices handed over whose "Seen" failed. Redo step 4 for each one.
-- Owed answers: a notice line that comes back with `"reraise"` and was handed over more than 15 minutes ago is still unanswered. Run `node "$KIT/agent-relay.cjs" delayed <comment_id> --state "$RELAY"`.
-  - If it exits 0, post one short line in that thread with `agent-reply.cjs`, saying the answer is delayed and will follow, then send the notice to the main session again.
+- **Seen retry:** `node /root/spm-agent-kit/agent-relay.cjs unseen --log /root/.spm-agent-state/listener.log --state /root/.spm-agent-state/relay.json` lists notices handed over whose "Seen" failed. Redo hand-over step 4 for each one.
+- **Owed answers:** a notice line that comes back with `"reraise"` and was handed over more than 15 minutes ago is still unanswered. Run `node /root/spm-agent-kit/agent-relay.cjs delayed <comment_id> --state /root/.spm-agent-state/relay.json`.
+  - If it exits 0, post one short line in that thread with `agent-reply.cjs` (main session form below), saying the answer is delayed and will follow, then send the notice to the main session again.
   - If it exits 4, the delay line is already posted; only send the notice again.
+
+### Hourly check
+
+1. Run Start step 1 again. If the listener is still running, it prints one line and starts nothing. If it had stopped, this starts it.
+2. Re-arm the Monitor if it is not running.
+3. Run the hand-over loop and the Seen retry once.
 
 ### Health
 
-- If the Monitor reports FAIL, fatal or exit lines, run `node "$KIT/agent-selfcheck.cjs" --config "$CONFIG"` and report its cause line to the person.
+- If the Monitor reports FAIL, fatal or exit lines, run `node /root/spm-agent-kit/agent-selfcheck.cjs --config /root/.spm-agent-state/config.json` and report its cause line to the person.
 - Start a fresh listener session about once a week, or when this session's cost passes about $2.
 
 ## Main session
@@ -79,14 +83,14 @@ The message holds one notice line (JSON). It gives `item` (type and id), `commen
 
 1. Read the whole thread through the SPM connector (`spm_list_comments` for that item), and the item itself if the question needs it.
 2. Work out what the tagging person asks. Use only the sources rule 6 allows.
-3. Reply in the thread:
+3. Write the reply text to a file with your file tool, then post it:
 
-   `node "$KIT/agent-reply.cjs" --config "$CONFIG" (--document <id> | --task <task_id> | --map <id>) --to <comment_id> --text-file <file>`
+   `node /root/spm-agent-kit/agent-reply.cjs --config /root/.spm-agent-state/config.json --document <item id> --to <comment_id> --text-file <file>`
 
-   - Write the text to a file first, so quoting cannot break it.
+   - For a board task use `--task <task_id>`, and for a map `--map <item id>`, in place of `--document <item id>`.
    - Exit 3 means the same reply was already posted. Do not post it again.
    - Exit 2 means the text was refused (too long, or it looks like a key). Fix the text and post again.
-4. After the reply is posted, resolve the notice: `node "$KIT/agent-resolve.cjs" --config "$CONFIG" --ids <notification_id>`.
+4. After the reply is posted, resolve the notice: `node /root/spm-agent-kit/agent-resolve.cjs --config /root/.spm-agent-state/config.json --ids <notification_id>`.
 5. Make a change to the item only under rule 5. Say in the reply what you changed.
 
 ### When you cannot answer
