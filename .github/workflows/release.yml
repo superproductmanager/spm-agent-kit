@@ -1,0 +1,50 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Unit tests
+        run: node --test test/*.test.cjs
+      - name: Listener selftest
+        run: node agent-listen.cjs --selftest
+      - name: Reply selftest
+        run: node agent-reply.cjs --selftest
+      - name: Ack selftest
+        run: node agent-ack.cjs --selftest
+      - name: Resolve selftest
+        run: node agent-resolve.cjs --selftest
+      - name: Secret scan
+        run: bash scripts/secret-scan.sh --all
+      - name: Build the archive from the tag
+        run: |
+          # release.sh takes the version without the leading v
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          bash scripts/release.sh "$VERSION"
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: dist/spm-agent-kit-${{ env.VERSION }}.tar.gz
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            "dist/spm-agent-kit-$VERSION.tar.gz" dist/SHA256SUMS \
+            --title "$GITHUB_REF_NAME" \
+            --notes "SPM agent kit $VERSION. Built by GitHub Actions from the tag, with a build provenance attestation. Verify the archive with: gh attestation verify spm-agent-kit-$VERSION.tar.gz --repo superproductmanager/spm-agent-kit"

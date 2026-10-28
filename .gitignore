@@ -1,0 +1,10 @@
+# Secrets and local state: never commit these.
+*.key
+.env*
+*.log
+state/
+*cursor*.json
+
+# Build output and dependencies.
+node_modules/
+dist/

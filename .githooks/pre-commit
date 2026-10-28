@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Blocks a commit whose staged files hold a possible secret.
+# Turn it on once per clone: git config core.hooksPath .githooks
+set -u
+ROOT="$(git rev-parse --show-toplevel)" || exit 0
+exec "$ROOT/scripts/secret-scan.sh" --staged

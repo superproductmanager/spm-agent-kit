@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Unit tests
+        run: node --test test/*.test.cjs
+      - name: Listener selftest
+        run: node agent-listen.cjs --selftest
+      - name: Reply selftest
+        run: node agent-reply.cjs --selftest
+      - name: Ack selftest
+        run: node agent-ack.cjs --selftest
+      - name: Resolve selftest
+        run: node agent-resolve.cjs --selftest
+      - name: Secret scan
+        run: bash scripts/secret-scan.sh --all

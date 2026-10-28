@@ -1,0 +1,208 @@
+{
+  "_provenance": "Synthetic example of the real inbox route reply: shapes only, all ids and addresses are made up.",
+  "document": {
+    "feed": {
+      "notifications": [
+        {
+          "id": "00000000-0000-4000-8000-000000000001",
+          "seq": 1,
+          "verb": "comment.created",
+          "reason": "mentioned",
+          "lane": "needs_you",
+          "created_at": "2026-10-07T09:50:08.598Z",
+          "read_at": null,
+          "resolved_at": null,
+          "resolution": null,
+          "actor": {
+            "kind": "human",
+            "name": "Example person"
+          },
+          "item": {
+            "type": "document",
+            "id": "00000000-0000-4000-8000-000000000002"
+          },
+          "object": {
+            "type": "comment",
+            "id": "00000000-0000-4000-8000-000000000003"
+          },
+          "thread_id": "00000000-0000-4000-8000-000000000003",
+          "item_seq": 1,
+          "target": null
+        },
+        {
+          "id": "00000000-0000-4000-8000-000000000004",
+          "seq": 2,
+          "verb": "comment.replied",
+          "reason": "participant",
+          "lane": "needs_you",
+          "created_at": "2026-10-07T09:50:09.202Z",
+          "read_at": null,
+          "resolved_at": null,
+          "resolution": null,
+          "actor": {
+            "kind": "human",
+            "name": "Example person"
+          },
+          "item": {
+            "type": "document",
+            "id": "00000000-0000-4000-8000-000000000002"
+          },
+          "object": {
+            "type": "comment",
+            "id": "00000000-0000-4000-8000-000000000005"
+          },
+          "thread_id": "00000000-0000-4000-8000-000000000003",
+          "item_seq": 3,
+          "target": null
+        }
+      ],
+      "cursor": 2,
+      "latest": 2,
+      "has_more": false
+    },
+    "empty": {
+      "notifications": [],
+      "cursor": 2,
+      "latest": 2,
+      "has_more": false
+    },
+    "reset": {
+      "notifications": [],
+      "cursor": 2,
+      "latest": 2,
+      "has_more": false,
+      "reset": true
+    },
+    "agent_email": "spm-example-agent@agents.invalid"
+  },
+  "board": {
+    "feed": {
+      "notifications": [
+        {
+          "id": "00000000-0000-4000-8000-000000000006",
+          "seq": 1,
+          "verb": "comment.created",
+          "reason": "mentioned",
+          "lane": "needs_you",
+          "created_at": "2026-10-07T09:50:10.988Z",
+          "read_at": null,
+          "resolved_at": null,
+          "resolution": null,
+          "actor": {
+            "kind": "human",
+            "name": "Example person"
+          },
+          "item": {
+            "type": "board",
+            "id": "00000000-0000-4000-8000-000000000007"
+          },
+          "object": {
+            "type": "comment",
+            "id": "00000000-0000-4000-8000-000000000008"
+          },
+          "thread_id": "00000000-0000-4000-8000-000000000008",
+          "item_seq": 1,
+          "target": {
+            "type": "task",
+            "id": "00000000-0000-4000-8000-000000000009"
+          }
+        }
+      ],
+      "cursor": 1,
+      "latest": 1,
+      "has_more": false
+    },
+    "empty": {
+      "notifications": [],
+      "cursor": 1,
+      "latest": 1,
+      "has_more": false
+    },
+    "reset": {
+      "notifications": [],
+      "cursor": 1,
+      "latest": 1,
+      "has_more": false,
+      "reset": true
+    },
+    "agent_email": "spm-example-agent@agents.invalid"
+  },
+  "map": {
+    "feed": {
+      "notifications": [
+        {
+          "id": "00000000-0000-4000-8000-00000000000a",
+          "seq": 1,
+          "verb": "comment.created",
+          "reason": "mentioned",
+          "lane": "needs_you",
+          "created_at": "2026-10-07T09:50:12.478Z",
+          "read_at": null,
+          "resolved_at": null,
+          "resolution": null,
+          "actor": {
+            "kind": "human",
+            "name": "Example person"
+          },
+          "item": {
+            "type": "map",
+            "id": "00000000-0000-4000-8000-00000000000b"
+          },
+          "object": {
+            "type": "comment",
+            "id": "00000000-0000-4000-8000-00000000000c"
+          },
+          "thread_id": "00000000-0000-4000-8000-00000000000c",
+          "item_seq": 1,
+          "target": {
+            "type": "node",
+            "id": "00000000-0000-4000-8000-00000000000d"
+          }
+        }
+      ],
+      "cursor": 1,
+      "latest": 1,
+      "has_more": false
+    },
+    "empty": {
+      "notifications": [],
+      "cursor": 1,
+      "latest": 1,
+      "has_more": false
+    },
+    "reset": {
+      "notifications": [],
+      "cursor": 1,
+      "latest": 1,
+      "has_more": false,
+      "reset": true
+    },
+    "agent_email": "spm-example-agent@agents.invalid"
+  },
+  "refusals": {
+    "no_key": {
+      "status": 401,
+      "body": {
+        "error": "unauthenticated",
+        "code": "unauthenticated",
+        "message": "missing Authorization Bearer token or X-Device-Token header"
+      }
+    },
+    "wrong_key": {
+      "status": 401,
+      "body": {
+        "error": "unauthenticated",
+        "code": "unauthenticated",
+        "message": "invalid or revoked API key"
+      }
+    },
+    "address_mismatch": {
+      "status": 403,
+      "body": {
+        "error": "email_mismatch",
+        "code": "email_mismatch",
+        "message": "X-SPM-User-Email must be the owner of this API key (or be left out)"
+      }
+    }
+  }
+}
