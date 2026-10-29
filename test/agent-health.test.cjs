@@ -1360,3 +1360,90 @@ test('K0.2.0 T6 heartbeat with CLAUDE_CODE_SESSION_ID=A reads the files of A, no
     assert.equal(hb[0].session_key, KEY_OF(home, SESSION_A));
   } finally { await srv.close(); }
 });
+
+// ---------------------------------------------------------------- Kit 0.2.1 (F10): the explicit local settings are sent once on start
+// Only keys the settings file sets explicitly are sent, and a value is sent again only when the explicit values change.
+// A missing key never overwrites a switch a person set in SPM. A failed send writes no marker and is tried on the next start.
+const settingsCount = (srv) => srv.seen.filter((q) => q.url.endsWith('/agent/settings')).length;
+const withLocal = (config, extra) => {
+  const c = JSON.parse(fs.readFileSync(config, 'utf8'));
+  fs.writeFileSync(config, JSON.stringify({ ...c, ...extra }, null, 2) + '\n', { mode: 0o600 });
+};
+const bothHandlers = (settingsStatus, settingsBody) => (rec) => selfWith({ settings: { autostart: true, reports: true } })(rec)
+  || settingsHandler(settingsStatus, settingsBody)(rec);
+
+test('F10 first start sends the explicit local autostart once; a second start sends nothing; a changed local value is sent again', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  withLocal(config, { autostart: false });
+  const srv = await server(bothHandlers(200, { autostart: false, reports: true }));
+  try {
+    const r1 = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r1.code, 0, r1.err);
+    assert.equal(settingsCount(srv), 1, 'first start sends the settings once');
+    const body = srv.seen.find((q) => q.url.endsWith('/agent/settings')).json;
+    assert.equal(body.autostart, false);
+    assert.equal(body.reports, undefined, 'a key the file does not set is not sent');
+    assert.equal(typeof readJson(path.join(stateDir(home), 'health.json')).settingsSentHash, 'string', 'the sent marker is written');
+    const r2 = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r2.code, 0, r2.err);
+    assert.equal(settingsCount(srv), 1, 'second start with the same local values sends nothing');
+    withLocal(config, { autostart: true });
+    const r3 = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r3.code, 0, r3.err);
+    assert.equal(settingsCount(srv), 2, 'a changed local value is sent again');
+    assert.equal(srv.seen.filter((q) => q.url.endsWith('/agent/settings')).pop().json.autostart, true);
+  } finally { await srv.close(); }
+});
+
+test('F10 an explicit local reports true is sent with the autostart key the file sets', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  withLocal(config, { report: true, autostart: true });
+  const srv = await server(bothHandlers(200, { autostart: true, reports: true }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    const body = srv.seen.find((q) => q.url.endsWith('/agent/settings')).json;
+    assert.deepEqual([body.autostart, body.reports], [true, true]);
+  } finally { await srv.close(); }
+});
+
+test('F10 a settings file with no explicit switch sends nothing on start', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  const srv = await server(bothHandlers(200, { autostart: true, reports: true }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(settingsCount(srv), 0);
+  } finally { await srv.close(); }
+});
+
+test('F10 reports off in the settings file: nothing is sent on start, not even the autostart switch', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  withLocal(config, { report: false, autostart: false });
+  const srv = await server(bothHandlers(200, { autostart: false, reports: true }));
+  try {
+    const r = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(settingsCount(srv), 0, 'no settings request while reports are off locally');
+  } finally { await srv.close(); }
+});
+
+test('F10 a failed send never fails start, writes no marker, and is tried again on the next start', async () => {
+  const kit = makeKit(); const { home, config } = makeHome({ name: SPM_NAME, email: SPM_ADDRESS });
+  withLocal(config, { autostart: false });
+  let srv = await server(bothHandlers(500, { code: 'internal_error' }));
+  try {
+    const r1 = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r1.code, 0, r1.err);
+    assert.ok(settingsCount(srv) >= 1, 'the send was attempted (the client may retry a 500 once)');
+    const st = readJson(path.join(stateDir(home), 'health.json'));
+    assert.equal(st.settingsSentHash, undefined, 'no marker after a failed send');
+  } finally { await srv.close(); }
+  srv = await server(bothHandlers(200, { autostart: false, reports: true }));
+  try {
+    const r2 = await run(kit, home, ['start', '--role', 'main', '--config', config], srv.base);
+    assert.equal(r2.code, 0, r2.err);
+    assert.equal(settingsCount(srv), 1, 'the next start tries again');
+    assert.equal(typeof readJson(path.join(stateDir(home), 'health.json')).settingsSentHash, 'string');
+  } finally { await srv.close(); }
+});

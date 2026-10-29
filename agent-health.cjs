@@ -527,6 +527,31 @@ async function settingsCommand(p, c, deps) {
   return 0;
 }
 
+// Kit 0.2.1 (F10): the switches the settings file sets explicitly are sent to SPM once for each set of values. A key the
+// file does not set is never sent, so SPM's own switch is not overwritten. The marker is a hash of the values sent (health.json).
+// Local report false sends nothing. A failed send writes no marker, never fails start, and is tried on the next start.
+function explicitSwitches(c) {
+  const o = {};
+  if (typeof c.autostart === 'boolean') o.autostart = c.autostart;
+  if (typeof c.report === 'boolean') o.reports = c.report;
+  return o;
+}
+
+async function sendExplicitSwitchesOnce({ c, env, now, healthFile }) {
+  if (c.report === false) return;
+  const want = explicitSwitches(c);
+  if (Object.keys(want).length === 0) return;
+  const hash = crypto.createHash('sha256').update(JSON.stringify(Object.entries(want).sort())).digest('hex');
+  const before = readHealth(healthFile);
+  if (before && before.settingsSentHash === hash) return;
+  const quiet = { out() {}, err() {} };
+  let rc = 1;
+  try { rc = await settingsCommand({ autostart: want.autostart, reports: want.reports }, c, { io: quiet, env, now }); } catch (_) { rc = 1; }
+  if (rc !== 0) return;
+  const after = readHealth(healthFile) || {};
+  R.writeFileAtomic(healthFile, JSON.stringify({ ...after, settingsSentHash: hash }) + '\n', 0o600);
+}
+
 // Runs one command. deps: io { out, err }, env (default process.env), now () -> epoch ms. Returns the exit code.
 async function main(argv, deps) {
   const io = deps.io;
@@ -665,6 +690,7 @@ async function main(argv, deps) {
     io.out(`health: warning: kit ${kv.version} is older than the minimum ${id.minKit} that SPM asks for`);
   }
   if (settingsOff) { io.out(`health: identified ${id.name}; reports off; nothing sent`); return 0; }
+  await sendExplicitSwitchesOnce({ c, env, now, healthFile });
   // Kit 0.2.0: SPM says reports off, so usage is counted locally and nothing is queued.
   const usageItemsNow = kv.version ? await buildUsage({ files, role: p.role, meta: metaOf(), salt: sa.salt }) : [];
   if (!id.reportOn) {

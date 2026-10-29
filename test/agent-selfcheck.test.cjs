@@ -656,6 +656,75 @@ test('setup (B6): with HTTPS_PROXY set, the checks go through the proxy (CONNECT
   }
 });
 
+// ---- Kit 0.2.1 (F8): the full self-check run spools its three steps (spm-key, sign-in, signal-read) as role listener ----
+const F8_SECRETS = [FAKE_KEY, FAKE_CUSTOM, FAKE_ID, FAKE_REFRESH, FAKE_WEB];
+
+/** A settings file with a real key file (the fake agent key) and the fake web key as app_id. */
+function f8Config() {
+  const d = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-f8-cfg-'));
+  const keyFile = path.join(d, 'agent.key');
+  fs.writeFileSync(keyFile, FAKE_KEY + '\n');
+  const p = path.join(d, 'config.json');
+  fs.writeFileSync(p, JSON.stringify({ agent: { name: TEST_AGENT.name, email: TEST_AGENT.email }, key_file: keyFile, app_id: FAKE_WEB }));
+  return p;
+}
+
+/** Healthy fakes for the full run: the same fake servers the full check uses. */
+async function f8Bases(idt = {}, regional = {}) {
+  const reg = await serve(fakeFirestore(regional));
+  const fn = await serve(fakeFunctions());
+  const id = await serve(fakeIdentity(idt));
+  return { regional: reg.base, shared: reg.base, fn: fn.base, idt: id.base };
+}
+
+test('F8 full run: the three steps are spooled as listener check lines, pass, with no code and no secret', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const r = await runSetupMode({ kit, home, config: f8Config(), bases: await f8Bases(), args: ['--config', f8Config()] });
+    assert.equal(r.code, 0, r.stderr);
+    const lines = spoolOf(home);
+    assert.deepEqual(lines.map((l) => [l.step, l.status, l.kind, l.role]), [
+      ['spm-key', 'pass', 'check', 'listener'], ['sign-in', 'pass', 'check', 'listener'], ['signal-read', 'pass', 'check', 'listener'],
+    ]);
+    for (const l of lines) assert.equal(l.code, undefined, `${l.step}: a pass has no code`);
+    const text = fs.readFileSync(path.join(home, '.spm-agent-state', 'setup-report.jsonl'), 'utf8');
+    for (const s of F8_SECRETS) assert.equal(text.includes(s), false, 'a secret reached the spool');
+    assert.equal(text.includes('@'), false, 'an address reached the spool');
+    assert.equal(text.includes('127.0.0.1'), false, 'a host address reached the spool');
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('F8 full run: a failed sign-in is fail with the code token_refused, signal-read is skip with not_run, exit 1, FAIL line still printed', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const idt = { status: 400, body: { error: { code: 400, message: 'INVALID_CUSTOM_TOKEN', status: 'INVALID_ARGUMENT' } } };
+    const cfg = f8Config();
+    const r = await runSetupMode({ kit, home, config: cfg, bases: await f8Bases(idt), args: ['--config', cfg] });
+    assert.equal(r.code, 1, r.stderr);
+    assert.match(r.stdout, /^FAIL sign-in: /m);
+    assert.deepEqual(spoolOf(home).map((l) => [l.step, l.status, l.code]), [
+      ['spm-key', 'pass', undefined], ['sign-in', 'fail', 'token_refused'], ['signal-read', 'skip', 'not_run'],
+    ]);
+    const text = fs.readFileSync(path.join(home, '.spm-agent-state', 'setup-report.jsonl'), 'utf8');
+    for (const s of F8_SECRETS) assert.equal(text.includes(s), false, 'a secret reached the spool');
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
+test('F8 full run: a failed google-host check makes the three steps skip with not_run', async () => {
+  const kit = setupKit();
+  const home = newHome();
+  try {
+    const cfg = f8Config();
+    const r = await runSetupMode({ kit, home, config: cfg, bases: await f8Bases({}, { status: 403 }), args: ['--config', cfg] });
+    assert.equal(r.code, 1, r.stderr);
+    assert.deepEqual(spoolOf(home).map((l) => [l.step, l.status, l.code]), [
+      ['spm-key', 'skip', 'not_run'], ['sign-in', 'skip', 'not_run'], ['signal-read', 'skip', 'not_run'],
+    ]);
+  } finally { fs.rmSync(kit, { recursive: true, force: true }); fs.rmSync(home, { recursive: true, force: true }); }
+});
+
 // ---------------------------------------------------------------- 0.2.0: the --base-* test flags take 127.0.0.1 or the slot's default only
 const FS_DEFAULT = 'https://firestore.asia-southeast1.rep.googleapis.com';
 const SHARED_DEFAULT = 'https://firestore.googleapis.com';

@@ -109,9 +109,9 @@ function kitVersion() {
 /** The plain cause for a server reply: the known code's line, else "unexpected HTTP <status>". Body text is never echoed. */
 function serverCause(status, json, secret = false) {
   const code = json && typeof json.code === 'string' && /^[a-z_]{1,60}$/.test(json.code) ? json.code : null;
-  if (secret && (status === 401 || status === 403) && SECRET_NOT_REACHED_CODES.includes(code)) return { cause: SECRET_NOT_REACHED[0], fix: SECRET_NOT_REACHED[1] };
-  if (code && Object.prototype.hasOwnProperty.call(SERVER_CAUSES, code)) return { cause: SERVER_CAUSES[code][0], fix: SERVER_CAUSES[code][1] };
-  return { cause: `unexpected HTTP ${status}`, fix: UNEXPECTED_FIX };
+  if (secret && (status === 401 || status === 403) && SECRET_NOT_REACHED_CODES.includes(code)) return { code, cause: SECRET_NOT_REACHED[0], fix: SECRET_NOT_REACHED[1] };
+  if (code && Object.prototype.hasOwnProperty.call(SERVER_CAUSES, code)) return { code, cause: SERVER_CAUSES[code][0], fix: SERVER_CAUSES[code][1] };
+  return { code: 'unexpected_status', cause: `unexpected HTTP ${status}`, fix: UNEXPECTED_FIX };
 }
 
 function wildcardCause(host) {
@@ -194,10 +194,10 @@ async function checkGoogleHost(ctx) {
 async function checkSpmKey(ctx) {
   const url = `${ctx.bases.fn}/getRealtimeToken`;
   const r = await call(url, 'POST', { ...agentHeaders(ctx), 'Content-Type': 'application/json' }, '{}');
-  if (r.status === null) return { ok: false, name: 'spm-key', cause: `cannot reach ${FN_HOST}`, fix: 'check that this machine may reach that host' };
+  if (r.status === null) return { ok: false, name: 'spm-key', code: 'no_answer', cause: `cannot reach ${FN_HOST}`, fix: 'check that this machine may reach that host' };
   if (r.status === 200) {
     if (r.json && typeof r.json.token === 'string' && r.json.token) { ctx.customToken = r.json.token; out('ok spm-key'); return { ok: true }; }
-    return { ok: false, name: 'spm-key', cause: 'the server reply has no token', fix: UNEXPECTED_FIX };
+    return { ok: false, name: 'spm-key', code: 'no_token', cause: 'the server reply has no token', fix: UNEXPECTED_FIX };
   }
   return { ok: false, name: 'spm-key', ...serverCause(r.status, r.json, ctx.secret) };
 }
@@ -205,36 +205,36 @@ async function checkSpmKey(ctx) {
 async function checkSignIn(ctx) {
   let webKey;
   try { webKey = loadWebKeyFrom(process.env, ctx.appId); } catch (_) {
-    return { ok: false, name: 'sign-in', cause: 'no app id (web API key) is set on this machine', fix: 'run setup-env.sh again with --app-id <the public SPM app id>, or set FIREBASE_API_KEY in the environment' };
+    return { ok: false, name: 'sign-in', code: 'no_app_id', cause: 'no app id (web API key) is set on this machine', fix: 'run setup-env.sh again with --app-id <the public SPM app id>, or set FIREBASE_API_KEY in the environment' };
   }
   const url = `${ctx.bases.idt}/v1/accounts:signInWithCustomToken?key=${encodeURIComponent(webKey)}`;
   const r = await call(url, 'POST', { Referer: REFERER, 'Content-Type': 'application/json' }, JSON.stringify({ token: ctx.customToken, returnSecureToken: true }));
-  if (r.status === null) return { ok: false, name: 'sign-in', cause: `cannot reach ${IDT_HOST}`, fix: 'check that this machine may reach that host' };
+  if (r.status === null) return { ok: false, name: 'sign-in', code: 'no_answer', cause: `cannot reach ${IDT_HOST}`, fix: 'check that this machine may reach that host' };
   if (r.status === 200) {
     if (r.json && typeof r.json.idToken === 'string' && r.json.idToken) { ctx.idToken = r.json.idToken; out('ok sign-in'); return { ok: true }; }
-    return { ok: false, name: 'sign-in', cause: 'the sign-in reply has no ID token', fix: UNEXPECTED_FIX };
+    return { ok: false, name: 'sign-in', code: 'no_id_token', cause: 'the sign-in reply has no ID token', fix: UNEXPECTED_FIX };
   }
   const message = r.json && r.json.error && typeof r.json.error.message === 'string' ? r.json.error.message : '';
   if (r.status === 400 && /API key not valid|API_KEY_INVALID|API key/i.test(message)) {
-    return { ok: false, name: 'sign-in', cause: 'the app id (web API key) is wrong', fix: 'check the --app-id given to setup-env.sh (or FIREBASE_API_KEY, which wins) against the public SPM app id' };
+    return { ok: false, name: 'sign-in', code: 'app_id_wrong', cause: 'the app id (web API key) is wrong', fix: 'check the --app-id given to setup-env.sh (or FIREBASE_API_KEY, which wins) against the public SPM app id' };
   }
   if (r.status === 400 && /^[A-Z_]{3,60}$/.test(message)) {
-    return { ok: false, name: 'sign-in', cause: `sign-in refused the token (${message})`, fix: UNEXPECTED_FIX };
+    return { ok: false, name: 'sign-in', code: 'token_refused', cause: `sign-in refused the token (${message})`, fix: UNEXPECTED_FIX };
   }
-  return { ok: false, name: 'sign-in', cause: `unexpected HTTP ${r.status}`, fix: UNEXPECTED_FIX };
+  return { ok: false, name: 'sign-in', code: 'unexpected_status', cause: `unexpected HTTP ${r.status}`, fix: UNEXPECTED_FIX };
 }
 
 async function checkSignalRead(ctx) {
   const feed = await call(`${ctx.bases.fn}/accountApi/notifications?since=0&limit=100&state=all`, 'GET', agentHeaders(ctx));
-  if (feed.status === null) return { ok: false, name: 'signal-read', cause: `cannot reach ${FN_HOST}`, fix: 'check that this machine may reach that host' };
+  if (feed.status === null) return { ok: false, name: 'signal-read', code: 'no_answer', cause: `cannot reach ${FN_HOST}`, fix: 'check that this machine may reach that host' };
   if (feed.status !== 200) return { ok: false, name: 'signal-read', ...serverCause(feed.status, feed.json, ctx.secret) };
   const sid = feed.json && feed.json.signal_id;
-  if (typeof sid !== 'string' || !/^[0-9a-f]{64}$/.test(sid)) return { ok: false, name: 'signal-read', cause: 'the inbox feed reply has no signal id', fix: UNEXPECTED_FIX };
+  if (typeof sid !== 'string' || !/^[0-9a-f]{64}$/.test(sid)) return { ok: false, name: 'signal-read', code: 'no_signal_id', cause: 'the inbox feed reply has no signal id', fix: UNEXPECTED_FIX };
   const r = await call(`${ctx.bases.regional}${FS_ROOT}/signals/${sid}`, 'GET', { Authorization: `Bearer ${ctx.idToken}` });
-  if (r.status === null) return { ok: false, name: 'signal-read', cause: `cannot reach ${FS_HOST}`, fix: 'check that this machine may reach that host' };
+  if (r.status === null) return { ok: false, name: 'signal-read', code: 'no_answer', cause: `cannot reach ${FS_HOST}`, fix: 'check that this machine may reach that host' };
   if (r.status === 200 || r.status === 404) { out('ok signal-read'); return { ok: true }; }
-  if (r.status === 403) return { ok: false, name: 'signal-read', ...wildcardCause(FS_HOST) };
-  return { ok: false, name: 'signal-read', cause: `unexpected ${r.status}`, fix: UNEXPECTED_FIX };
+  if (r.status === 403) return { ok: false, name: 'signal-read', code: 'wildcard_secret', ...wildcardCause(FS_HOST) };
+  return { ok: false, name: 'signal-read', code: 'unexpected_status', cause: `unexpected ${r.status}`, fix: UNEXPECTED_FIX };
 }
 
 // ---------------------------------------------------------------- 0.2.0: the three no-key checks for --setup
@@ -276,7 +276,7 @@ function setupRunId(dir) {
 }
 
 /** Appends one check line to the spool. Never throws, never prints. */
-function spoolCheck(step, status, code) {
+function spoolCheck(step, status, code, role = 'setup') {
   const kv = strictKitVersion();
   if (!kv) return;
   try {
@@ -285,7 +285,7 @@ function spoolCheck(step, status, code) {
     fs.chmodSync(dir, 0o700);
     const file = path.join(dir, 'setup-report.jsonl');
     if (isLink(file)) return;
-    const item = { id: crypto.randomBytes(16).toString('hex'), kind: 'check', role: 'setup', run_id: setupRunId(dir), step, status };
+    const item = { id: crypto.randomBytes(16).toString('hex'), kind: 'check', role, run_id: setupRunId(dir), step, status };
     if (code) item.code = code;
     item.at = new Date().toISOString();
     item.kit_version = kv;
@@ -373,11 +373,16 @@ async function main(argv) {
   out(`info kit version: ${kitVersion()}`);
   const secret = mode.mode === 'secret';
   const ctx = { email: conf.email, appId: conf.appId, bases: a.bases, key: secret ? mode.key : keyFor(conf.keyFile), customToken: null, idToken: null, secret };
-  for (const check of [checkGoogleHost, checkSpmKey, checkSignIn, checkSignalRead]) {
+  // 0.2.1 (F8): the three steps after the google-host check are also written to the spool as role listener, pass, fail with
+  // a code word, or skip (code not_run) after an earlier fail. Only the code word reaches the spool.
+  let failed = false;
+  for (const [name, check] of [['google-host', checkGoogleHost], ['spm-key', checkSpmKey], ['sign-in', checkSignIn], ['signal-read', checkSignalRead]]) {
+    if (failed) { if (name !== 'google-host') spoolCheck(name, 'skip', 'not_run', 'listener'); continue; }
     const r = await check(ctx);
-    if (!r.ok) { out(`FAIL ${r.name}: ${r.cause}. Fix: ${r.fix}.`); return 1; }
+    if (name !== 'google-host') spoolCheck(name, r.ok ? 'pass' : 'fail', r.ok ? null : (r.code || 'unexpected_error'), 'listener');
+    if (!r.ok) { out(`FAIL ${r.name}: ${r.cause}. Fix: ${r.fix}.`); failed = true; }
   }
-  return 0;
+  return failed ? 1 : 0;
 }
 
 if (require.main === module) {
