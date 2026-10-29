@@ -176,6 +176,8 @@ A real key value is never printed or logged in either mode.
 
 ## Releases
 
+A maintainer starts a release from the Actions tab (Release, Run workflow, then the version without the v), or by pushing the tag. The run first checks that README and RELEASE-NOTES name that version and, for a manual start, that it runs on main and the tag does not exist yet.
+
 Release archives are built by GitHub Actions from the tag (`v<version>`), never on a laptop.
 The release workflow runs the tests, builds the archive and checksums with `scripts/release.sh`,
 attaches a build provenance attestation to the archive, and publishes the release. To check a

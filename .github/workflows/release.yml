@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the v, for example 0.2.1. README and RELEASE-NOTES must already name it."
+        required: true
+        type: string
+
+# One release at a time. A second start waits for the first, and never cancels it.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 # Default for every job: read only. The release job below raises what it needs.
 permissions:
@@ -19,6 +30,18 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
+      - name: Check the version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            MODE=dispatch
+            VERSION="$INPUT_VERSION"
+          else
+            MODE=tag
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          bash scripts/release-preflight.sh "$VERSION" "$MODE"
       - name: Unit tests
         run: node --test test/*.test.cjs
       - name: Listener selftest
@@ -44,21 +67,44 @@ jobs:
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: 22
-      - name: Build the archive from the tag
+      - name: Set the version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
         run: |
           # release.sh takes the version without the leading v
-          VERSION="${GITHUB_REF_NAME#v}"
+          if [ "$GITHUB_EVENT_NAME" = "workflow_dispatch" ]; then
+            VERSION="$INPUT_VERSION"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release: the version '$VERSION' is not MAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-          bash scripts/release.sh "$VERSION"
+          echo "TAG=v$VERSION" >> "$GITHUB_ENV"
+      - name: Make the tag
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          # Local only. The tag is pushed after the archive is built and attested.
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "SPM agent kit $VERSION" "$GITHUB_SHA"
+      - name: Build the archive from the tag
+        run: bash scripts/release.sh "$VERSION"
       - name: Attest build provenance
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: dist/spm-agent-kit-${{ env.VERSION }}.tar.gz
+      - name: Push the tag
+        if: github.event_name == 'workflow_dispatch'
+        run: git push origin "refs/tags/$TAG"
       - name: Create the GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
+          gh release create "$TAG" \
             "dist/spm-agent-kit-$VERSION.tar.gz" dist/SHA256SUMS \
-            --title "$GITHUB_REF_NAME" \
+            --title "$TAG" \
+            --verify-tag \
             --notes "SPM agent kit $VERSION. Built by GitHub Actions from the tag, with a build provenance attestation. Verify the archive with: gh attestation verify spm-agent-kit-$VERSION.tar.gz --repo superproductmanager/spm-agent-kit"
