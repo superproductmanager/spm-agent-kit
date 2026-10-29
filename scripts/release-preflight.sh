@@ -32,8 +32,10 @@ esac
 ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || die "not inside a git repository"
 cd "$ROOT"
 
-# Fixed-string whole-line matches, so the version is never read as a pattern.
-if ! grep -Fxq -- "Current version: $VERSION" README.md 2>/dev/null; then
+# README says "Current version: <version>" inside a sentence. The version is digits and dots only (checked
+# above), so escaping the dots makes it an exact pattern; it must not run on into a longer version (0.2.10).
+VERSION_RE="${VERSION//./\\.}"
+if ! grep -Eq -- "Current version: ${VERSION_RE}(\.?\$|\.?[^0-9.])" README.md 2>/dev/null; then
   die "README.md does not say 'Current version: $VERSION'"
 fi
 

@@ -105,6 +105,30 @@ test('README names another version: exit 1', () => {
   assert.match(r.stderr, /^release-preflight: README\.md does not say 'Current version: 0\.2\.1'/);
 });
 
+test('README names the version inside a sentence, as the real README does: exit 0', () => {
+  const { work } = makeFixture();
+  rewriteReadme(work, `# Example kit\n\nStatus: preview. Current version: ${VERSION} (see RELEASE-NOTES.md). More text.\n`);
+  assert.equal(run(work, [VERSION, 'tag']).code, 0);
+  rewriteReadme(work, `# Example kit\n\nThe current one. Current version: ${VERSION}.\n`);
+  assert.equal(run(work, [VERSION, 'tag']).code, 0);
+});
+
+test('README names a longer version that starts the same: exit 1', () => {
+  const { work } = makeFixture();
+  for (const other of ['0.2.10', '0.2.1.5', '0.2.12 (see notes)']) {
+    rewriteReadme(work, `# Example kit\n\nCurrent version: ${other}\n`);
+    const r = run(work, [VERSION, 'tag']);
+    assert.equal(r.code, 1, `README with ${other}`);
+  }
+});
+
+test('the real README of this repo passes for its own current version', () => {
+  const m = fs.readFileSync(path.join(KIT_SRC, 'README.md'), 'utf8').match(/Current version: (\d+\.\d+\.\d+)/);
+  assert.ok(m, 'README has a Current version line');
+  const r = spawnSync('bash', [SCRIPT, m[1], 'tag'], { cwd: KIT_SRC, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+});
+
 test('RELEASE-NOTES heading missing: exit 1', () => {
   const { work } = makeFixture();
   fs.writeFileSync(path.join(work, 'RELEASE-NOTES.md'), '# Release notes\n\n## 0.2.10\n\nSynthetic notes.\n');
