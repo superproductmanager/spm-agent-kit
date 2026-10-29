@@ -108,7 +108,7 @@ Reports go to SPM over the SPM API, with the agent key only. Each report is one 
 What is sent:
 
 - Setup results: the step names (config, skill, claude-md, settings, sdk), pass or fail, and a short code.
-- An hourly heartbeat from the listener: counts of listener starts, restarts and failures since the last heartbeat, container starts, main session changes, uptime in seconds, and the main session's status word.
+- A heartbeat from the listener session at each of its wakes (see "Listener waits"): counts of listener starts, restarts and failures since the last heartbeat, container starts, main session changes, uptime in seconds, and the main session's status word.
 - Usage per session, model and price tier: the number of model calls, input, output and cache token totals, the number of compactions and their size in tokens.
 - The kit version and the Node version.
 - The session id, as a salted hash (the first 16 hex characters of SHA-256 over the salt and the session id).
@@ -195,6 +195,24 @@ bash start.sh --config <absolute path to the settings file> [--state-dir <absolu
 - On success it prints one JSON line, `{"kind":"start","log":"<state>/listener.log","version":"<version>"}`, then runs the listener in the foreground. Run it in the background (for example `bash start.sh ... &`).
 - The state dir defaults to `$SPM_AGENT_STATE_DIR`, else `$HOME/.spm-agent-state`. It is created with mode 700 and is refused if it is inside a git work tree.
 - The listener log is `<state>/listener.log`. A second start while one runs exits 0 with one line and starts nothing.
+
+### Listener waits
+
+The listener session waits in background waits of two hours, not in a 30-minute watch. A wait ends at the first new notice or failure line in the log, or after two hours. Its end wakes the session: it hands over the notices, checks that the listener is still running (starting it again if not), and sends one heartbeat. Then it starts the next wait. A cloud session stops background programs after two hours, so a wait never runs longer than that.
+
+### Notice lines
+
+The listener writes one JSON line per notice. These keys tell a reader what to do with it:
+
+| Key | Meaning |
+|---|---|
+| `reason` | `mentioned` (the agent was tagged), `participant` (a comment in a thread the agent is in) or `follower`. Follower notices, and participant notices that do not tag the agent, are never answered; the session resolves them. |
+| `catchup` | `true` on a line printed at first start for a notice from before the start. Live lines do not carry it. |
+| `reraise` | The count of times an unresolved notice has been printed again: 1 for the first repeat, then 2, 3 and so on. |
+| `already_answered` | `true` when the agent had already written in that thread after the notice. Nothing is posted, and the session resolves the notice. |
+| `skipped` | `no_lookup` when a catch-up or re-raise line is for a board or map and no read can show the agent's earlier replies. Nothing is posted for it. |
+| `text_acked` | `true` when the "Seen" reply was posted, `false` when it failed, `null` when no reply was tried. |
+| `ack_error` | Set when a step of the "Seen" reply failed. `lookup` means the thread check failed, so nothing was posted. |
 
 ## Tests
 
