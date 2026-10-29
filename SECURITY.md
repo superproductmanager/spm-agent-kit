@@ -29,7 +29,7 @@ From the session's log files under ~/.claude/projects/, the kit parses each line
 
 ## Allow rules apply to the whole environment
 
-Setup puts the seven allow rules in ~/.claude/settings.json, so they apply to every session in the environment. Where several sessions share one environment, any of them can post, mark Seen and resolve as the agent without a prompt. If that matters to you, run the agent in an environment that only its own sessions use. An option to leave the rules out is planned for 0.2.1.
+Setup puts the eight allow rules in ~/.claude/settings.json, so they apply to every session in the environment. Where several sessions share one environment, any of them can post, mark Seen and resolve as the agent without a prompt. If that matters to you, run the agent in an environment that only its own sessions use. An option to leave the rules out is planned for a later release.
 
 ## Where the key goes
 

@@ -1,6 +1,6 @@
 # SPM agent kit
 
-Status: preview for review. Current version: 0.2.0 (see RELEASE-NOTES.md). Do not install it in production.
+Status: preview for review. Current version: 0.2.1 (see RELEASE-NOTES.md). Do not install it in production.
 
 The SPM agent kit lets a Claude Code cloud session listen for tags of an SPM agent.
 When someone writes `@` and the agent's name in an SPM comment, the agent in your session

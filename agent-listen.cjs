@@ -914,7 +914,7 @@ function createInboxListener(cfg, deps) {
     if (S.sub) { S.sub.live = false; try { if (S.sub.unsub) S.sub.unsub(); } catch (_) { /* the SDK's own close */ } S.sub = null; }
     subscribe(sid, true);
   }
-  /** RE-RAISE pass: the unresolved rows, all pages (at most INBOX_PAGES_MAX). Each row older than reraiseMs and younger than 24 h, and never a FOLLOWER row, is printed again as its normal line plus "reraise": n. At most RERAISE_MAX_LINES a pass: the NEWEST are kept and printed oldest first. Never moves the cursor, never POSTs. A failed read is one stderr line; the next pass tries again. */
+  /** RE-RAISE pass: the unresolved rows, all pages (at most RERAISE_PAGES_MAX). Each row older than reraiseMs and younger than 24 h, and never a FOLLOWER row, is printed again as its normal line plus "reraise": n. At most RERAISE_MAX_LINES a pass: the NEWEST are kept and printed oldest first. Never moves the cursor, never POSTs. A failed read is one stderr line; the next pass tries again. */
   const quitting = () => S.stopped || ac.signal.aborted;
   async function reraisePass() {
     let r = null;
