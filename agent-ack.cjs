@@ -12,7 +12,9 @@
  *
  * ADDED KEYS. "addressed" (true or false) is always added. "acked" is true, false, or null (no reaction was tried). "ack_error" is added when the reaction failed:
  * http_<status>, network, timeout, rate_limited, bad_ids, no_key, guard, internal or lookup. "reason" is added only for "group" or "thread" (a line
- * addressed by name has no reason key). "text_acked" is last: true, false, or null (no text reply was tried). An input line's own keys with these names are replaced.
+ * addressed by name has no reason key). "already_answered" is added as true only for a catch-up or re-raise notice (see NOTICE LINES). "skipped" is added
+ * only as "no_lookup": a catch-up or re-raise notice with no thread root, so its thread cannot be checked. "text_acked" is always last: true, false, or null
+ * (no text reply was tried). An input line's own keys with these names are replaced.
  * A line that is not a JSON object passes through unchanged. A failure never delays a line beyond its request timeout (8 s; the thread lookup 2 s).
  *
  * ADDRESSED RULE. addressed is true only for a human comment.created or comment.replied that either (a) names this agent (its name as "@<name>",
@@ -36,12 +38,19 @@
  * at most 10 replies per rolling minute per process. --no-text-ack turns the text reply off.
  *
  * BOARD AND MAP LINES. The listener's board and map lines carry item_type ("board" or "map") and item_id. An addressed board or map line gets the
- * text reply only (no reaction, no thread rule, no lookup): POST boardsApi/tasks/<task_id>/comments or mapsApi/maps/<item_id>/comments, with
- * body { body, parent_id }. No Idempotency-Key is sent on these routes.
+ * text reply only (no reaction, no thread rule): POST boardsApi/tasks/<task_id>/comments or mapsApi/maps/<item_id>/comments, with
+ * body { body, parent_id }. No Idempotency-Key is sent on these routes. The thread of a board or map comment is read with GET of the same route
+ * (the two key headers and no body, nothing else): a catch-up or re-raise line reads it before any text, and a participant line reads it to see
+ * whether the comment tags this agent. A failed read sends nothing.
  *
  * NOTICE LINES. The listener may also print kind "notice" lines (an inbox notice with item {type, id}, comment_id, thread_root_id, task_id and reason).
  * Only a mentioned human comment is answered: the eyes and the text reply on a document, the text reply only on a board or map.
- * A participant notice is answered only when it tags this agent.
+ * A participant notice is answered only when it tags this agent (its comment is read from the thread first; a board or map too).
+ * A CATCH-UP or RE-RAISE notice (a key "catchup": true, or "reraise" of 1 or more, printed by the listener) is answered only when the agent has
+ * NOT written in that thread after the noticed comment. The thread is read first (one list call on a document, one GET on a board or map); the
+ * noticed comment's position is its place in that list. Another comment of the agent after it gives nothing and "already_answered": true. A failed
+ * read, or a noticed comment missing from the list, gives nothing and "ack_error": "lookup". A catch-up line with no thread root gives nothing and
+ * "skipped": "no_lookup". Live lines (no catchup or reraise key) are judged as before, with no read.
  *
  * KEY. The key is read once at start from key_file and sent only as the X-SPM-API-Key header. It is never printed or written; any output line that
  * contains it is redacted. The server's reply body is discarded unread. If the key cannot be read, one notice goes to stderr, every addressed line is
@@ -76,7 +85,7 @@ const THREAD_CAP = 500;
 const LIST_MAX_BYTES = 8 * 1024 * 1024;
 const CREATE_PATH = '/documentsApi/createDocumentComment';
 const CREATE_URL = `https://${FN_HOST}${CREATE_PATH}`;
-const TEXT_TIMEOUT_MS = 2000;
+const TEXT_TIMEOUT_MS = 8000; // the reply route stores the comment before it answers, so it needs the same budget as a reaction (2 s cut off replies that were stored)
 const TEXT_MAX_PER_MINUTE = 10;
 const ITEM_PATH_RE = /^\/(?:boardsApi\/tasks|mapsApi\/maps)\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/comments$/; // the board (task) and map comment routes (lower-case ids only; the line's ids are lower-cased first)
 const IDEM_RE = /^ack-text:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
@@ -183,6 +192,18 @@ function verdictOf(snap, me) {
   return prev !== null && prev.mine;
 }
 
+/** a notice that replays old news: the first run's catch-up line (catchup true) or a re-raise (reraise 1 or more) */
+function isCatchOrRaise(o) {
+  return o.catchup === true || (Number.isInteger(o.reraise) && o.reraise >= 1);
+}
+/** the catch-up and re-raise check on a thread snapshot: 'answered' when a comment marked mine comes AFTER the noticed comment in the list order, 'ok' when none does, 'lookup' when the check cannot be made (failed read, or the noticed comment is not in the list) */
+function gateOf(snap, me) {
+  if (!snap.ok) return 'lookup';
+  const idx = snap.thread.findIndex((c) => c.id === me);
+  if (idx < 0) return 'lookup';
+  return snap.thread.slice(idx + 1).some((c) => c.mine) ? 'answered' : 'ok';
+}
+
 // ---------------------------------------------------------------- the transport (real https in a run; plain http to a local stand-in in the selftest: the SAME guard and code either way)
 class GuardError extends Error { constructor(m) { super(m); this.name = 'GuardError'; } }
 function guardRequest(urlStr, method, headers, bodyStr) {
@@ -266,9 +287,20 @@ function guardItemCreate(urlStr, method, headers, bodyObj) {
   if (typeof bodyObj.parent_id !== 'string' || !UUID_RE.test(bodyObj.parent_id)) fail('item create parent');
   if (typeof bodyObj.body !== 'string' || !ackTextOk(bodyObj.body)) fail('item create text');
 }
+/** the thread read of a board or map item: GET boardsApi/tasks/<uuid>/comments or mapsApi/maps/<uuid>/comments on the same host, with the two key headers and no body (the same route agent-reply.cjs reads) */
+function guardItemRead(urlStr, method, headers, bodyObj) {
+  const fail = (m) => { throw new GuardError(m); };
+  let u; try { u = new URL(urlStr); } catch { fail('bad url'); }
+  if (u.protocol !== 'https:' || u.port !== '' || u.search !== '' || u.hash !== '' || u.username !== '' || u.password !== '' || u.hostname !== FN_HOST || !ITEM_PATH_RE.test(u.pathname)) fail('only GET boardsApi/tasks/<uuid>/comments or mapsApi/maps/<uuid>/comments on ' + FN_HOST + ' is allowed');
+  if (method !== 'GET') fail('item read method');
+  const names = Object.keys(headers).map((k) => k.toLowerCase()).sort();
+  if (names.join(',') !== 'x-spm-api-key,x-spm-user-email') fail('item read header names');
+  if (bodyObj !== undefined) fail('item read carries no body');
+}
 function guardApi(urlStr, method, headers, bodyObj) {
   let u; try { u = new URL(urlStr); } catch { throw new GuardError('bad url'); }
   if (u.pathname === CREATE_PATH) return guardCreate(urlStr, method, headers, bodyObj);
+  if (method === 'GET' && ITEM_PATH_RE.test(u.pathname)) return guardItemRead(urlStr, method, headers, bodyObj);
   if (ITEM_PATH_RE.test(u.pathname)) return guardItemCreate(urlStr, method, headers, bodyObj);
   return guardList(urlStr, method, headers, bodyObj); // any other path fails the list guard's path check
 }
@@ -276,12 +308,13 @@ function guardApi(urlStr, method, headers, bodyObj) {
 function makeApi(rewrite, lib = https) {
   return function api(urlStr, method, headers, bodyObj, timeoutMs) {
     guardApi(urlStr, method, headers, bodyObj);
-    const bodyStr = JSON.stringify(bodyObj);
+    const isGet = method === 'GET'; // the thread read: no body, no content headers
+    const bodyStr = isGet ? '' : JSON.stringify(bodyObj);
     return new Promise((resolve) => {
       let settled = false; let timer = null; let req = null;
       const finish = (r) => { if (settled) return; settled = true; clearTimeout(timer); resolve(r); };
       const u = new URL(urlStr);
-      const opts = { method, path: u.pathname, hostname: rewrite ? rewrite.hostname : u.hostname, port: rewrite ? rewrite.port : 443, ...(rewrite ? {} : proxyOpt(lib)), headers: { ...headers, 'Content-Type': 'application/json', Accept: 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) } };
+      const opts = { method, path: u.pathname, hostname: rewrite ? rewrite.hostname : u.hostname, port: rewrite ? rewrite.port : 443, ...(rewrite ? {} : proxyOpt(lib)), headers: { ...headers, ...(isGet ? {} : { 'Content-Type': 'application/json' }), Accept: 'application/json', ...(isGet ? {} : { 'Content-Length': Buffer.byteLength(bodyStr) }) } };
       try {
         req = (rewrite ? http : lib).request(opts, (res) => {
           const chunks = []; let size = 0;
@@ -293,7 +326,7 @@ function makeApi(rewrite, lib = https) {
       } catch { finish({ err: 'network' }); return; }
       timer = setTimeout(() => { req.destroy(); finish({ err: 'timeout' }); }, timeoutMs);
       req.on('error', () => finish({ err: 'network' }));
-      req.write(bodyStr);
+      if (!isGet) req.write(bodyStr);
       req.end();
     });
   };
@@ -432,32 +465,51 @@ function createAcker(cfg, deps) {
   }
 
   /** ONE listDocumentComments call for a participant notice's thread, never from the thread cache (the comment's own text is needed, and the cache keeps none). A failed call gives { ok: false }. */
-  async function freshThread(documentId, root) {
-    const headers = { 'X-SPM-User-Email': cfg.email, 'X-SPM-API-Key': cfg.key };
+  async function freshThread(kind, target, root) {
     let r = null;
-    try { r = await deps.api(LIST_URL, 'POST', headers, { documentId }, lookupMs); } catch { r = null; }
+    try {
+      if (kind === 'document') r = await deps.api(LIST_URL, 'POST', { 'X-SPM-User-Email': cfg.email, 'X-SPM-API-Key': cfg.key }, { documentId: target }, lookupMs);
+      else r = await deps.api(kind === 'board' ? `https://${FN_HOST}/boardsApi/tasks/${target.task}/comments` : `https://${FN_HOST}/mapsApi/maps/${target.item}/comments`, 'GET', { 'X-SPM-API-Key': cfg.key, 'X-SPM-User-Email': cfg.email }, undefined, lookupMs);
+    } catch { r = null; }
     return snapshotOf(r, root, selfId, true);
+  }
+  /** the catch-up or re-raise check of one notice line: 'answered', 'ok', 'lookup' (see gateOf), or 'no_lookup' when the line has no thread root to check under (nothing is read, nothing is sent) */
+  async function replayGate(kind, target, comment, root) {
+    if (root === null) return 'no_lookup';
+    return gateOf(await freshThread(kind, target, root), comment);
   }
 
   /** A PARTICIPANT notice (reason participant: a human reply that tags this agent inside a thread the agent already wrote in). Judged as the listener line of the same comment is: ONE list call for its thread, the comment found by comment_id, its body and author kind taken from the list, the name and group rule on that body, then the thread rule from the same answer. Only a human document comment with well-formed ids and a key makes the call; any other participant notice gets nothing and no call. */
   async function participantOutcome(o) {
-    const none = { addressed: false, acked: null, error: null, textAcked: null };
+    const none = { addressed: false, acked: null, error: null, textAcked: null, alreadyAnswered: false };
     const ok = (v) => typeof v === 'string' && UUID_RE.test(v);
-    if (o.actor_kind !== 'human' || !ACK_KINDS.includes(o.verb) || !isPlainObject(o.item) || o.item.type !== 'document') return none;
+    const kind = !isPlainObject(o.item) ? null : o.item.type === 'document' ? 'document' : o.item.type === 'board' ? 'board' : o.item.type === 'map' ? 'map' : null;
+    if (o.actor_kind !== 'human' || !ACK_KINDS.includes(o.verb) || kind === null) return none;
     if (!ok(o.item.id) || !ok(o.comment_id) || !ok(o.thread_root_id) || !deps.api || !cfg.key) return none;
-    const documentId = o.item.id; const me = o.comment_id.toLowerCase(); const root = o.thread_root_id.toLowerCase();
-    const snap = await freshThread(documentId, root);
+    if (kind === 'board' && !ok(o.task_id)) return none;
+    const me = o.comment_id.toLowerCase(); const root = o.thread_root_id.toLowerCase();
+    const target = kind === 'document' ? o.item.id : { task: kind === 'board' ? o.task_id.toLowerCase() : null, item: o.item.id.toLowerCase() };
+    const snap = await freshThread(kind, target, root);
     const row = snap.ok ? snap.thread.find((c) => c.id === me) : undefined;
     if (row === undefined) return { ...none, error: 'lookup' };
-    const line = { document_id: documentId, comment_id: o.comment_id, thread_root_id: o.thread_root_id, body: row.body, author_kind: row.author_kind, kind: o.verb };
+    const line = kind === 'document'
+      ? { document_id: o.item.id, comment_id: o.comment_id, thread_root_id: o.thread_root_id, body: row.body, author_kind: row.author_kind, kind: o.verb }
+      : { item_type: kind, item_id: o.item.id, comment_id: o.comment_id, task_id: kind === 'board' ? o.task_id : null, thread_root_id: o.thread_root_id, body: row.body, author_kind: row.author_kind, kind: o.verb };
     const why = addressedReason(line, cfg.mentions, cfg.others);
     if (why === 'named' || why === 'group') {
-      const [r, tx] = await Promise.all([ack(documentId, o.comment_id), textAck(line)]);
-      return { addressed: true, acked: r.acked, error: r.error || null, textAcked: tx };
+      if (isCatchOrRaise(o)) { // an old notice: the thread is checked on the same read, before any eyes or text
+        const gate = gateOf(snap, me);
+        if (gate === 'answered') return { ...none, addressed: true, alreadyAnswered: true };
+        if (gate === 'lookup') return { ...none, addressed: true, error: 'lookup' };
+      }
+      if (kind !== 'document') return { addressed: true, acked: null, error: null, textAcked: await itemTextAck(line, kind, itemIds(line, kind)), alreadyAnswered: false };
+      const [r, tx] = await Promise.all([ack(o.item.id, o.comment_id), textAck(line)]);
+      return { addressed: true, acked: r.acked, error: r.error || null, textAcked: tx, alreadyAnswered: false };
     }
     if (why === 'other') return none; // another agent is named: nothing, as for a listener line
+    if (kind !== 'document') return none; // a board or map thread rule needs a reaction, which those routes do not have
     const verdict = root !== me && eligible(line) ? verdictOf(snap, me) : false;
-    if (verdict === true) { const r = await ack(documentId, o.comment_id); return { ...none, acked: r.acked, error: r.error || null }; }
+    if (verdict === true) { const r = await ack(o.item.id, o.comment_id); return { ...none, acked: r.acked, error: r.error || null }; }
     return none;
   }
 
@@ -468,26 +520,41 @@ function createAcker(cfg, deps) {
     try { o = JSON.parse(raw); } catch { return scrub(raw); }
     if (!isPlainObject(o)) return scrub(raw);
     const notice = o.kind === 'notice';
-    let addressed = false; let acked = null; let error = null; let reason = null; let textAcked = null;
+    let addressed = false; let acked = null; let error = null; let reason = null; let textAcked = null; let alreadyAnswered = false; let skipped = null;
     try {
       if (notice && o.reason === 'participant') {
         // a participant notice is judged from its comment's text: one list call, then the name, group and thread rules (see participantOutcome); it gets no reason key of its own
-        ({ addressed, acked, error, textAcked } = await participantOutcome(o));
+        ({ addressed, acked, error, textAcked, alreadyAnswered } = await participantOutcome(o));
       } else {
         // a notice (inbox mode) stands for the listener line of its comment, or null when it is not ours; a listener line is judged as before
         const line = notice ? noticeAsLine(o) : o;
         const why = notice ? (line === null ? null : 'notice') : addressedReason(o, cfg.mentions, cfg.others);
         addressed = why === 'named' || why === 'group' || why === 'notice';
         const kind = line === null ? 'document' : lineKind(line);
+        const replay = notice && isCatchOrRaise(o); // an old notice (catch-up or re-raise): its thread is read before any eyes or text
         if (addressed && kind !== 'document') {
           // a board or map line: the text reply only (no reaction route, no thread rule); a malformed line or no key is reported the way a document line reports it
           if (why === 'group') reason = 'group';
           const ids = kind === 'bad' ? null : itemIds(line, kind);
           if (!ids) { acked = false; error = 'bad_ids'; }
           else if (!cfg.key) { acked = false; error = 'no_key'; }
-          else textAcked = await itemTextAck(line, kind, ids);
+          else {
+            const gate = replay ? await replayGate(kind, ids, ids.comment, ids.root) : 'ok';
+            if (gate === 'answered') alreadyAnswered = true;
+            else if (gate === 'lookup') error = 'lookup';
+            else if (gate === 'no_lookup') skipped = 'no_lookup';
+            else textAcked = await itemTextAck(line, kind, ids);
+          }
         }
-        else if (addressed) { if (why === 'group') reason = 'group'; const [r, tx] = await Promise.all([ack(line.document_id, line.comment_id), textAck(line)]); acked = r.acked; error = r.error || null; textAcked = tx; }
+        else if (addressed) {
+          if (why === 'group') reason = 'group';
+          const root = typeof line.thread_root_id === 'string' && UUID_RE.test(line.thread_root_id) ? line.thread_root_id.toLowerCase() : null;
+          const gate = replay && cfg.key ? await replayGate('document', line.document_id, line.comment_id.toLowerCase(), root) : 'ok';
+          if (gate === 'answered') alreadyAnswered = true;
+          else if (gate === 'lookup') error = 'lookup';
+          else if (gate === 'no_lookup') skipped = 'no_lookup';
+          else { const [r, tx] = await Promise.all([ack(line.document_id, line.comment_id), textAck(line)]); acked = r.acked; error = r.error || null; textAcked = tx; }
+        }
         else if (!notice && why !== 'other' && kind === 'document') {
           const verdict = await threadVerdict(o);
           if (verdict === true) { reason = 'thread'; const r = await ack(o.document_id, o.comment_id); acked = r.acked; error = r.error || null; }
@@ -499,9 +566,13 @@ function createAcker(cfg, deps) {
     delete out.ack_error;
     if (!notice) delete out.reason; // a notice keeps its own reason (mentioned, participant or follower); this script adds none to a notice
     delete out.text_acked;
+    delete out.already_answered;
+    delete out.skipped;
     if (error) out.ack_error = error;
     if (reason) out.reason = reason;
-    out.text_acked = textAcked;
+    if (alreadyAnswered) out.already_answered = true;
+    if (skipped) out.skipped = skipped;
+    out.text_acked = textAcked; // always last
     return scrub(JSON.stringify(out));
   }
   return { handleLine, ack };
@@ -579,7 +650,8 @@ const humanLine = (n, text, extra) => JSON.stringify({ t: '2026-10-04T16:50:15+0
  *  trusted Origin else 403 untrusted_origin; X-SPM-API-Key + X-SPM-User-Email else 401; body {documentId, commentId, emoji, op}; non-empty emoji of at most 16 UTF-16 units and op add|remove else 400;
  *  unknown document or a comment not in it -> 404; add is an idempotent upsert (UNIQUE comment, emoji, reactor); 200 {"ok":true}. A CONTRACT-FAITHFUL STAND-IN: production needs Postgres. */
 function makeStandIn() {
-  const st = { requests: [], lists: [], posts: [], itemReqs: [], itemComments: { board: new Map(), map: new Map() }, idem: new Map(), comments: [], callerIdentity: SELF_ID, isYouOff: false, reactions: new Set(), behave: null, server: null, port: 0 };
+  const keyOk = (k) => k === FAKE_KEY || (st.placeholderKey === true && k === 'network-secret'); // network-secret mode sends the placeholder; the stand-in takes it only when a test turns placeholderKey on
+  const st = { placeholderKey: false, requests: [], lists: [], posts: [], itemReqs: [], itemComments: { board: new Map(), map: new Map() }, idem: new Map(), comments: [], callerIdentity: SELF_ID, isYouOff: false, reactions: new Set(), behave: null, server: null, port: 0 };
   st.server = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
@@ -604,7 +676,7 @@ function makeStandIn() {
         // (200 + Idempotent-Replayed: true, no second row), a DIFFERENT request is 422 { error: idempotency_key_reused }; 200 with the new comment row.
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
         if (rec.headers.origin !== ORIGIN) return send(403, { code: 'origin_not_allowed' });
-        if (rec.headers['x-spm-api-key'] !== FAKE_KEY || rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return send(401, { error: 'unauthorized', echoedKey: rec.headers['x-spm-api-key'] });
+        if (!keyOk(rec.headers['x-spm-api-key']) || rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return send(401, { error: 'unauthorized', echoedKey: rec.headers['x-spm-api-key'] });
         const ikRaw = rec.headers['idempotency-key'];
         const ik = ikRaw === undefined ? null : String(ikRaw).trim();
         if (ik !== null && !/^[\x20-\x7E]{1,255}$/.test(ik)) return send(400, { code: 'invalid_idempotency_key', error: 'invalid_idempotency_key' });
@@ -631,7 +703,7 @@ function makeStandIn() {
         // POST listDocumentComments as the reply script calls it: x-spm-api-key + x-spm-user-email (no Origin needed), body { documentId };
         // 200 { comments: [ the row (id, document_id, author_identity, parent_id, body, created_at, ...) + author_email + author_is_you (FOR THIS CALLER) + author_kind + author_display_name + reactions ], total, signal_id }
         if (req.method !== 'POST') return send(405, { error: 'method not allowed' });
-        if (rec.headers['x-spm-api-key'] !== FAKE_KEY || rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return send(401, { error: 'unauthorized', echoedKey: rec.headers['x-spm-api-key'] });
+        if (!keyOk(rec.headers['x-spm-api-key']) || rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return send(401, { error: 'unauthorized', echoedKey: rec.headers['x-spm-api-key'] });
         let lb; try { lb = JSON.parse(rec.raw); } catch { return send(400, { error: 'bad json' }); }
         if (!lb || lb.documentId !== DOC) return send(404, { error: 'document not found' });
         const comments = st.comments.map((row) => ({ ...row, author_is_you: !st.isYouOff && row.author_identity === st.callerIdentity }));
@@ -640,7 +712,7 @@ function makeStandIn() {
       if (req.method === 'OPTIONS') { res.writeHead(204); return res.end(); }
       if (req.method !== 'POST' || !req.url.startsWith(FN_PATH)) return send(404, { error: 'not found' });
       if (rec.headers.origin !== ORIGIN) return send(403, { error: 'not a trusted origin', code: 'untrusted_origin' });
-      if (rec.headers['x-spm-api-key'] !== FAKE_KEY || rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return send(401, { error: 'unauthorized', echoedKey: rec.headers['x-spm-api-key'] });
+      if (!keyOk(rec.headers['x-spm-api-key']) || rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return send(401, { error: 'unauthorized', echoedKey: rec.headers['x-spm-api-key'] });
       let body; try { body = JSON.parse(rec.raw); } catch { return send(400, { error: 'bad json' }); }
       if (body.documentId !== DOC) return send(404, { error: 'document not found' });
       if (typeof body.emoji !== 'string' || !body.emoji.trim() || body.emoji.length > 16) return send(400, { error: 'bad emoji' });
@@ -661,8 +733,12 @@ function makeStandIn() {
   function itemRequest(rec, m, send) {
     const [, fn, seg, rawId] = m; const type = fn === 'boardsApi' ? 'board' : 'map';
     const out = (name, status, body) => send(status, body);
-    if (rec.headers['x-spm-api-key'] !== FAKE_KEY) return out('board.events.bad-key', 401, errBody('unauthenticated', 'invalid or revoked API key'));
+    if (!keyOk(rec.headers['x-spm-api-key'])) return out('board.events.bad-key', 401, errBody('unauthenticated', 'invalid or revoked API key'));
     if (rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return out('board.events.owner-mismatch', 403, errBody('api_key_owner_mismatch', 'this API key can only act as its owner'));
+    if (rec.method === 'GET' && seg === (type === 'board' ? 'tasks' : 'maps')) { // the thread read: the comment list of the item, the stand-in's own rows in the order they were stored
+      if (rawId.toLowerCase() !== (type === 'board' ? TASK_ID : MAP_ID)) return out(`${type}.comments.list.not-found`, 404, errBody('not_found', 'not found'));
+      return out(`${type}.comments.list`, 200, { comments: [...st.itemComments[type].values()].map((c) => itemWire(type, c, FAKE_EMAIL)) });
+    }
     if (seg !== (type === 'board' ? 'tasks' : 'maps') || rec.method !== 'POST') return out('board.events.unknown-route', 404, errBody('unknown_route', `${rec.method} ${rec.url} is not a route`));
     if (rawId.toLowerCase() !== (type === 'board' ? TASK_ID : MAP_ID)) return out(`${type}.comments.create.not-found`, 404, errBody('not_found', 'not found'));
     let body; try { body = JSON.parse(rec.raw); } catch { return send(400, errBody('invalid_request', 'bad json')); }
@@ -678,7 +754,7 @@ function makeStandIn() {
   }
   st.start = () => new Promise((resolve) => st.server.listen(0, '127.0.0.1', () => { st.port = st.server.address().port; resolve(); }));
   st.stop = () => new Promise((resolve) => { st.server.closeAllConnections?.(); st.server.close(() => resolve()); });
-  st.reset = () => { st.requests.length = 0; st.lists.length = 0; st.posts.length = 0; st.itemReqs.length = 0; st.itemComments = { board: new Map(), map: new Map() }; st.idem.clear(); st.comments = []; st.callerIdentity = SELF_ID; st.isYouOff = false; st.reactions.clear(); st.behave = null; };
+  st.reset = () => { st.requests.length = 0; st.lists.length = 0; st.posts.length = 0; st.itemReqs.length = 0; st.itemComments = { board: new Map(), map: new Map() }; st.idem.clear(); st.comments = []; st.callerIdentity = SELF_ID; st.isYouOff = false; st.reactions.clear(); st.behave = null; st.placeholderKey = false; };
   return st;
 }
 /** One comment row in the list wire shape (authors by identity: 'agent' = this agent, 'other' = some other identity, 'human'); parent = a number (a cid) or undefined for a top-level comment. */
@@ -692,9 +768,9 @@ const threadLine = (n, text, root, extra) => humanLine(n, text, { parent_id: roo
 
 const LIVE = new Set(); // every child the selftest started; whatever is still alive when the run ends is killed (a failed case must never leave a child holding the process open)
 function spawnAck(env, o = {}) {
-  const cfg = { argv: ['--config', o.keyFile !== undefined ? env.writeConfig({ key_file: o.keyFile }) : env.configFile, ...(o.args || [])], port: o.port !== undefined ? o.port : env.standIn.port, timeoutMs: o.timeoutMs, lookupTimeoutMs: o.lookupTimeoutMs, textTimeoutMs: o.textTimeoutMs };
+  const cfg = { argv: ['--config', o.configPath || (o.keyFile !== undefined ? env.writeConfig({ key_file: o.keyFile }) : env.configFile), ...(o.args || [])], port: o.port !== undefined ? o.port : env.standIn.port, timeoutMs: o.timeoutMs, lookupTimeoutMs: o.lookupTimeoutMs, textTimeoutMs: o.textTimeoutMs };
   const code = 'const m=require(process.argv[1]);m.runChild(JSON.parse(process.argv[2])).then((c)=>{process.exitCode=c;});';
-  const child = spawn(process.execPath, ['-e', code, __filename, JSON.stringify(cfg)], { cwd: env.cwd, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawn(process.execPath, ['-e', code, __filename, JSON.stringify(cfg)], { cwd: env.cwd, env: { ...process.env, ...(o.env || {}) }, stdio: ['pipe', 'pipe', 'pipe'] });
   LIVE.add(child); child.on('close', () => LIVE.delete(child));
   const h = { child, stdout: '', stderr: '', waiters: [], exited: null };
   child.stdout.on('data', (c) => { h.stdout += c; h.waiters.forEach((w) => w()); });
@@ -1323,7 +1399,7 @@ function defineCases(cases, env) {
     for (const a of bad) { let threw = null; try { await api(...a, 1000); } catch (e) { threw = e; } check(threw instanceof GuardError, `not blocked: ${a[0]} ${a[1]} ${JSON.stringify(a[3]).slice(0, 70)}`); }
     check(si.posts.length === 0 && si.lists.length === 0 && si.requests.length === 0, 'nothing reached the stand-in');
     const rd = realDeps();
-    check(rd.textTimeoutMs === 2000, 'real run: 2 s text reply timeout');
+    check(rd.textTimeoutMs === 8000, 'real run: 8 s text reply timeout');
     si.comments = [mk(2, 'human')];
     const ok = await api(URL_, 'POST', hdr, body, 2000);
     check(ok.status === 200 && ok.json && typeof ok.json.id === 'string' && si.posts.length === 1, `a good post goes through (to the stand-in): ${JSON.stringify(ok).slice(0, 100)}`);
@@ -1630,7 +1706,7 @@ function defineCases(cases, env) {
     check(o.addressed === true && o.acked === null && o.text_acked === true && !('ack_error' in o), r.raw[0]);
   });
 
-  T('T85', 'notice lines that must do NOTHING: a participant from an agent actor or on a board, follower, an agent actor, comment.edited, an unknown item type, a malformed comment_id, a board notice with no task_id; each is printed back with addressed false, acked null, text_acked null, and no request of any kind is made', async () => {
+  T('T85', 'notice lines that must do NOTHING: a participant from an agent actor or on a board, follower, an agent actor, comment.edited, an unknown item type, a malformed comment_id, a board notice with no task_id; each is printed back with addressed false, acked null, text_acked null, and no write of any kind is made (a board or map thread read is allowed)', async () => {
     si.comments = [mk(930, 'human')];
     seedItem('board', itemRow(931, 'human'));
     const bad = [
@@ -1646,7 +1722,7 @@ function defineCases(cases, env) {
     const r = await runAll(env, bad);
     check(r.code === 0 && r.raw.length === bad.length, `lines ${r.raw.length} of ${bad.length} stderr ${r.stderr}`);
     r.out.forEach((o, i) => check(o.addressed === false && o.acked === null && o.text_acked === null && !('ack_error' in o), `line ${i}: ${r.raw[i]}`));
-    check(si.requests.length === 0 && si.lists.length === 0 && si.posts.length === 0 && si.itemReqs.length === 0, `requests ${si.requests.length} lists ${si.lists.length} posts ${si.posts.length} item posts ${si.itemReqs.length}`);
+    check(si.requests.length === 0 && si.lists.length === 0 && si.posts.length === 0 && si.itemReqs.every((x) => x.method === 'GET'), `requests ${si.requests.length} lists ${si.lists.length} posts ${si.posts.length} item writes ${si.itemReqs.filter((x) => x.method !== 'GET').length}`); // a board or map thread READ (GET) is allowed; no write
   });
 
   T('T86', 'a notice line and a listener line for the SAME comment in one process: one reaction and one text reply in total, in either order', async () => {
@@ -1743,7 +1819,7 @@ function defineCases(cases, env) {
     si.comments = [mk(1000, 'agent'), tagged(1001, 1000, '@Example agent hello')];
     const r = await runAll(env, [partNotice(1001, 1000, { actor_kind: 'agent' }), partNotice(1101, 1100, { item: { type: 'board', id: BOARD_ID }, task_id: TASK_ID }), partNotice(1110, 1110, { item: { type: 'map', id: MAP_ID } })]);
     check(r.code === 0 && r.raw.length === 3, `lines ${r.raw.length} stderr ${r.stderr}`);
-    check(si.lists.length === 0 && si.requests.length === 0 && si.posts.length === 0 && si.itemReqs.length === 0, `lists ${si.lists.length} reactions ${si.requests.length} posts ${si.posts.length} item posts ${si.itemReqs.length}`);
+    check(si.lists.length === 0 && si.requests.length === 0 && si.posts.length === 0 && si.itemReqs.every((x) => x.method === 'GET'), `lists ${si.lists.length} reactions ${si.requests.length} posts ${si.posts.length} item writes ${si.itemReqs.filter((x) => x.method !== 'GET').length}`); // the board and map thread READ (GET) is allowed; no write
     r.out.forEach((o, i) => check(o.addressed === false && o.acked === null && o.text_acked === null && !('ack_error' in o), `line ${i}: ${r.raw[i]}`));
   });
 
@@ -1756,6 +1832,136 @@ function defineCases(cases, env) {
     const r2 = await runAll(env, [threadLine(1201, '@Example agent please look', 1200), partNotice(1201, 1200)]);
     check(si.requests.length === 1 && si.posts.length === 1, `listener first: reactions ${si.requests.length} posts ${si.posts.length}`);
     check(r2.out[0].acked === true && r2.out[0].text_acked === true && r2.out[1].addressed === true && r2.out[1].acked === true && r2.out[1].text_acked === true, r2.raw.join(' | '));
+  });
+
+  // ==== Notice lines are built by the REAL noticeLine() of agent-listen.cjs from a fixture row (the row's ids are the stand-in's; nothing else is changed)
+  const FIX = require(path.join(__dirname, 'agent-listen-inbox-feed.fixture.json'));
+  const LISTEN = require(path.join(__dirname, 'agent-listen.cjs'));
+  const T0 = Date.UTC(2026, 9, 29, 4, 0, 0);
+  /** a DOCUMENT notice line: the fixture's first document row, its item and comment ids set to the stand-in's; rootNull drops thread_id; extra keys (catchup, reraise, reason, verb) are added after the real keys */
+  const fixNotice = (n, root, extra, rootNull) => { const row = JSON.parse(JSON.stringify(FIX.document.feed.notifications[0])); row.item.id = DOC; row.object.id = cid(n); row.thread_id = rootNull ? null : cid(root); return JSON.stringify({ ...LISTEN.noticeLine(row, T0), ...(extra || {}) }); };
+  /** a BOARD or MAP notice line from the fixture's first row of that kind, with the stand-in's ids; extra keys as above */
+  const fixItemNotice = (kind, n, root, extra) => { const row = JSON.parse(JSON.stringify(FIX[kind].feed.notifications[0])); row.item.id = kind === 'board' ? BOARD_ID : MAP_ID; row.object.id = cid(n); row.thread_id = cid(root); if (kind === 'board') row.target.id = TASK_ID; return JSON.stringify({ ...LISTEN.noticeLine(row, T0), ...(extra || {}) }); };
+  const itemPosts = (kind) => si.itemReqs.filter((x) => x.method === 'POST' && x.url === (kind === 'board' ? `/boardsApi/tasks/${TASK_ID}/comments` : `/mapsApi/maps/${MAP_ID}/comments`));
+
+  T('T95', 'F2 (cause: the text reply has a 2 s timeout, shorter than the server, which stores the comment before it answers): a notice line from the real noticeLine(); the stand-in stores the Seen reply and answers after 2.5 s: text_acked true, one text reply, acked true, no ack_error', async () => {
+    si.comments = [mk(960, 'human')];
+    si.behave = (rec) => (rec.post ? { delayMs: 2500 } : null);
+    const r = await runAll(env, [fixNotice(960, 960, {})]);
+    check(r.code === 0 && si.posts.length === 1 && NOTICE_TEXT_RE.test(JSON.parse(si.posts[0].raw).body), `posts ${si.posts.length} ${r.raw[0]}`);
+    check(r.out[0].acked === true && r.out[0].text_acked === true && !('ack_error' in r.out[0]), r.raw[0]);
+  });
+
+  T('T95a', 'F2, network-secret mode (no key file, HTTPS_PROXY set): a notice line gets the eyes and the Seen text, text_acked true; the placeholder key is the only key sent', async () => {
+    si.placeholderKey = true; si.comments = [mk(961, 'human')];
+    const r = await runAll(env, [fixNotice(961, 961, {})], { configPath: env.writeConfig({ key_file: undefined }), env: { HTTPS_PROXY: 'http://127.0.0.1:9' } });
+    check(si.posts.length === 1 && r.out[0].text_acked === true && r.out[0].acked === true, `${r.raw[0]} | ${r.stderr}`);
+    check(si.posts[0].headers['x-spm-api-key'] === 'network-secret' && !r.stdout.includes(FAKE_KEY), 'placeholder key only');
+  });
+
+  T('T95b', 'F2, input from a file (the notice line written to a file, read back, one JSON object per line): the same result as a pipe, text_acked true', async () => {
+    si.comments = [mk(962, 'human')];
+    const f = path.join(env.runDir, 'notice-line.jsonl'); fs.writeFileSync(f, fixNotice(962, 962, {}) + '\n');
+    const r = await runAll(env, fs.readFileSync(f, 'utf8').split('\n').filter(Boolean));
+    check(si.posts.length === 1 && r.out[0].text_acked === true, r.raw[0]);
+  });
+
+  T('T95c', 'F2 candidate, a notice line whose thread_root_id is null: nothing to reply under, so no Seen text is sent and text_acked is null; the eyes still go', async () => {
+    si.comments = [mk(963, 'human')];
+    const r = await runAll(env, [fixNotice(963, 963, {}, true)]);
+    check(si.posts.length === 0 && r.out[0].text_acked === null && r.out[0].acked === true, r.raw[0]);
+  });
+
+  T('T96', 'F1b: a catch-up or re-raise document notice where the agent already wrote AFTER the noticed comment: no reaction, no text, already_answered true, addressed true, acked and text_acked null; the key sits just before text_acked', async () => {
+    for (const extra of [{ catchup: true }, { reraise: 2 }]) {
+      si.reset(); si.comments = [mk(970, 'human'), mk(971, 'human', 970), mk(972, 'agent', 970)];
+      const r = await runAll(env, [fixNotice(971, 970, extra)]);
+      const o = r.out[0];
+      check(si.requests.length === 0 && si.posts.length === 0, `${JSON.stringify(extra)}: reactions ${si.requests.length} posts ${si.posts.length}`);
+      check(o.addressed === true && o.already_answered === true && o.acked === null && o.text_acked === null && !('ack_error' in o) && Object.keys(o).slice(-2).join() === 'already_answered,text_acked', `${JSON.stringify(extra)}: ${r.raw[0]}`);
+    }
+  });
+
+  T('T97', 'F1b: a catch-up document notice where the agent has NOT written after the noticed comment: one thread read, then the eyes and the Seen text as for a live line; no already_answered key', async () => {
+    si.comments = [mk(980, 'human'), mk(981, 'human', 980)];
+    const r = await runAll(env, [fixNotice(981, 980, { catchup: true })]);
+    const o = r.out[0];
+    check(si.lists.length === 1 && si.requests.length === 1 && si.posts.length === 1 && o.acked === true && o.text_acked === true && !('already_answered' in o), `lists ${si.lists.length} ${r.raw[0]}`);
+  });
+
+  T('T98', 'F1b: a catch-up document notice whose thread read fails (HTTP 500), or whose noticed comment is missing from the list: no reaction, no text, ack_error lookup, acked and text_acked null', async () => {
+    si.comments = [mk(990, 'human'), mk(991, 'human', 990)];
+    si.behave = (rec) => (rec.list ? { status: 500 } : null);
+    const r = await runAll(env, [fixNotice(991, 990, { catchup: true })]);
+    check(si.requests.length === 0 && si.posts.length === 0 && r.out[0].ack_error === 'lookup' && r.out[0].acked === null && r.out[0].text_acked === null && r.out[0].addressed === true, `500: ${r.raw[0]}`);
+    si.reset(); si.comments = [mk(992, 'human')];
+    const r2 = await runAll(env, [fixNotice(993, 992, { catchup: true })]);
+    check(si.requests.length === 0 && si.posts.length === 0 && r2.out[0].ack_error === 'lookup', `missing: ${r2.raw[0]}`);
+  });
+
+  T('T99', 'F1b: a catch-up document notice with thread_root_id null: nothing to check the thread under, so NO request of any kind; skipped no_lookup, addressed true, acked and text_acked null', async () => {
+    si.comments = [mk(1000, 'human')];
+    const r = await runAll(env, [fixNotice(1000, 1000, { catchup: true }, true)]);
+    const o = r.out[0];
+    check(si.requests.length === 0 && si.lists.length === 0 && si.posts.length === 0 && o.skipped === 'no_lookup' && o.addressed === true && o.acked === null && o.text_acked === null, r.raw[0]);
+  });
+
+  T('T100', 'F1b: a catch-up BOARD or MAP notice reads its thread first (GET comment list): answered after the noticed comment gives no post and already_answered true; not answered gets ONE text reply, no reaction; a failed read gives ack_error lookup and no post', async () => {
+    for (const kind of ['board', 'map']) {
+      const row = (n, by, parent) => ({ ...itemRow(n, by, parent) });
+      si.reset(); seedItem(kind, row(1030, 'human'), row(1031, 'human', 1030), row(1032, 'agent', 1030));
+      const a = await runAll(env, [fixItemNotice(kind, 1031, 1030, { catchup: true })]);
+      check(itemPosts(kind).length === 0 && si.requests.length === 0 && a.out[0].already_answered === true && a.out[0].acked === null && a.out[0].text_acked === null && a.out[0].addressed === true, `${kind} answered: ${a.raw[0]} posts ${itemPosts(kind).length}`);
+      si.reset(); seedItem(kind, row(1040, 'human'), row(1041, 'human', 1040));
+      const b = await runAll(env, [fixItemNotice(kind, 1041, 1040, { catchup: true })]);
+      check(itemPosts(kind).length === 1 && si.requests.length === 0 && b.out[0].text_acked === true && b.out[0].acked === null && !('already_answered' in b.out[0]), `${kind} not answered: ${b.raw[0]}`);
+      si.reset(); seedItem(kind, row(1050, 'human'), row(1051, 'human', 1050)); si.behave = (rec) => (rec.method === 'GET' && rec.itemPost === false && rec.url.includes('/comments') ? { status: 500 } : null);
+      const c = await runAll(env, [fixItemNotice(kind, 1051, 1050, { catchup: true })]);
+      check(itemPosts(kind).length === 0 && si.requests.length === 0 && c.out[0].ack_error === 'lookup' && c.out[0].text_acked === null, `${kind} read failed: ${c.raw[0]}`);
+    }
+  });
+
+  T('T101', 'B1: the board and map comment LIST (GET) passes the guard only with the two key headers and no body; every near miss is refused before any call', async () => {
+    const L = `https://${'asia-south1-litethink.cloudfunctions.net'}`;
+    const TL = `${L}/boardsApi/tasks/${TASK_ID}/comments`; const ML = `${L}/mapsApi/maps/${MAP_ID}/comments`;
+    const H = { 'X-SPM-API-Key': FAKE_KEY, 'X-SPM-User-Email': FAKE_EMAIL };
+    for (const u of [TL, ML]) { let threw = null; try { guardApi(u, 'GET', H, undefined); } catch (e) { threw = e; } check(!threw, `allowed ${u}: ${threw && threw.message}`); }
+    const bad = [
+      [TL, 'GET', { ...H, Origin: ORIGIN }, undefined], [TL, 'GET', { ...H, Authorization: 'Bearer x' }, undefined], [TL, 'GET', { 'X-SPM-API-Key': FAKE_KEY }, undefined], [TL, 'GET', H, {}],
+      [`${TL}?x=1`, 'GET', H, undefined], [`${TL}/`, 'GET', H, undefined], [`${L}/boardsApi/tasks/${TASK_ID.toUpperCase()}/comments`, 'GET', H, undefined],
+      [`https://us-central1-litethink.cloudfunctions.net/boardsApi/tasks/${TASK_ID}/comments`, 'GET', H, undefined], [`https://evil.example.net/boardsApi/tasks/${TASK_ID}/comments`, 'GET', H, undefined],
+      [`${L}/boardsApi/tasks/${TASK_ID}/activity`, 'GET', H, undefined], [`${L}/mapsApi/tasks/${TASK_ID}/comments`, 'GET', H, undefined], [TL, 'PUT', H, undefined], [TL, 'DELETE', H, undefined],
+      [TL, 'GET', { ...H, 'X-SPM-Workspace': 'ws' }, undefined],
+    ];
+    for (const a of bad) { let threw = null; try { guardApi(...a); } catch (e) { threw = e; } check(threw instanceof GuardError, `not refused: ${a[0]} ${a[1]} ${JSON.stringify(Object.keys(a[2]))}`); }
+  });
+
+  T('T102', 'F5: a BOARD participant notice whose comment tags this agent (read from the board thread) gets the Seen text: one board text reply under the thread root, no reaction, addressed true, reason participant kept', async () => {
+    seedItem('board', itemRow(1060, 'agent'), { ...itemRow(1061, 'human', 1060), body: '@Example agent please look' });
+    const r = await runAll(env, [fixItemNotice('board', 1061, 1060, { reason: 'participant', verb: 'comment.replied' })]);
+    const p = itemPosts('board');
+    check(si.requests.length === 0 && p.length === 1 && JSON.parse(p[0].raw).parent_id === cid(1060) && NOTICE_TEXT_RE.test(JSON.parse(p[0].raw).body), `posts ${p.length} reactions ${si.requests.length} ${r.raw[0]}`);
+    check(r.out[0].addressed === true && r.out[0].text_acked === true && r.out[0].reason === 'participant', r.raw[0]);
+  });
+
+  T('T103', 'F5: a BOARD participant notice whose comment does NOT tag this agent gets nothing: no post, addressed false', async () => {
+    seedItem('board', itemRow(1070, 'agent'), { ...itemRow(1071, 'human', 1070), body: 'thanks, that is done' });
+    const r = await runAll(env, [fixItemNotice('board', 1071, 1070, { reason: 'participant', verb: 'comment.replied' })]);
+    check(itemPosts('board').length === 0 && si.requests.length === 0 && r.out[0].addressed === false && r.out[0].text_acked === null, r.raw[0]);
+  });
+
+  T('T104', 'F5: a MAP participant notice whose comment tags this agent gets one map text reply under the thread root; no reaction', async () => {
+    seedItem('map', itemRow(1080, 'agent'), { ...itemRow(1081, 'human', 1080), body: '@Example agent check node 3' });
+    const r = await runAll(env, [fixItemNotice('map', 1081, 1080, { reason: 'participant', verb: 'comment.replied' })]);
+    const p = itemPosts('map');
+    check(si.requests.length === 0 && p.length === 1 && JSON.parse(p[0].raw).parent_id === cid(1080) && r.out[0].text_acked === true && r.out[0].addressed === true, `${r.raw[0]} posts ${p.length}`);
+  });
+
+  T('T105', 'live lines unchanged: a LIVE document notice where the agent already wrote after the noticed comment still gets the eyes and the Seen text, with no thread read and no already_answered key', async () => {
+    si.comments = [mk(1090, 'human'), mk(1091, 'human', 1090), mk(1092, 'agent', 1090)];
+    const r = await runAll(env, [fixNotice(1091, 1090, {})]);
+    const o = r.out[0];
+    check(si.lists.length === 0 && si.requests.length === 1 && si.posts.length === 1 && o.acked === true && o.text_acked === true && !('already_answered' in o) && Object.keys(o).slice(-3).join() === 'addressed,acked,text_acked', r.raw[0]);
   });
 
 
