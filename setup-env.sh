@@ -22,7 +22,7 @@
 #   ~/.claude/skills/spm-agent/SKILL.md   copied from skill/spm-agent/SKILL.md, with the literal
 #                                         /root/spm-agent-kit replaced by this kit folder and
 #                                         /root/.spm-agent-state by $HOME/.spm-agent-state; replaced on every run
-#   ~/.claude/settings.json               the seven allow rules (absolute, from this kit folder) merged in; other keys and rules kept;
+#   ~/.claude/settings.json               the eight allow rules (absolute, from this kit folder) merged in; other keys and rules kept;
 #                                         written through a temp file in the same folder, then renamed; no change when already there
 #   ~/.claude/CLAUDE.md                   (Addendum B1) the block from <kit>/hook/claude-md-block.md, between the lines
 #                                         <!-- spm-agent-kit:start --> and <!-- spm-agent-kit:end -->; the two literal paths replaced;
@@ -206,6 +206,7 @@ const RULES = [
   `Bash(node ${KIT}/agent-selfcheck.cjs *)`,
   `Bash(bash ${KIT}/start.sh *)`,
   `Bash(node ${KIT}/agent-health.cjs *)`,
+  `Bash(bash ${KIT}/agent-wait.sh *)`,
 ];
 const BLOCK_FILE = path.join(KIT, 'hook', 'claude-md-block.md');
 const START_MARK = '<!-- spm-agent-kit:start -->';

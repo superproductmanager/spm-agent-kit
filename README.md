@@ -61,7 +61,7 @@ f=$(mktemp) && curl --proto '=https' -fsSL https://raw.githubusercontent.com/sup
 - `setup-env.sh` then writes what Claude needs into the user's own Claude folder, which every session reads:
   - `~/.spm-agent-state/config.json` (folder 0700, file 0600): the agent's name and address, `app_id`, plus `ignore_agents` and `transport` when you give them. No key and no session id. Rewritten on every run. An agent block already there is kept when you give no `--name` and `--email`.
   - `~/.claude/skills/spm-agent/SKILL.md`: copied from the kit's `skill/spm-agent/SKILL.md`, with the kit folder filled in. Replaced on every run.
-  - `~/.claude/settings.json`: the seven allow rules under "Allow rules" below are merged in. Other keys and rules are kept. A file that is a symbolic link, is not valid JSON, or is not a JSON object is refused with exit code 2 and left untouched.
+  - `~/.claude/settings.json`: the eight allow rules under "Allow rules" below are merged in. Other keys and rules are kept. A file that is a symbolic link, is not valid JSON, or is not a JSON object is refused with exit code 2 and left untouched.
   - `~/.claude/CLAUDE.md`: a short block between the two marker lines `<!-- spm-agent-kit:start -->` and `<!-- spm-agent-kit:end -->`. It tells each new session to start the agent (see "Settings"). A re-run replaces only the block. Text outside the markers is kept byte for byte. With `--autostart off` no block is written, and the kit's block is removed if it is there.
   - `~/.spm-agent-state/setup-report.jsonl` (file 0600): one line per setup step (config, skill, claude-md, settings, sdk) with the step's name, pass or fail, a short code, and a run id. It holds no key, no path and no conversation text. Health reports send it later.
   - `~/.spm-agent-state/report-salt` (file 0600): 32 random hex characters, written once and kept on every later run. The kit mixes it into session ids before a report leaves the machine, so SPM never sees a raw session id. It is never sent.
@@ -126,7 +126,7 @@ A local off wins. When the config says `"report": false`, nothing is sent, even 
 
 ## Allow rules
 
-Setup adds these seven `permissions.allow` rules to `~/.claude/settings.json`, so the agent runs its own scripts without a prompt for each call. The kit never sets the permission mode. Each rule is built from the kit folder that `setup-env.sh` ran from (`<kit>` below), so the rules are absolute:
+Setup adds these eight `permissions.allow` rules to `~/.claude/settings.json`, so the agent runs its own scripts without a prompt for each call. The kit never sets the permission mode. Each rule is built from the kit folder that `setup-env.sh` ran from (`<kit>` below), so the rules are absolute:
 
 - `Bash(node <kit>/agent-reply.cjs *)`
 - `Bash(node <kit>/agent-ack.cjs *)`
@@ -135,6 +135,7 @@ Setup adds these seven `permissions.allow` rules to `~/.claude/settings.json`, s
 - `Bash(node <kit>/agent-selfcheck.cjs *)`
 - `Bash(bash <kit>/start.sh *)`
 - `Bash(node <kit>/agent-health.cjs *)`
+- `Bash(bash <kit>/agent-wait.sh *)`
 
 A command matches a rule only when it starts with that same absolute path, unquoted (for example `node <kit>/agent-reply.cjs --config ...`). A variable or a quoted path does not match, and Claude will ask for approval. The skill is written with the kit path already filled in, so its commands match these rules.
 
@@ -148,6 +149,7 @@ A command matches a rule only when it starts with that same absolute path, unquo
 | `agent-resolve.cjs` | Marks a notice as resolved, so the listener stops raising it again. |
 | `agent-selfcheck.cjs` | Runs checks on the settings file, the key and the server. Prints one cause and one fix for each failure. |
 | `agent-health.cjs` | Reads the agent's identity and settings from SPM at start, sends health reports, and changes the settings when the person asks. |
+| `agent-wait.sh` | The listener session's wait: ends at the first new notice, FAIL or fatal line in the listener log, or after `--seconds` (default 7200). Prints `notice`, `fail` or `timeout`. |
 | `start.sh` | Runs the selfcheck, then the listener in the foreground with restarts (see "Start the listener"). |
 | `agent-relay.cjs` | Keeps a record of which notices were handed over, so none is dropped or repeated. |
 | `agent-keepalive.sh` | Restarts a command when it exits, and appends its output to a log file. |
@@ -198,7 +200,7 @@ bash start.sh --config <absolute path to the settings file> [--state-dir <absolu
 
 ### Listener waits
 
-The listener session waits in background waits of two hours, not in a 30-minute watch. A wait ends at the first new notice or failure line in the log, or after two hours. Its end wakes the session: it hands over the notices, checks that the listener is still running (starting it again if not), and sends one heartbeat. Then it starts the next wait. A cloud session stops background programs after two hours, so a wait never runs longer than that.
+The listener session waits in background waits of two hours, not in a 30-minute watch. Each wait is `agent-wait.sh --log <state>/listener.log`, which ends at the first new notice, FAIL or fatal line written after it starts, or after two hours. Its end wakes the session: it hands over the notices, checks that the listener is still running (starting it again if not), and sends one heartbeat. Then it starts the next wait. A cloud session stops background programs after two hours, so a wait never runs longer than that.
 
 ### Notice lines
 

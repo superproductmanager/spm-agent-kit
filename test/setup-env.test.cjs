@@ -15,7 +15,7 @@ const NAME = 'Example agent';
 const EMAIL = 'spm-example-agent@agents.invalid';
 const APP_ID = 'example-app-id-0000000000000000';
 
-// The seven allow rules, absolute, built from the kit folder that setup-env.sh runs from (0.2.0 adds agent-health last).
+// The eight allow rules, absolute, built from the kit folder that setup-env.sh runs from (0.2.0 adds agent-health; 0.2.1 adds agent-wait last).
 function rulesFor(kit) {
   return [
     `Bash(node ${kit}/agent-reply.cjs *)`,
@@ -25,6 +25,7 @@ function rulesFor(kit) {
     `Bash(node ${kit}/agent-selfcheck.cjs *)`,
     `Bash(bash ${kit}/start.sh *)`,
     `Bash(node ${kit}/agent-health.cjs *)`,
+    `Bash(bash ${kit}/agent-wait.sh *)`,
   ];
 }
 
@@ -378,7 +379,7 @@ test('an existing skill file is replaced on every run', () => {
 
 // ---- settings.json merge ----
 
-test('absent settings.json: created at 0600 with exactly the seven absolute rules, in order', () => {
+test('absent settings.json: created at 0600 with exactly the eight absolute rules, in order', () => {
   const sb = sandbox();
   try {
     assert.equal(fs.existsSync(CLAUDE_DIR(sb)), false);
@@ -398,7 +399,7 @@ test('a missing ~/.claude folder is created at 0700', () => {
   } finally { cleanup(sb); }
 });
 
-test('settings with other keys and rules keeps them all and appends only the seven missing rules', () => {
+test('settings with other keys and rules keeps them all and appends only the eight missing rules', () => {
   const sb = sandbox();
   try {
     const before = {
@@ -428,7 +429,7 @@ test('rules already present are not duplicated; the missing ones are appended in
     fs.writeFileSync(SETTINGS(sb), JSON.stringify({ permissions: { allow: [R[1], 'Bash(x)', R[4]] } }));
     const r = runSetup(sb, ok(['--no-sdk']));
     assert.equal(r.status, 0, r.stderr);
-    assert.deepEqual(readJson(SETTINGS(sb)).permissions.allow, [R[1], 'Bash(x)', R[4], R[0], R[2], R[3], R[5], R[6]]);
+    assert.deepEqual(readJson(SETTINGS(sb)).permissions.allow, [R[1], 'Bash(x)', R[4], R[0], R[2], R[3], R[5], R[6], R[7]]);
   } finally { cleanup(sb); }
 });
 
@@ -455,7 +456,7 @@ test('an existing settings.json keeps its file mode when it is rewritten', () =>
   } finally { cleanup(sb); }
 });
 
-test('an empty or whitespace-only settings.json is treated as {} and gets the seven rules, keeping its mode', () => {
+test('an empty or whitespace-only settings.json is treated as {} and gets the eight rules, keeping its mode', () => {
   for (const text of ['', '   \n\t ']) {
     const sb = sandbox();
     try {
@@ -583,7 +584,7 @@ test('a kit with no VERSION file reports version dev', () => {
   } finally { cleanup(sb); }
 });
 
-test('a checkout with no VERSION file (the real setup-env.sh) runs with --no-sdk, says dev, and gets all seven rules', () => {
+test('a checkout with no VERSION file (the real setup-env.sh) runs with --no-sdk, says dev, and gets all eight rules', () => {
   const sb = sandbox();
   try {
     const r = runSetup(sb, ok(['--no-sdk']));

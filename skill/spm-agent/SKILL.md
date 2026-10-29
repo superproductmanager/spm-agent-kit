@@ -59,7 +59,7 @@ Read a hand-over at once, before any other work in this session, and answer it i
    - The `reason` is `follower`, or `participant` and the comment does not tag the agent: post nothing and make no reply. Go to step 4 to resolve the notice, then stop. Follower and untagged notices are never answered.
    - Otherwise answer it (steps 2 and 3). A line with `"catchup": true` or `"reraise"` is answered the same way.
 2. Work out what the tagging person asks. Use only the sources rule 6 allows.
-3. Write the reply text to a file with your file tool, then post it as the agent (through this script only, never the SPM connector's comment tool):
+3. Write the reply text to a file with your file tool, then post it with the script in rule 1:
 
    `node /root/spm-agent-kit/agent-reply.cjs --config /root/.spm-agent-state/config.json --document <item id> --to <comment_id> --text-file <file>`
 
@@ -89,14 +89,14 @@ The main session id is in your first message, and in any later "Main session id"
 ### Start
 
 1. Start the listener as a background task, with the longest timeout allowed: `bash /root/spm-agent-kit/start.sh --config /root/.spm-agent-state/config.json`. If it prints FAIL lines, send each line to the main session with `send_message` and stop. Do not try to fix a key or a network secret yourself.
-2. Arm the wait: run this as a background command, with the longest timeout allowed (`run_in_background` and `timeout` 7200000, two hours): `n=$(wc -c < /root/.spm-agent-state/listener.log); timeout 7200 bash -c 'until tail -c +'$((n+1))' /root/.spm-agent-state/listener.log | grep -q -E "\"kind\": ?\"notice\"|FAIL|fatal|exit"; do sleep 5; done'`. It ends at the first new notice or failure line, or after two hours. Its end wakes this session. Never use a Monitor for this wait.
+2. Arm the wait: run `bash /root/spm-agent-kit/agent-wait.sh --log /root/.spm-agent-state/listener.log` as a background command, with the longest timeout allowed (`run_in_background` and `timeout` 7200000, two hours). It ends at the first new notice, FAIL or fatal line in the log, or after two hours, and it prints `notice`, `fail` or `timeout`. Its end wakes this session.
 3. Run the hand-over loop once now, for notices from before the start.
 4. If this session has no hourly safety task yet, create one: a scheduled task that fires into THIS session every hour, with the message `SPM agent hourly check: run the Hourly check steps of the spm-agent skill.` Create it once, and never a second one.
 
 ### Keeping it running
 
 - **Background task ended:** a cloud session stops background programs after two hours, and its end wakes this session. When the start command's background task ends, for any reason, run Start step 1 again.
-- **Wait ended:** the wait in Start step 2 ends at a new notice or failure line, or after two hours, and its end wakes this session. Run the hand-over loop, then arm the wait again (Start step 2).
+- **Wait ended:** the wait in Start step 2 ends at a new notice or failure line, or after two hours, and its end wakes this session. Run the Hourly check steps, which include the hand-over loop and arm the next wait.
 - **Hourly check:** covers anything missed above, including a container restart.
 
 ### Hand-over loop
@@ -107,8 +107,8 @@ Run it at every wake of the wait, and repeat it until `next` prints nothing. For
 2. Send that exact line to the main session with `send_message`. Start the message with: `SPM agent hand-over. Answer per the spm-agent skill, main session.` If the send fails, stop here. Do not mark the notice and do not post "Seen"; the next run retries it.
 3. Mark it handed over: `node /root/spm-agent-kit/agent-relay.cjs done <notification_id> --state /root/.spm-agent-state/relay.json`.
 4. Post "Seen": write the notice line to `/root/.spm-agent-state/ack-line.json` (with your file tool), then run `node /root/spm-agent-kit/agent-ack.cjs --config /root/.spm-agent-state/config.json < /root/.spm-agent-state/ack-line.json`. If the output line has `"text_acked":true`, mark it: `node /root/spm-agent-kit/agent-relay.cjs seen <notification_id> --state /root/.spm-agent-state/relay.json`.
-   - If the output line has `"already_answered":true`, the agent already answered that thread, so post nothing. Resolve the notice: `node /root/spm-agent-kit/agent-resolve.cjs --config /root/.spm-agent-state/config.json --ids <notification_id>`.
-   - If the notice's `reason` is `follower`, skip this step (no "Seen"). The main session resolves it.
+   - If the output line has `"already_answered":true` or `"skipped"`, nothing was posted, by design. Mark it seen (`agent-relay.cjs seen`, as above), so the Seen retry does not list it again, and resolve it: `node /root/spm-agent-kit/agent-resolve.cjs --config /root/.spm-agent-state/config.json --ids <notification_id>`.
+   - If the notice's `reason` is `follower`, post nothing. Mark it seen (`agent-relay.cjs seen`) and leave it to the main session to resolve.
 
 "Seen" is never posted before step 2 succeeds.
 
@@ -124,8 +124,8 @@ Run it at every wake of the wait, and repeat it until `next` prints nothing. For
 1. Run Start step 1 again. If the listener is still running, it prints one line and starts nothing. If it had stopped, this starts it.
 2. Arm the wait (Start step 2) if it is not running.
 3. Run the hand-over loop and the Seen retry once.
-4. At each wake, send the health numbers (no text). Call `get_session` with the main session id and note its `status_bucket`. Then run `node /root/spm-agent-kit/agent-health.cjs heartbeat --config /root/.spm-agent-state/config.json --main-status <status_bucket>` (use `unknown` when there is none), and `node /root/spm-agent-kit/agent-health.cjs usage --role listener --config /root/.spm-agent-state/config.json`. Each prints one line; do not retry them, and send them to the main session only when a line starts with `health: SPM refused`.
+4. Send the health numbers (no text). Call `get_session` with the main session id and note its `status_bucket`. Then run `node /root/spm-agent-kit/agent-health.cjs heartbeat --config /root/.spm-agent-state/config.json --main-status <status_bucket>` (use `unknown` when there is none), and `node /root/spm-agent-kit/agent-health.cjs usage --role listener --config /root/.spm-agent-state/config.json`. Each prints one line; do not retry them, and send them to the main session only when a line starts with `health: SPM refused`.
 
 ### Health
 
-- If the wait ended on a FAIL, fatal or exit line, run `node /root/spm-agent-kit/agent-selfcheck.cjs --config /root/.spm-agent-state/config.json` and send its cause line to the main session.
+- If the wait printed `fail`, run `node /root/spm-agent-kit/agent-selfcheck.cjs --config /root/.spm-agent-state/config.json` and send its cause line to the main session.
