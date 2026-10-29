@@ -204,5 +204,104 @@
         "message": "X-SPM-User-Email must be the owner of this API key (or be left out)"
       }
     }
+  },
+  "unresolved": {
+    "page_1": {
+      "notifications": [
+        {
+          "id": "00000000-0000-4000-8000-000000000101",
+          "seq": 1,
+          "verb": "comment.created",
+          "reason": "mentioned",
+          "lane": "needs_you",
+          "created_at": "2026-10-04T05:00:00.000Z",
+          "read_at": null,
+          "resolved_at": null,
+          "resolution": null,
+          "actor": {
+            "kind": "human",
+            "name": "Example person"
+          },
+          "item": {
+            "type": "document",
+            "id": "00000000-0000-4000-8000-000000000002"
+          },
+          "object": {
+            "type": "comment",
+            "id": "00000000-0000-4000-8000-000000000103"
+          },
+          "thread_id": "00000000-0000-4000-8000-000000000103",
+          "item_seq": 1,
+          "target": null
+        }
+      ],
+      "cursor": 1,
+      "latest": 2,
+      "has_more": true
+    },
+    "page_2": {
+      "notifications": [
+        {
+          "id": "00000000-0000-4000-8000-000000000102",
+          "seq": 2,
+          "verb": "comment.created",
+          "reason": "mentioned",
+          "lane": "needs_you",
+          "created_at": "2026-10-04T05:00:00.000Z",
+          "read_at": null,
+          "resolved_at": null,
+          "resolution": null,
+          "actor": {
+            "kind": "human",
+            "name": "Example person"
+          },
+          "item": {
+            "type": "document",
+            "id": "00000000-0000-4000-8000-000000000002"
+          },
+          "object": {
+            "type": "comment",
+            "id": "00000000-0000-4000-8000-000000000104"
+          },
+          "thread_id": "00000000-0000-4000-8000-000000000104",
+          "item_seq": 2,
+          "target": null
+        }
+      ],
+      "cursor": 2,
+      "latest": 2,
+      "has_more": false
+    },
+    "no_paging": {
+      "notifications": [
+        {
+          "id": "00000000-0000-4000-8000-000000000101",
+          "seq": 1,
+          "verb": "comment.created",
+          "reason": "mentioned",
+          "lane": "needs_you",
+          "created_at": "2026-10-04T05:00:00.000Z",
+          "read_at": null,
+          "resolved_at": null,
+          "resolution": null,
+          "actor": {
+            "kind": "human",
+            "name": "Example person"
+          },
+          "item": {
+            "type": "document",
+            "id": "00000000-0000-4000-8000-000000000002"
+          },
+          "object": {
+            "type": "comment",
+            "id": "00000000-0000-4000-8000-000000000103"
+          },
+          "thread_id": "00000000-0000-4000-8000-000000000103",
+          "item_seq": 1,
+          "target": null
+        }
+      ],
+      "latest": 1
+    }
   }
 }

@@ -24,7 +24,9 @@
  *     "comment_id", "thread_root_id", "task_id" (a BOARD row only, else null), "target" ({ "type", "id" } or null), "item_seq", "actor_kind": "human"|"agent" }
  * WHICH FIELD FEEDS WHICH agent-reply.cjs FLAG (always --to <comment_id>; the reply goes under thread_root_id by itself): a DOCUMENT row: --document <item.id>; a BOARD row: --task <task_id> (item.id is the board; board comments
  * hang on tasks); a MAP row: --map <item.id>. To READ the text first, use the item's own comment-events read with since = item_seq - 1 (documents: listDocumentCommentEvents, boards and maps: .../comment-events).
- * FIRST RUN: one read with state=unresolved (since=0). It prints the unresolved notices of the last 24 hours, at most 20, as notice lines, then the cursor is the feed's latest and the stream goes on. A feed reply with no signal_id is fatal.
+ * CATCH-UP KEY: a line printed by the FIRST RUN carries "catchup": true (after every key above). So does a line printed by a normal read after a restart when its row is older than 10 minutes (missed while the listener was down). A fresh live line and a re-raise line carry no catchup key.
+ * A notices reply with no cursor or no has_more is read as ONE page, and one stderr line says so.
+ * FIRST RUN: the unresolved notices (state=unresolved, read from since=0 page by page, at most 20 pages of 100 rows). It prints the NEWEST 20 of those from the last 24 hours, oldest first, as notice lines with "catchup": true; then the cursor is the feed's largest latest and the stream goes on. A failed page fails the whole first run (nothing printed, no cursor saved, retried). A feed reply with no signal_id is fatal.
  * CURSOR FILE: its own file { "inbox_seq": <last seq> } (written atomically AFTER the lines are printed: at least once, never lost). A file that holds per-item cursors (a document, board or map listener's file) is refused
  * with a plain message, exit 2, before any call (and a per-item listener refuses an inbox file the same way). --mode once: wait for the first batch that printed a notice, print it, exit 0; stream: keep going.
  * POLL: none. --poll-ms is refused for --inbox (exit 2). Reads happen on a marker bump (one read in flight; a bump during a read re-runs it once), on the first server snapshot after each subscription, and never on a timer, except the RE-RAISE pass (stream mode, below) and the retry after a failed read (5 s, 15 s, 45 s, then every 120 s, until one read succeeds; a bump reads at once and cancels that wait). ERRORS: 401, 403, 400 or 404 print ONE clear line and exit 1 (no retry); 429 waits Retry-After seconds (1 to 3600, else 60); a network failure or a 5xx
@@ -33,8 +35,8 @@
  * carries no address to compare, so a row about the agent's own comment cannot reach the feed. A row whose ACTOR is another agent IS printed (a tag by another agent is a tag).
  *
  * RE-RAISE. The notices are read once and the cursor moves past them, so a notice the agent did not act on (its chat was compacted, say) would never come back.
- * So every 5 minutes (REraise_MS) the stream also makes ONE read, GET ...?since=0&limit=100&state=unresolved, and prints again each unresolved notice older than 5 minutes and younger than 24 hours: the same notice line plus "reraise": <n> (1 on the first re-raise of that id in this process, then 2, 3 ...).
- * At most 20 lines a pass, oldest first; the rest wait for a later pass. The pass never moves the cursor and never POSTs. A failed read prints one stderr line and the next pass tries again. Once mode has no re-raise pass.
+ * So every 5 minutes (REraise_MS) the stream also makes the re-raise read, GET ...?since=0&limit=100&state=unresolved (at most 10 pages of 100 rows; the first error or 429 ends the pass, and the next pass tries again), and prints again each unresolved notice older than 5 minutes and younger than 24 hours: the same notice line plus "reraise": <n> (1 on the first re-raise of that id in this process, then 2, 3 ...).
+ * A FOLLOWER row is never re-raised. At most 20 lines a pass: the NEWEST are kept and printed oldest first; the older ones are not printed in that pass. The pass never moves the cursor and never POSTs. A failed read prints one stderr line and the next pass tries again. Once mode has no re-raise pass.
  * FLOW. (1) POST getRealtimeToken (asia-south1) with X-SPM-API-Key and the typed X-SPM-User-Email, body {}, no Origin. (2) Sign in through the Firebase SDK (signInWithCustomToken, the same Referer and web API key source as the canary). The refresh token lives in memory only;
  * the SDK refreshes the ID token itself. A failed mint or sign-in retries with backoff, and the listens start only after the sign-in works. (3) Per document, ONE
  * events read with a cursor above any seq answers { reset: true, latest, signal_id }: the signal id and the current max seq. A reply with no signal id stops the listener with one clear line and exit 1. The cursor file holds
@@ -710,6 +712,9 @@ function noticeLine(row, tMs) {
  * unresolved notices of the last 24 hours (at most 20) as catch-up lines, then streams. */
 const INBOX_CATCHUP_MS = 24 * 60 * 60 * 1000;
 const INBOX_CATCHUP_MAX = 20;
+const INBOX_PAGES_MAX = 20; // the first run reads at most this many pages of the feed (100 rows each)
+const RERAISE_PAGES_MAX = 10; // a re-raise pass reads at most this many pages
+const CATCHUP_AGE_MS = 10 * 60 * 1000; // a row printed by a read after a restart that is older than this carries "catchup": true
 const INBOX_RETRY_MS = [5000, 15000, 45000]; // R-P2: the waits after the 1st, 2nd and 3rd failed read in a row
 const INBOX_RETRY_LAST_MS = 120000; // then every 120 s until one read succeeds
 // RE-RAISE. Stream mode only: every REraise_MS one feed read; a row older than REraise_MS and younger than 24 h is printed again.
@@ -800,7 +805,8 @@ function createInboxListener(cfg, deps) {
         const line = noticeLine(row, now());
         if (!line || line.seq <= last) { say('feed', 'notices read failed (unexpected_reply); it is retried'); return { ok: false, printed }; }
         last = line.seq;
-        lines.push(line);
+        const ms = typeof row.created_at === 'string' ? Date.parse(row.created_at) : NaN; // a row older than CATCHUP_AGE_MS was missed while the listener was down: a catch-up line
+        lines.push(Number.isFinite(ms) && now() - ms > CATCHUP_AGE_MS ? { ...line, catchup: true } : line);
       }
       for (const l of lines) emit(l);
       printed += lines.length;
@@ -812,18 +818,38 @@ function createInboxListener(cfg, deps) {
     }
     return { ok: true, printed };
   }
-  /** FIRST RUN (no cursor): the unresolved notices of the last 24 hours, at most 20 of them, printed as catch-up lines; then the cursor is the feed's latest. */
+  /** Reads the unresolved rows from since 0, page by page (the fetchRows rule: next = max(cursor, last seq), stop when has_more is false or next does not move), at most INBOX_PAGES_MAX pages.
+   * Returns { ok, rows (ascending seq), latest (the largest latest seen), sid, capped } or { ok: false, why, wait, shape }. Never moves the cursor, never POSTs. */
+  async function readUnresolvedPages(maxPages) {
+    const rows = []; let since = 0; let latest = null; let sid = null;
+    for (let page = 0; ; page++) {
+      const e = await readFeed(since, 'unresolved');
+      if (!e.ok) return { ok: false, why: e.why, wait: e.wait, shape: false };
+      const j = e.j;
+      if (sidOf(j)) sid = sidOf(j);
+      if (!Array.isArray(j.notifications) || !Number.isSafeInteger(j.latest) || j.latest < 0) return { ok: false, why: 'unexpected_reply', wait: 0, shape: true };
+      latest = latest === null ? j.latest : Math.max(latest, j.latest);
+      let top = since;
+      for (const row of j.notifications) { rows.push(row); if (row && Number.isSafeInteger(row.seq) && row.seq > top) top = row.seq; }
+      const paged = Number.isSafeInteger(j.cursor) && typeof j.has_more === 'boolean';
+      if (!paged) say('paging', 'the notices reply has no cursor or has_more: it is read as one page');
+      const next = Math.max(paged ? j.cursor : since, top);
+      if (!paged || j.has_more !== true || next <= since) return { ok: true, rows, latest, sid, capped: false };
+      if (page + 1 >= maxPages) return { ok: true, rows, latest, sid, capped: true };
+      since = next;
+    }
+  }
+  /** FIRST RUN (no cursor): the unresolved notices of the last 24 hours, the NEWEST 20 of them (all pages read first), printed oldest first as catch-up lines ("catchup": true); then the cursor is the feed's latest. A failed page fails the whole first run: nothing printed, no cursor. */
   async function firstRun() {
-    const e = await readFeed(0, 'unresolved');
-    if (!e.ok) return { ok: false, wait: e.wait };
-    const j = e.j;
-    if (sidOf(j)) S.lastSid = sidOf(j);
-    if (!Array.isArray(j.notifications) || !Number.isSafeInteger(j.latest) || j.latest < 0) { say('feed', 'notices read failed (unexpected_reply); retrying'); return { ok: false }; }
+    const r = await readUnresolvedPages(INBOX_PAGES_MAX);
+    if (!r.ok) { if (r.shape) say('feed', 'notices read failed (unexpected_reply); retrying'); return { ok: false, wait: r.wait || 0 }; }
+    if (r.sid) S.lastSid = r.sid;
+    if (r.capped) say('capped', `the first run read only the first ${INBOX_PAGES_MAX} pages of the feed; older unresolved notices were not shown`);
     const cutoff = now() - INBOX_CATCHUP_MS;
-    const recent = j.notifications.filter((r) => { const ms = r && typeof r.created_at === 'string' ? Date.parse(r.created_at) : NaN; return Number.isFinite(ms) && ms >= cutoff; });
+    const recent = r.rows.filter((row) => { const ms = row && typeof row.created_at === 'string' ? Date.parse(row.created_at) : NaN; return Number.isFinite(ms) && ms >= cutoff; });
     const lines = recent.slice(-INBOX_CATCHUP_MAX).map((row) => noticeLine(row, now())).filter(Boolean);
-    for (const l of lines) emit(l);
-    S.cursor = j.latest; save(); unsay('feed');
+    for (const l of lines) emit({ ...l, catchup: true });
+    S.cursor = r.latest; save(); unsay('feed');
     return { ok: true, printed: lines.length };
   }
   /** One read, as the bump asked for it. { ok, wait }: a failed read reports the Retry-After wait of a 429 (ms, 0 otherwise); armRetry then waits the larger of the ladder step and that (R-P2, F2). */
@@ -888,34 +914,33 @@ function createInboxListener(cfg, deps) {
     if (S.sub) { S.sub.live = false; try { if (S.sub.unsub) S.sub.unsub(); } catch (_) { /* the SDK's own close */ } S.sub = null; }
     subscribe(sid, true);
   }
-  /** RE-RAISE pass: one read since=0 state=unresolved. Each row older than reraiseMs and younger than 24 h is printed again as its normal line plus "reraise": n, oldest first, at most RERAISE_MAX_LINES a pass. Never moves the cursor, never POSTs. A failed read is one stderr line; the next pass tries again. */
+  /** RE-RAISE pass: the unresolved rows, all pages (at most INBOX_PAGES_MAX). Each row older than reraiseMs and younger than 24 h, and never a FOLLOWER row, is printed again as its normal line plus "reraise": n. At most RERAISE_MAX_LINES a pass: the NEWEST are kept and printed oldest first. Never moves the cursor, never POSTs. A failed read is one stderr line; the next pass tries again. */
   const quitting = () => S.stopped || ac.signal.aborted;
   async function reraisePass() {
-    let j = null;
+    let r = null;
     try {
-      const e = await readFeed(0, 'unresolved');
+      r = await readUnresolvedPages(RERAISE_PAGES_MAX);
       if (quitting()) return;
-      if (!e.ok) { say('reraise', `re-raise read failed (${e.why}); the next pass tries again`); return; }
-      j = e.j;
+      if (!r.ok) { say('reraise', r.shape ? 're-raise read failed (unexpected_reply); the next pass tries again' : `re-raise read failed (${r.why}); the next pass tries again`); return; }
     } catch (err) {
       if (quitting()) return;
       say('reraise', err instanceof Fatal ? err.message : `re-raise read failed (${word(err && err.name)}); the next pass tries again`);
       return;
     }
-    if (!Array.isArray(j.notifications)) { say('reraise', 're-raise read failed (unexpected_reply); the next pass tries again'); return; }
+    if (r.capped) say('capped-reraise', `the re-raise read covered only the first ${RERAISE_PAGES_MAX} pages of the feed; older unresolved notices were not shown this pass`);
     unsay('reraise');
     const at = now();
     const lines = [];
-    for (const row of j.notifications) {
+    for (const row of r.rows) {
       const ms = row && typeof row.created_at === 'string' ? Date.parse(row.created_at) : NaN;
       if (!Number.isFinite(ms)) continue;
       const age = at - ms;
       if (!(age > reraiseMs && age < INBOX_CATCHUP_MS)) continue;
       const line = noticeLine(row, at);
-      if (line) lines.push(line);
+      if (line && line.reason !== 'follower') lines.push(line);
     }
     lines.sort((a, b) => a.seq - b.seq);
-    for (const l of lines.slice(0, RERAISE_MAX_LINES)) {
+    for (const l of lines.slice(-RERAISE_MAX_LINES)) {
       const n = (reraised.get(l.notification_id) || 0) + 1;
       reraised.set(l.notification_id, n);
       emit({ ...l, reraise: n });
@@ -1263,7 +1288,7 @@ function makeFakeServers() {
     if (!W.inbox.noSignalId) body = { ...body, signal_id: INBOX_SID };
     if (W.inbox.hook) body = W.inbox.hook(body);
     const problem = inboxShapeProblem(body);
-    if (problem) W.violations.push(`inbox.feed: ${problem}`);
+    if (problem && !W.inbox.offShape) W.violations.push(`inbox.feed: ${problem}`); // offShape: a test serves a deliberately off-shape reply (A1)
     const shown = W.inbox.plant ? { ...body, notifications: body.notifications.map((r) => ({ ...r, ...W.inbox.plant })) } : body; // planted extras are added AFTER the shape check
     return send(res, 200, shown);
   }
@@ -2629,7 +2654,7 @@ function defineCases(cases, env) {
     check(n.length === 21 && n[0].seq === 6 && n[19].seq === 25 && n[20].seq === 26, `catch-up then stream: ${n.map((l) => l.seq).join(',')}`);
   });
 
-  // ==== RE-RAISE. Stream mode only: every 5 minutes (REraise_MS) ONE feed read since=0 state=unresolved; each unresolved row older than 5 minutes and newer than 24 hours is printed again with "reraise": n (n counts the re-raises of that id in this process); at most 20 lines per pass, oldest first. Never moves the cursor, never POSTs.
+  // ==== RE-RAISE. Stream mode only: every 5 minutes (REraise_MS) the re-raise read since=0 state=unresolved, at most 10 pages; each unresolved row older than 5 minutes and newer than 24 hours is printed again with "reraise": n (n counts the re-raises of that id in this process); at most 20 lines per pass, the newest kept and printed oldest first; a follower row is never re-raised. Never moves the cursor, never POSTs.
   const RR_Q = '?since=0&limit=100&state=unresolved';
   const rrOf = (r) => notices(r).filter((l) => 'reraise' in l);
   tc('RR1', 'RE-RAISE: an unresolved notice older than 5 minutes is printed again at the 10-minute pass with reraise 1 (the 5-minute pass prints nothing: the rows are exactly 5 minutes old); reads are GET since=0&limit=100&state=unresolved at 5 and 10 minutes; the cursor is unchanged; nothing is POSTed', async () => {
@@ -2662,12 +2687,121 @@ function defineCases(cases, env) {
     check(same(rr.map((l) => [l.seq, l.reraise]), [[2, 1], [3, 1], [4, 1]]), `re-raised ${JSON.stringify(rr.map((l) => [l.seq, l.reraise]))}, want [2,3,4] once each (seq 1 is older than 24 hours)`);
   });
 
-  tc('RR4', 'RE-RAISE: at most 20 lines per pass, oldest first; the other rows wait for the next pass', async () => {
+  tc('RR4', 'RE-RAISE: at most 20 lines per pass, the NEWEST kept and printed oldest first (seq 6 to 25 of 25); the older rows are not printed again', async () => {
     const r = await inboxRun({ id: 'RR4', world: (W) => seedDocs(W, 25), cursor: { inbox_seq: 25 }, mode: 'stream', stopAt: 605000 });
     check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
     const rr = rrOf(r);
-    check(rr.length === 20 && same(rr.map((l) => l.seq), Array.from({ length: 20 }, (_, i) => i + 1)) && rr.every((l) => l.reraise === 1), `re-raised ${JSON.stringify(rr.map((l) => [l.seq, l.reraise]))}`);
+    check(rr.length === 20 && same(rr.map((l) => l.seq), Array.from({ length: 20 }, (_, i) => i + 6)) && rr.every((l) => l.reraise === 1), `re-raised ${JSON.stringify(rr.map((l) => [l.seq, l.reraise]))}`);
   });
+
+  tc('F12a', 'INBOX first run PAGES the feed: 250 unresolved rows over three pages print the NEWEST 20 (seq 231 to 250), oldest first; the cursor is the latest (250); the three reads are since 0, 100, 200', async () => {
+    const r = await inboxRun({ id: 'F12a', world: (W) => seedDocs(W, 250), mode: 'stream', stopAt: 4000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const n = notices(r);
+    check(n.length === 20 && same(n.map((l) => l.seq), Array.from({ length: 20 }, (_, i) => i + 231)), `catch-up seqs ${JSON.stringify(n.map((l) => l.seq))}`);
+    check(same(r.cursor, { inbox_seq: 250 }), `cursor ${r.cursorText}`);
+    const reads = r.W.inboxCalls.filter((c) => /state=unresolved/.test(c.q)).map((c) => c.q);
+    check(same(reads, ['?since=0&limit=100&state=unresolved', '?since=100&limit=100&state=unresolved', '?since=200&limit=100&state=unresolved']), `first-run reads ${JSON.stringify(reads)}`);
+  });
+
+  tc('F12b', 'INBOX first run: a failed SECOND page fails the whole first run: nothing printed, no cursor saved (the retry comes later)', async () => {
+    const r = await inboxRun({ id: 'F12b', world: (W) => { seedDocs(W, 250); W.over.inbox = (n) => (n === 2 ? { status: 500, body: {} } : null); }, mode: 'stream', stopAt: 4000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    check(r.outs.length === 0, `printed on a failed first run: ${r.outs.join(' | ')}`);
+    check(r.cursor === null, `a cursor was saved: ${r.cursorText}`);
+  });
+
+  tc('F12c', 'INBOX re-raise PAGES the feed: 150 eligible rows print the NEWEST 20 (seq 131 to 150), oldest first, reraise 1; the pass reads since 0 then 100; no re-raise line carries catchup', async () => {
+    const r = await inboxRun({ id: 'F12c', world: (W) => seedDocs(W, 150), cursor: { inbox_seq: 150 }, mode: 'stream', stopAt: 605000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const rr = rrOf(r);
+    check(rr.length === 20 && same(rr.map((l) => l.seq), Array.from({ length: 20 }, (_, i) => i + 131)) && rr.every((l) => l.reraise === 1), `re-raised ${JSON.stringify(rr.map((l) => [l.seq, l.reraise]))}`);
+    const reads = r.W.inboxCalls.filter((c) => c.t === 600000).map((c) => c.q);
+    check(same(reads, ['?since=0&limit=100&state=unresolved', '?since=100&limit=100&state=unresolved']), `re-raise pass reads ${JSON.stringify(reads)}`);
+    check(rr.every((l) => !('catchup' in l)), `a re-raise line has catchup: ${JSON.stringify(rr[0] || {})}`);
+  });
+
+  tc('F4', 'INBOX re-raise never re-raises a FOLLOWER row: the mentioned rows are re-raised, the follower row (seq 2) is not', async () => {
+    const r = await inboxRun({ id: 'F4', world: (W) => { W.addNotice('document', { itemId: DOC_A, reason: 'mentioned' }); W.addNotice('document', { itemId: DOC_A, reason: 'follower' }); W.addNotice('document', { itemId: DOC_A, reason: 'mentioned' }); }, cursor: { inbox_seq: 3 }, mode: 'stream', stopAt: 605000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const rr = rrOf(r);
+    check(same(rr.map((l) => [l.seq, l.reraise]), [[1, 1], [3, 1]]), `re-raised ${JSON.stringify(rr.map((l) => [l.seq, l.reraise, l.reason]))}`);
+    check(!rr.some((l) => l.reason === 'follower'), 'a follower line was re-raised');
+  });
+
+  tc('F1a', 'INBOX catch-up lines carry "catchup": true (exact keys: the notice keys then catchup); a live line carries no catchup key', async () => {
+    const r = await inboxRun({ id: 'F1a', world: (W) => seedDocs(W, 2), mode: 'stream', stopAt: 6000, at: [[5000, (W) => W.addNotice('document', { itemId: DOC_A })]] });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const n = notices(r);
+    check(n.length === 3 && same(n.map((l) => l.seq), [1, 2, 3]), `lines ${r.outs.join(' | ')}`);
+    check(n[0].catchup === true && n[1].catchup === true, `catch-up flag ${JSON.stringify(n.map((l) => l.catchup))}`);
+    check(same(Object.keys(n[0]), [...INBOX_KEYS, 'catchup']), `catch-up keys ${JSON.stringify(Object.keys(n[0]))}`);
+    check(!('catchup' in n[2]) && same(Object.keys(n[2]), INBOX_KEYS), `live line keys ${JSON.stringify(Object.keys(n[2]))}`);
+  });
+
+  // ---- addendum A1 to A5 (the spec author's ruling on L1)
+  const unresolvedHook = (W, pick) => { W.inbox.hook = (body) => { const q = W.inboxCalls[W.inboxCalls.length - 1].q; if (!/state=unresolved/.test(q)) { W.inbox.offShape = false; return body; } const b = pick(q); if (!b) { W.inbox.offShape = false; return body; } W.inbox.offShape = !('cursor' in b && 'has_more' in b); return { ...b, signal_id: INBOX_SID }; }; }; // a reply with no cursor or has_more is served as it is (offShape: the fake does not count it as a shape violation): the listener must cope
+
+  tc('F1b', 'INBOX first run (A1): an unresolved reply with NO cursor and NO has_more is read as ONE page (one unresolved read), its row prints with catchup true, and ONE stderr line says so', async () => {
+    const r = await inboxRun({ id: 'F1b', world: (W) => { seedDocs(W, 1); unresolvedHook(W, () => inboxFixture().unresolved.no_paging); }, mode: 'stream', stopAt: 4000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const reads = r.W.inboxCalls.filter((c) => /state=unresolved/.test(c.q));
+    check(reads.length === 1, `unresolved reads ${reads.length}`);
+    const n = notices(r);
+    check(n.length === 1 && n[0].seq === 1 && n[0].catchup === true, `lines ${r.outs.join(' | ')}`);
+    check(r.errs.filter((s) => /no cursor or has_more/.test(s)).length === 1, `stderr ${r.errs.join(' | ')}`);
+    check(same(r.cursor, { inbox_seq: 1 }), `cursor ${r.cursorText}`);
+  });
+
+  tc('F1c', 'INBOX first run (A1): a multi-page unresolved feed from the fixture (page 1 has_more, page 2 does not) is read to the end: reads since 0 then 1, rows 1 and 2 print with catchup true, cursor 2', async () => {
+    const r = await inboxRun({ id: 'F1c', world: (W) => { seedDocs(W, 2); unresolvedHook(W, (q) => (/since=0&/.test(q) ? inboxFixture().unresolved.page_1 : inboxFixture().unresolved.page_2)); }, mode: 'stream', stopAt: 4000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const reads = r.W.inboxCalls.filter((c) => /state=unresolved/.test(c.q)).map((c) => c.q);
+    check(same(reads, ['?since=0&limit=100&state=unresolved', '?since=1&limit=100&state=unresolved']), `reads ${JSON.stringify(reads)}`);
+    const n = notices(r);
+    check(same(n.map((l) => l.seq), [1, 2]) && n.every((l) => l.catchup === true), `lines ${r.outs.join(' | ')}`);
+    check(same(r.cursor, { inbox_seq: 2 }), `cursor ${r.cursorText}`);
+  });
+
+  tc('F2c', 'INBOX first run at the page cap (A2): 2001 unresolved rows: only the first 20 pages (2000 rows) are read, the NEWEST of them print (seq 1981 to 2000), the cursor is the feed latest (2001), one stderr line says only the first pages were read', async () => {
+    const r = await inboxRun({ id: 'F2c', world: (W) => seedDocs(W, 2001), mode: 'stream', stopAt: 4000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const n = notices(r);
+    check(n.length === 20 && same(n.map((l) => l.seq), Array.from({ length: 20 }, (_, i) => i + 1981)), `catch-up seqs ${JSON.stringify(n.map((l) => l.seq))}`);
+    check(r.W.inboxCalls.filter((c) => /state=unresolved/.test(c.q)).length === 20, 'the first run did not stop at 20 pages');
+    check(same(r.cursor, { inbox_seq: 2001 }), `cursor ${r.cursorText}`);
+    check(r.errs.filter((s) => /only the first 20 pages/.test(s)).length === 1, `stderr ${r.errs.join(' | ')}`);
+  });
+
+  tc('F3a', 'INBOX re-raise pass reads at most 10 pages (A3): 1050 unresolved rows, the 10-minute pass reads since 0 to 900 only and prints the NEWEST 20 of those rows (seq 981 to 1000); one stderr line says so', async () => {
+    const r = await inboxRun({ id: 'F3a', world: (W) => seedDocs(W, 1050), cursor: { inbox_seq: 1050 }, mode: 'stream', stopAt: 605000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const rr = rrOf(r);
+    check(rr.length === 20 && same(rr.map((l) => l.seq), Array.from({ length: 20 }, (_, i) => i + 981)), `re-raised ${JSON.stringify(rr.map((l) => l.seq))}`);
+    const reads = r.W.inboxCalls.filter((c) => c.t === 600000).map((c) => c.q);
+    check(same(reads, Array.from({ length: 10 }, (_, i) => `?since=${i * 100}&limit=100&state=unresolved`)), `10-minute pass reads ${JSON.stringify(reads)}`);
+    check(r.errs.filter((s) => /only the first 10 pages/.test(s)).length === 1, `stderr ${r.errs.join(' | ')}`);
+  });
+
+  tc('F3b', 'INBOX re-raise pass stops at the first non-ok read (A3): a 429 on the second page ends the pass with no partial lines, one stderr line, and no retry is armed for the pass', async () => {
+    const r = await inboxRun({ id: 'F3b', world: (W) => { seedDocs(W, 150); let k = 0; W.over.inbox = () => { if (W.clock.t >= T0 + 600000 && W.clock.t < T0 + 600500) { k += 1; return k === 2 ? { status: 429, headers: { 'retry-after': '30' }, body: {} } : null; } return null; }; }, cursor: { inbox_seq: 150 }, mode: 'stream', stopAt: 605000 });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const reads = r.W.inboxCalls.filter((c) => c.t === 600000);
+    check(reads.length === 2, `reads at the 10-minute pass: ${reads.length}`);
+    check(rrOf(r).length === 0, `partial lines: ${JSON.stringify(rrOf(r).map((l) => l.seq))}`);
+    check(r.errs.filter((s) => /re-raise read failed \(429\)/.test(s)).length === 1, `stderr ${r.errs.join(' | ')}`);
+    check(same(r.cursor, { inbox_seq: 150 }), `cursor ${r.cursorText}`);
+  });
+
+  tc('F5a', 'INBOX restart (A5): a row printed by a normal read that is older than 10 minutes carries "catchup": true; a fresh row carries no catchup key', async () => {
+    const r = await inboxRun({ id: 'F5a', world: (W) => { seedDocs(W, 2); for (const row of W.inbox.rows) row.created_at = new Date(T0 - 11 * 60000).toISOString(); }, cursor: { inbox_seq: 0 }, mode: 'stream', stopAt: 6000, at: [[5000, (W) => W.addNotice('document', { itemId: DOC_A })]] });
+    check(r.code === 0, `exit ${r.code} ${r.errs.join('|')}`);
+    const n = notices(r).filter((l) => !('reraise' in l));
+    check(same(n.map((l) => l.seq), [1, 2, 3]), `lines ${r.outs.join(' | ')}`);
+    check(n[0].catchup === true && n[1].catchup === true && !('catchup' in n[2]), `catchup flags ${JSON.stringify(n.map((l) => l.catchup))}`);
+    check(same(Object.keys(n[2]), INBOX_KEYS), `fresh keys ${JSON.stringify(Object.keys(n[2]))}`);
+  });
+
 
   tc('RR5', 'RE-RAISE: a failed re-raise read prints ONE stderr line, the cursor does not move, and the next pass (15 minutes) prints the notice with reraise 1', async () => {
     const r = await inboxRun({ id: 'RR5', world: (W) => { seedDocs(W, 3); W.over.inbox = () => (W.clock.t >= T0 + 600000 && W.clock.t < T0 + 600500 ? { status: 500, body: {} } : null); }, cursor: { inbox_seq: 3 }, mode: 'stream', stopAt: 905000 });
