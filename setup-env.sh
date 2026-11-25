@@ -58,6 +58,7 @@ usage: setup-env.sh [--app-id <value>] [--name <text> --email <address>] [--igno
   --api-base      optional: the SPM functions address, https://<host> with no path (writes backend.api_base)
   --firebase-project  optional: the Firebase project id, 4 to 30 lower-case letters, digits or hyphens (writes backend.firebase_project)
   --firebase-web-key  optional: the public web API key of that project, 20 to 80 of A-Z a-z 0-9 _ - (writes backend.firebase_web_key)
+  --firestore-region  optional: the Firestore region of that project, lower-case, e.g. asia-southeast1 (writes backend.firestore_region)
   --report        on (default) or off: off sends no health reports
   --autostart     on (default) or off: off turns the agent's automatic start off (no CLAUDE.md block is written, and the kit's block is removed)
   --name          optional: the agent's name as people tag it, 1 to 60 of A-Z a-z 0-9, space, dot, brackets, hyphen (give it with --email)
@@ -88,12 +89,13 @@ HAS_BACKEND=0
 API_BASE=""
 FB_PROJECT=""
 FB_KEY=""
+FS_REGION=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --no-sdk) SDK=0; shift ;;
-    --name|--email|--app-id|--ignore-agent|--transport|--report|--autostart|--api-base|--firebase-project|--firebase-web-key)
+    --name|--email|--app-id|--ignore-agent|--transport|--report|--autostart|--api-base|--firebase-project|--firebase-web-key|--firestore-region)
       if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
         fail "$1 needs a value (see --help)"
       fi
@@ -109,6 +111,7 @@ while [ $# -gt 0 ]; do
         --api-base) API_BASE="$2"; HAS_BACKEND=1 ;;
         --firebase-project) FB_PROJECT="$2"; HAS_BACKEND=1 ;;
         --firebase-web-key) FB_KEY="$2"; HAS_BACKEND=1 ;;
+        --firestore-region) FS_REGION="$2"; HAS_BACKEND=1 ;;
       esac
       shift 2
       ;;
@@ -148,6 +151,10 @@ if [ "$HAS_BACKEND" -eq 1 ]; then
   if [ -n "$FB_KEY" ]; then
     FB_KEY_RE='^[A-Za-z0-9_-]{20,80}$'
     [[ "$FB_KEY" =~ $FB_KEY_RE ]] || fail "--firebase-web-key must be 20 to 80 letters, digits, hyphens or underscores (see --help)"
+  fi
+  if [ -n "$FS_REGION" ]; then
+    FS_REGION_RE='^[a-z][a-z0-9-]{1,40}$'
+    [[ "$FS_REGION" =~ $FS_REGION_RE ]] || fail "--firestore-region must be a lower-case region name such as asia-southeast1 (see --help)"
   fi
 fi
 case "$REPORT" in
@@ -226,6 +233,7 @@ const HOME = e.SPM_SETUP_HOME;
 const KV = e.SPM_SETUP_KIT_VERSION || '';
 const RULES = [
   `Bash(node ${KIT}/agent-reply.cjs *)`,
+  `Bash(node ${KIT}/agent-call.cjs *)`,
   `Bash(node ${KIT}/agent-ack.cjs *)`,
   `Bash(node ${KIT}/agent-resolve.cjs *)`,
   `Bash(node ${KIT}/agent-relay.cjs *)`,
@@ -371,6 +379,7 @@ try {
     if (e.SPM_SETUP_API_BASE) backend.api_base = e.SPM_SETUP_API_BASE;
     if (e.SPM_SETUP_FB_PROJECT) backend.firebase_project = e.SPM_SETUP_FB_PROJECT;
     if (e.SPM_SETUP_FB_KEY) backend.firebase_web_key = e.SPM_SETUP_FB_KEY;
+    if (e.SPM_SETUP_FS_REGION) backend.firestore_region = e.SPM_SETUP_FS_REGION;
   }
   if (backend && Object.keys(backend).length > 0) cfg.backend = backend;
   if (e.SPM_SETUP_HAS_IGNORE === '1') {
@@ -472,7 +481,7 @@ spool_setup() {
 SPM_SETUP_KIT="$KIT" SPM_SETUP_HOME="$HOME" SPM_SETUP_KIT_VERSION="$KIT_VERSION" \
   SPM_SETUP_HAS_AGENT="$HAS_AGENT" SPM_SETUP_NAME="$NAME" SPM_SETUP_EMAIL="$EMAIL" \
   SPM_SETUP_APP_ID="$APP_ID" SPM_SETUP_HAS_APP="$HAS_APP" SPM_SETUP_REPORT="$REPORT" SPM_SETUP_AUTOSTART="$AUTOSTART" SPM_SETUP_TRANSPORT="$TRANSPORT" SPM_SETUP_HAS_IGNORE="$HAS_IGNORE" \
-  SPM_SETUP_IGNORE="$IGNORE_LIST" SPM_SETUP_HAS_BACKEND="$HAS_BACKEND" SPM_SETUP_API_BASE="$API_BASE" SPM_SETUP_FB_PROJECT="$FB_PROJECT" SPM_SETUP_FB_KEY="$FB_KEY" \
+  SPM_SETUP_IGNORE="$IGNORE_LIST" SPM_SETUP_HAS_BACKEND="$HAS_BACKEND" SPM_SETUP_API_BASE="$API_BASE" SPM_SETUP_FB_PROJECT="$FB_PROJECT" SPM_SETUP_FB_KEY="$FB_KEY" SPM_SETUP_FS_REGION="$FS_REGION" \
   node -e "$WRITE_JS"
 RC=$?
 if [ "$RC" -ne 0 ]; then

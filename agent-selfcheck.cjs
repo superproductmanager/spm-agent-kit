@@ -58,7 +58,8 @@ const { keyMode, proxyUrl } = require('./lib/key-mode.cjs');
 
 // 0.3.0: the functions host and the Firebase project come from the settings file ("backend"); litethink by default.
 let PROJECT = resolveBackend({}).firebase_project;
-const FS_HOST = 'firestore.asia-southeast1.rep.googleapis.com'; // D10: our database's regional host
+// D10: our database's regional host. 0.3.1: it follows backend.firestore_region (default asia-southeast1, today's host).
+let FS_HOST = `firestore.${resolveBackend({}).firestore_region}.rep.googleapis.com`;
 const SHARED_FS_HOST = 'firestore.googleapis.com';             // shared host: info only
 let FN_HOST = resolveBackend({}).api_host;
 const IDT_HOST = 'identitytoolkit.googleapis.com';
@@ -333,10 +334,11 @@ async function mainSetup(argv) {
 /** Sets the one server this run talks to (0.3.0). main reads the settings file first; tests call it directly. */
 function applyBackend(b) {
   PROJECT = b.firebase_project; FN_HOST = b.api_host; FS_ROOT = `/v1/projects/${PROJECT}/databases/(default)/documents`;
-  BASE_FLAGS['--base-fn'] = `https://${FN_HOST}`; SECRET_NOT_REACHED = secretNotReachedFor(FN_HOST);
+  FS_HOST = `firestore.${b.firestore_region || resolveBackend({}).firestore_region}.rep.googleapis.com`;
+  BASE_FLAGS['--base-fn'] = `https://${FN_HOST}`; BASE_FLAGS['--base-regional'] = `https://${FS_HOST}`; SECRET_NOT_REACHED = secretNotReachedFor(FN_HOST);
 }
 /** The targets this run uses (for the tests). */
-function currentTargets() { return { fn_host: FN_HOST, project: PROJECT, fs_root: FS_ROOT, secret_not_reached: SECRET_NOT_REACHED.slice() }; }
+function currentTargets() { return { fn_host: FN_HOST, fs_host: FS_HOST, project: PROJECT, fs_root: FS_ROOT, secret_not_reached: SECRET_NOT_REACHED.slice() }; }
 
 // The test-only --base-* flags (0.2.0): a value must be http on 127.0.0.1 (any port and path) or exactly that slot's default.
 const BASE_FLAGS = {

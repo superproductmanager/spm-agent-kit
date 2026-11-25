@@ -28,7 +28,7 @@ function admitted(fn) { try { fn(); return true; } catch (_) { return false; } }
 
 test('no backend in the settings gives the litethink values', () => {
   const b = resolveBackend({});
-  assert.deepEqual(b, { api_base: LITE_BASE, api_host: 'asia-south1-litethink.cloudfunctions.net', firebase_project: 'litethink', firebase_web_key: null });
+  assert.deepEqual(b, { api_base: LITE_BASE, api_host: 'asia-south1-litethink.cloudfunctions.net', firebase_project: 'litethink', firebase_web_key: null, firestore_region: 'asia-southeast1' });
   assert.deepEqual(resolveBackend({ backend: undefined }), b);
   assert.deepEqual(DEFAULT_BACKEND, b);
 });
@@ -43,7 +43,24 @@ test('a partial backend block falls back per field to the litethink values', () 
 
 test('a configured https host is accepted and becomes the one host', () => {
   const b = resolveBackend({ backend: CONF });
-  assert.deepEqual(b, { api_base: CONF.api_base, api_host: CONF_HOST, firebase_project: CONF.firebase_project, firebase_web_key: CONF.firebase_web_key });
+  assert.deepEqual(b, { api_base: CONF.api_base, api_host: CONF_HOST, firebase_project: CONF.firebase_project, firebase_web_key: CONF.firebase_web_key, firestore_region: 'asia-southeast1' });
+});
+
+// ---------------------------------------------------------------- 0.3.1 KITFIX: the Firestore region
+test('firestore_region: the default is asia-southeast1 when the backend block omits it', () => {
+  assert.equal(resolveBackend({}).firestore_region, 'asia-southeast1');
+  assert.equal(resolveBackend({ backend: CONF }).firestore_region, 'asia-southeast1');
+});
+
+test('firestore_region: a configured region of lower-case letters, digits and hyphens is accepted', () => {
+  assert.equal(resolveBackend({ backend: { firestore_region: 'europe-west3' } }).firestore_region, 'europe-west3');
+  assert.equal(resolveBackend({ backend: { firestore_region: 'us-central1' } }).firestore_region, 'us-central1');
+});
+
+test('firestore_region: a value that is not a lower-case region name is refused with BackendError', () => {
+  for (const bad of ['', 'Asia-Southeast1', 'asia southeast1', 'asia.southeast1', '1asia', 'x'.repeat(60), 42]) {
+    assert.throws(() => resolveBackend({ backend: { firestore_region: bad } }), BackendError, `refused: ${JSON.stringify(bad)}`);
+  }
 });
 
 test('an api_base with a trailing slash is normalised to the origin', () => {

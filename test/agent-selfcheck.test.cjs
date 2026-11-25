@@ -882,3 +882,22 @@ test('--setup mode applies the configured backend: the functions target is the c
     fs.rmSync(cfgDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------- 0.3.1 KITFIX round 2: the regional Firestore host follows backend.firestore_region
+test('firestore_region: the regional Firestore host follows the configured region', () => {
+  const { resolveBackend } = require('../lib/backend.cjs');
+  const sc = require('../agent-selfcheck.cjs');
+  try {
+    sc.applyBackend(resolveBackend({ backend: { firestore_region: 'europe-west3' } }));
+    assert.equal(sc.currentTargets().fs_host, 'firestore.europe-west3.rep.googleapis.com');
+    assert.equal(sc.parseArgs([]).bases.regional, 'https://firestore.europe-west3.rep.googleapis.com');
+  } finally { sc.applyBackend(resolveBackend({})); }
+});
+
+test('firestore_region: with no region the regional host is today\'s asia-southeast1 host', () => {
+  const { resolveBackend } = require('../lib/backend.cjs');
+  const sc = require('../agent-selfcheck.cjs');
+  sc.applyBackend(resolveBackend({}));
+  assert.equal(sc.currentTargets().fs_host, 'firestore.asia-southeast1.rep.googleapis.com');
+  assert.equal(sc.parseArgs([]).bases.regional, 'https://firestore.asia-southeast1.rep.googleapis.com');
+});

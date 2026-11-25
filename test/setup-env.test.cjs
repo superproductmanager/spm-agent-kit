@@ -15,10 +15,11 @@ const NAME = 'Example agent';
 const EMAIL = 'spm-example-agent@agents.invalid';
 const APP_ID = 'example-app-id-0000000000000000';
 
-// The eight allow rules, absolute, built from the kit folder that setup-env.sh runs from (0.2.0 adds agent-health; 0.2.1 adds agent-wait last).
+// The nine allow rules, absolute, built from the kit folder that setup-env.sh runs from (0.2.0 adds agent-health; 0.2.1 adds agent-wait last; 0.3.1 adds agent-call after agent-reply).
 function rulesFor(kit) {
   return [
     `Bash(node ${kit}/agent-reply.cjs *)`,
+    `Bash(node ${kit}/agent-call.cjs *)`,
     `Bash(node ${kit}/agent-ack.cjs *)`,
     `Bash(node ${kit}/agent-resolve.cjs *)`,
     `Bash(node ${kit}/agent-relay.cjs *)`,
@@ -426,10 +427,10 @@ test('rules already present are not duplicated; the missing ones are appended in
   try {
     const R = rulesFor(sb.kit);
     fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
-    fs.writeFileSync(SETTINGS(sb), JSON.stringify({ permissions: { allow: [R[1], 'Bash(x)', R[4]] } }));
+    fs.writeFileSync(SETTINGS(sb), JSON.stringify({ permissions: { allow: [R[2], 'Bash(x)', R[5]] } }));
     const r = runSetup(sb, ok(['--no-sdk']));
     assert.equal(r.status, 0, r.stderr);
-    assert.deepEqual(readJson(SETTINGS(sb)).permissions.allow, [R[1], 'Bash(x)', R[4], R[0], R[2], R[3], R[5], R[6], R[7]]);
+    assert.deepEqual(readJson(SETTINGS(sb)).permissions.allow, [R[2], 'Bash(x)', R[5], R[0], R[1], R[3], R[4], R[6], R[7], R[8]]);
   } finally { cleanup(sb); }
 });
 
@@ -1031,14 +1032,15 @@ test('C4 setup leaves an existing permissions.defaultMode unchanged, and adds no
 });
 
 // ---- Addendum item 5: the six old rules gain only the seventh ----
-test('settings with the six old allow rules gains only the agent-health rule, in place order, nothing else changed', () => {
+test('settings with the six old allow rules gains only the three missing rules (agent-call, agent-health, agent-wait), in listed order, nothing else changed', () => {
   const sb = sandbox({ version: '0.2.0\n' });
   try {
-    const six = rulesFor(sb.kit).slice(0, 6);
+    const R9 = rulesFor(sb.kit);
+    const six = R9.filter((_, i) => ![1, 6, 7].includes(i));
     fs.mkdirSync(CLAUDE_DIR(sb), { recursive: true });
     fs.writeFileSync(SETTINGS(sb), JSON.stringify({ model: 'x', permissions: { allow: six, deny: ['Bash(rm -rf *)'] } }, null, 2) + '\n');
     assert.equal(runSetup(sb, ok(['--no-sdk'])).status, 0);
-    assert.deepEqual(readJson(SETTINGS(sb)), { model: 'x', permissions: { allow: rulesFor(sb.kit), deny: ['Bash(rm -rf *)'] } });
+    assert.deepEqual(readJson(SETTINGS(sb)), { model: 'x', permissions: { allow: [...six, R9[1], R9[6], R9[7]], deny: ['Bash(rm -rf *)'] } });
   } finally { cleanup(sb); }
 });
 
@@ -1136,5 +1138,29 @@ test('a --api-base that is not an https origin is refused with exit 2 and nothin
     assert.ok(/--api-base/.test(r.stderr), r.stderr);
     assert.equal(fs.existsSync(CONFIG(sb)), false, 'config.json not written');
     assert.equal(fs.existsSync(sb.selfcheckLog), false, 'selfcheck not run');
+  } finally { cleanup(sb); }
+});
+
+// ---- 0.3.1 (KITFIX round 2): --firestore-region writes backend.firestore_region before selfcheck --setup
+test('--firestore-region writes backend.firestore_region before selfcheck --setup runs', () => {
+  const sb = sandbox({ version: '0.3.1\n' });
+  try {
+    stubSelfcheckRecordingConfig(sb);
+    const r = runSetup(sb, ['--app-id', APP_ID, '--no-sdk', '--firestore-region', 'europe-west3']);
+    assert.equal(r.status, 0, r.stderr);
+    const calls = fs.readFileSync(sb.selfcheckLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(calls.length, 1, 'selfcheck --setup ran once');
+    assert.deepEqual(JSON.parse(calls[0].config).backend, { firestore_region: 'europe-west3' }, 'the region was in config.json when selfcheck ran');
+    assert.deepEqual(readJson(CONFIG(sb)).backend, { firestore_region: 'europe-west3' });
+  } finally { cleanup(sb); }
+});
+
+test('a --firestore-region that is not a lower-case region name is refused with exit 2 and nothing is written', () => {
+  const sb = sandbox({ version: '0.3.1\n' });
+  try {
+    const r = runSetup(sb, ['--app-id', APP_ID, '--no-sdk', '--firestore-region', 'Europe West3']);
+    assert.equal(r.status, 2);
+    assert.ok(/--firestore-region/.test(r.stderr), r.stderr);
+    assert.equal(fs.existsSync(CONFIG(sb)), false, 'config.json not written');
   } finally { cleanup(sb); }
 });
