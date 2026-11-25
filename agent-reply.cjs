@@ -64,7 +64,7 @@ const GAP_MS = 3200;
 const DUP_WINDOW_MS = 10 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ITEM_PATH_RE = new RegExp('^/(?:boardsApi/tasks|mapsApi/maps)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/comments$');
-const USAGE = 'usage: node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid>) --to <comment_id> (--text "<text>" | --text-file <absolute path>) [--dry-run]  |  node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid>) --new (--text "<text>" | --text-file <absolute path>) [--dry-run]  |  node agent-reply.cjs --selftest (--config may also be set through SPM_AGENT_CONFIG; --new posts a top-level comment and takes no --to; a text over 600 characters is refused)';
+const USAGE = 'usage: node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid>) --to <comment_id> (--text "<text>" | --text-file <absolute path>) [--dry-run]  |  node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid>) --new (--text "<text>" | --text-file <absolute path>) [--dry-run] [--for-comment <comment id>]  |  node agent-reply.cjs --selftest (--config may also be set through SPM_AGENT_CONFIG; --new posts a top-level comment and takes no --to; a text over 600 characters is refused; --for-comment sends the hand-over comment id as X-SPM-On-Behalf-Of-Comment)';
 const MAX_REPLY_BYTES = 16 * 1024 * 1024;
 const TEXT_LIMIT = 600; // characters (Unicode code points), the standing comment format
 const KEY_PATTERNS = [
@@ -99,7 +99,7 @@ function firstKeyLike(text) {
 // argv is the command line WITHOUT --config (main strips it). config is { name, email, keyFile } from the settings file.
 function parseArgs(argv, config = {}) {
   const bad = (why) => ({ ok: false, error: why });
-  const valued = ['--document', '--map', '--task', '--to', '--text', '--text-file'];
+  const valued = ['--document', '--map', '--task', '--to', '--text', '--text-file', '--for-comment'];
   const v = {}; let dryRun = false; let isNew = false;
   for (let i = 0; i < argv.length; i++) {
     const f = argv[i];
@@ -132,7 +132,14 @@ function parseArgs(argv, config = {}) {
   if (!text.trim()) return bad('the text is empty');
   const nChars = Array.from(text).length; // code points of the text exactly as it will be posted
   if (nChars > TEXT_LIMIT) return { ok: false, noUsage: true, error: `refused: the text is ${nChars} characters; the standing format allows ${TEXT_LIMIT}` };
-  return { ok: true, cfg: { identity: config.email, kind, document: kind === 'document' ? itemId : null, map: kind === 'map' ? itemId : null, task: kind === 'task' ? itemId : null, to, text, dryRun, isNew, keyFile: config.keyFile || null, email: config.email } };
+  // --for-comment (0.4.0): the hand-over's comment id; sent as X-SPM-On-Behalf-Of-Comment on the thread lookup and the post
+  let forComment = null;
+  if (Object.prototype.hasOwnProperty.call(v, '--for-comment')) {
+    const fc = v['--for-comment'].trim().toLowerCase();
+    if (!UUID_RE.test(fc)) return bad('--for-comment must be a comment id (a uuid)');
+    forComment = fc;
+  }
+  return { ok: true, cfg: { identity: config.email, kind, document: kind === 'document' ? itemId : null, map: kind === 'map' ? itemId : null, task: kind === 'task' ? itemId : null, to, text, dryRun, isNew, keyFile: config.keyFile || null, email: config.email, forComment } };
 }
 
 // ---------------------------------------------------------------- the allow-list: checked before EVERY call
@@ -141,8 +148,11 @@ function guardRequest(url, method, headers, body, mode) { // mode 'new': the req
   try { u = new URL(url); } catch (_) { throw new GuardError('refused: unparseable url'); }
   if (u.protocol !== 'https:' || u.port !== '' || u.username !== '' || u.password !== '' || u.hash !== '' || u.search !== '') throw new GuardError('refused: scheme, port, query or credentials in the url');
   if (u.hostname !== FN_HOST) throw new GuardError('refused: host or method is not on the allow-list');
-  const names = Object.keys(headers || {}).map((h) => h.toLowerCase());
-  const only = (allowed) => { if (!names.every((n) => allowed.includes(n))) throw new GuardError('refused: a header that does not belong on this route'); };
+  // X-SPM-On-Behalf-Of-Comment (--for-comment) is allowed on every route here, once, with a comment id; the route checks below see the other headers only
+  const onBehalf = Object.keys(headers || {}).filter((h) => h.toLowerCase() === 'x-spm-on-behalf-of-comment');
+  if (onBehalf.length > 1 || (onBehalf.length === 1 && !UUID_RE.test(String(headers[onBehalf[0]]).toLowerCase()))) throw new GuardError('refused: the on-behalf header');
+  const names = Object.keys(headers || {}).map((h) => h.toLowerCase()).filter((h) => h !== 'x-spm-on-behalf-of-comment');
+  const only =(allowed) => { if (!names.every((n) => allowed.includes(n))) throw new GuardError('refused: a header that does not belong on this route'); };
   const exact = (wanted) => { if (names.length !== wanted.length || !wanted.every((n) => names.includes(n))) throw new GuardError('refused: the headers of this route are exactly ' + wanted.join(', ')); };
   const keys = (b) => (b && typeof b === 'object' && !Array.isArray(b) ? Object.keys(b).sort().join(',') : null);
   if (ITEM_PATH_RE.test(u.pathname)) { // board (tasks) and map comments: GET the list, POST the reply; nothing else on these paths
@@ -269,7 +279,8 @@ async function run(cfg, deps) {
     if (hit) { L.outcome = 'refused_key_like'; warn(`refused: the text contains something shaped like a secret (${hit}); nothing was sent`); return 2; }
     if (cfg.secretMode) key = NETWORK_SECRET_VALUE; // K-A3 item 1: the placeholder; no key file is read
     else { try { key = deps.readKeyFile(cfg.keyFile); } catch (e) { L.outcome = 'no_key'; warn(`cannot read the key file (${word(e && e.code)})`); return 1; } }
-    const headersRead = { 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email };
+    const onBehalfHdr = cfg.forComment ? { 'X-SPM-On-Behalf-Of-Comment': cfg.forComment } : {}; // --for-comment: the same header on the lookup and the post
+    const headersRead = { 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email, ...onBehalfHdr };
     const call = async (method, route, headers, body) => {
       const url = `https://${FN_HOST}/${route}`;
       guardRequest(url, method, headers, body, cfg.isNew ? 'new' : 'reply');
@@ -315,7 +326,7 @@ async function run(cfg, deps) {
     }
     if (wait > 0) await deps.sleep(wait);
     // (b) the post
-    const postHeaders = { Origin: ORIGIN, 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email };
+    const postHeaders = { Origin: ORIGIN, 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email, ...onBehalfHdr };
     const post = cfg.kind === 'document' ? await call('POST', 'documentsApi/createDocumentComment', postHeaders, { documentId: cfg.document, body: cfg.text, parent_id: root }) : await call('POST', itemRoute, postHeaders, { body: cfg.text, parent_id: root });
     L.http_status = post.status;
     const settle = (fn) => withLock(deps.stateDir, async () => { const st = readState(deps.stateDir); fn(st); writeStateAtomic(deps.stateDir, st); });
@@ -446,7 +457,7 @@ function makeStandIn() {
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       const p = new URL(req.url, 'http://x').pathname; const body = parseJson(Buffer.concat(chunks).toString('utf8'));
-      const rec = { p, m: req.method, hdr: Object.keys(req.headers).sort(), body, q: new URL(req.url, 'http://x').search, key: req.headers['x-spm-api-key'] };
+      const rec = { p, m: req.method, hdr: Object.keys(req.headers).sort(), body, q: new URL(req.url, 'http://x').search, key: req.headers['x-spm-api-key'], ob: req.headers['x-spm-on-behalf-of-comment'] };
       S.calls.push(rec);
       const owners = { [FAKE_KEY]: ['spm-example-agent@agents.invalid', OTHER_EMAIL], [OTHER_KEY]: [OTHER_EMAIL], [OTHER_KEY]: [OTHER_EMAIL] };
       const sentKey = req.headers['x-spm-api-key'];
@@ -660,6 +671,25 @@ function defineCases(cases, S) {
     check(same(S.calls[0].hdr.filter((h) => h.startsWith('x-spm') || h === 'origin' || h === 'authorization'), ['x-spm-api-key', 'x-spm-user-email']), `list headers ${S.calls[0].hdr}`);
     check(same(S.calls[1].hdr.filter((h) => h.startsWith('x-spm') || h === 'origin' || h === 'authorization'), ['origin', 'x-spm-api-key', 'x-spm-user-email']), `create headers ${S.calls[1].hdr}`);
     check(same(Object.keys(S.calls[1].body).sort(), ['body', 'documentId', 'parent_id']) && same(Object.keys(S.calls[0].body), ['documentId']), 'request bodies');
+  });
+
+  rc('FC1', '--for-comment: the list and the create carry X-SPM-On-Behalf-Of-Comment with the given comment id (any case, sent lower-case); without the option neither carries it', async () => {
+    S.reset();
+    const r = await runCli(S, base(TOP, 'on behalf check', ['--for-comment', REPLY.toUpperCase()]));
+    check(r.code === 0 && S.calls.length === 2, `code ${r.code} calls ${S.calls.length} err ${r.errs.join('|')}`);
+    check(S.calls[0].ob === REPLY && S.calls[1].ob === REPLY, `header on the list ${S.calls[0].ob}, on the create ${S.calls[1].ob}`);
+    check(same(sendHdr(S.calls[1]).filter((h) => h.startsWith('x-spm') || h === 'origin'), ['origin', 'x-spm-api-key', 'x-spm-on-behalf-of-comment', 'x-spm-user-email']), `create headers ${sendHdr(S.calls[1])}`);
+    S.reset();
+    await runCli(S, base(TOP, 'no header check'));
+    check(S.calls.length === 2 && S.calls[0].ob === undefined && S.calls[1].ob === undefined, 'no header without the option');
+  });
+
+  rc('FC2', '--for-comment must be a uuid: any other value is refused (exit 2) and nothing is sent', async () => {
+    S.reset();
+    for (const v of ['nope', 'spm_k_test_not_a_comment_id']) {
+      const r = await runCli(S, base(TOP, 'x', ['--for-comment', v]));
+      check(r.code === 2 && S.calls.length === 0, `value ${v}: code ${r.code} calls ${S.calls.length}`);
+    }
   });
 
   rc('R14', 'the allow-list refuses another host, path, method, extra header or body shape before any call', async () => {
