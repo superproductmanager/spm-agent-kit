@@ -9,7 +9,7 @@ const path = require('node:path');
 const http = require('node:http');
 const { main, makeTransport, isApiPath } = require('../agent-call.cjs');
 
-const KEY = 'spm_k_test_agent_call_key_0123456789abcdef';
+const KEY = 'fake-agent-call-key-0123456789abcdef';
 const EMAIL = 'spm-example-agent@agents.invalid';
 const API_BASE = 'https://spm-stub.invalid';
 const COMMENT = '00000000-0000-4000-8000-0000000000c1';
@@ -137,7 +137,7 @@ test('a path that leaves the configured host is refused (exit 2) before any call
   const stub = await startStub();
   try {
     const bad = [
-      'https://evil.example/ok', 'http://evil.example/ok', '//evil.example/ok', '/ok@evil.example', 'ok', '/../ok', '/ok/../../x', '/ok#frag', '/ok\\x',
+      'https://evil.example/ok', 'http://evil.example/ok', '//evil.example/ok', '/ok@evil', 'ok', '/../ok', '/ok/../../x', '/ok#frag', '/ok\\x',
     ];
     for (const p of bad) {
       const r = await runCall(stub.port, ['--method', 'GET', '--path', p]);

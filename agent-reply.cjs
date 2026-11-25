@@ -686,7 +686,7 @@ function defineCases(cases, S) {
 
   rc('FC2', '--for-comment must be a uuid: any other value is refused (exit 2) and nothing is sent', async () => {
     S.reset();
-    for (const v of ['nope', 'spm_k_test_not_a_comment_id']) {
+    for (const v of ['nope', 'not-a-comment-id-at-all']) {
       const r = await runCli(S, base(TOP, 'x', ['--for-comment', v]));
       check(r.code === 2 && S.calls.length === 0, `value ${v}: code ${r.code} calls ${S.calls.length}`);
     }
