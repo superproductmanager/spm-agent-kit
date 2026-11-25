@@ -82,16 +82,21 @@ const crypto = require('node:crypto');
 const { spawn } = require('node:child_process');
 const { createRequire } = require('node:module');
 const { loadConfig } = require('./lib/config.cjs');
+const { resolveBackend } = require('./lib/backend.cjs');
 const { keyMode, NETWORK_SECRET_VALUE } = require('./lib/key-mode.cjs'); // K-A3 item 1
 
 // The Firebase SDK is installed by cloud-agent-setup.sh into this folder (SPM_AGENT_RUNTIME_DIR overrides it).
 const RUNTIME_DIR = process.env.SPM_AGENT_RUNTIME_DIR || path.join(os.homedir(), '.spm-agent-runtime');
-const PROJECT = 'litethink';
+// 0.3.0: the SPM server is configurable (settings "backend"); these lets start at the litethink values and applyBackend() sets them from the settings file.
+let BACKEND = resolveBackend({});
+let PROJECT = BACKEND.firebase_project;
 const REFERER = 'https://app.superproductmanager.ai/';
-const FN_HOST = 'asia-south1-litethink.cloudfunctions.net';
+let FN_HOST = BACKEND.api_host;
 const IDT_HOST = 'identitytoolkit.googleapis.com';
 const FS_HOST = 'firestore.googleapis.com';
-const FS_ROOT = `/v1/projects/${PROJECT}/databases/(default)/documents`;
+let FS_ROOT = `/v1/projects/${PROJECT}/databases/(default)/documents`;
+/** Sets the one server this run talks to (called once by main, and by the selftests). */
+function applyBackend(b) { BACKEND = b; PROJECT = b.firebase_project; FN_HOST = b.api_host; FS_ROOT = `/v1/projects/${PROJECT}/databases/(default)/documents`; }
 const FUTURE_SINCE = 2147483647; // a cursor above any real seq: the events route answers { reset: true, latest, signal_id } after one primary-key lookup (canary H3)
 const DEFAULTS = { mode: 'once', selfSkip: true };
 const DEFAULT_WAIT_S = 60;
@@ -1009,6 +1014,7 @@ async function main(argv, deps) {
   if (!parsed.ok) { deps.io.err(`agent-listen: ${parsed.error}`); deps.io.err(USAGE); return 2; }
   let conf;
   try { conf = loadConfig({ argv }); } catch (e) { deps.io.err(`agent-listen: ${e.message}`); return 2; }
+  applyBackend(conf.backend);
   const mode = keyMode(conf, { HTTPS_PROXY: process.env.HTTPS_PROXY, https_proxy: process.env.https_proxy }); // K-A3 item 1: no key_file means network-secret mode, which needs the proxy
   if (mode.mode === 'refused') { deps.io.err(`agent-listen: ${mode.message}`); return 2; }
   deps.transport = conf.transport; // realDeps' sign-in and listen read it
@@ -1026,7 +1032,7 @@ async function main(argv, deps) {
   else { try { key = deps.readKey(conf.keyFile); } catch (_) { key = null; } }
   if (typeof key !== 'string' || !key) { deps.io.err('agent-listen: cannot read the key file named in the settings file'); return 1; }
   let webKey = null;
-  try { webKey = deps.loadWebKey(conf.appId) || null; } catch (_) { webKey = null; } // B10: the inbox listener signs in with the SDK too (the same as item mode)
+  try { webKey = conf.backend.firebase_web_key || deps.loadWebKey(conf.appId) || null; } catch (_) { webKey = null; } // B10: the inbox listener signs in with the SDK too (the same as item mode)
   const listener = (cfg.inbox ? createInboxListener : createListener)({ ...cfg, email: conf.email, key, webKey }, deps);
   const off = installSignalHandlers(deps.proc, listener);
   try { return await listener.run(); } finally { off(); }
@@ -3094,7 +3100,7 @@ async function selftest() {
   return fail === 0 ? 0 : 1;
 }
 
-module.exports = { transportRefusal, loadSdk, parseArgs, guardRequest, GuardError, readCursorFile, writeCursorAtomic, makeTransport, loadWebKeyFrom, readKeyFile, createListener, createInboxListener, noticeLine, cursorKindOf, installSignalHandlers, exitWhenDone, realDeps, main, selftestChild, selftest, istIso, FUTURE_SINCE };
+module.exports = { applyBackend, transportRefusal, loadSdk, parseArgs, guardRequest, GuardError, readCursorFile, writeCursorAtomic, makeTransport, loadWebKeyFrom, readKeyFile, createListener, createInboxListener, noticeLine, cursorKindOf, installSignalHandlers, exitWhenDone, realDeps, main, selftestChild, selftest, istIso, FUTURE_SINCE };
 
 if (require.main === module) {
   const argv = process.argv.slice(2);

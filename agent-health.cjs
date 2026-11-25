@@ -142,7 +142,7 @@ function resolveKey(c, env) {
 function sendTarget(c, env) {
   const kr = resolveKey(c, env);
   if (kr.error) return { error: kr.error };
-  try { return { key: kr.key, base: R.spmBase(env) }; } catch (e) { return { error: e.message }; }
+  try { return { key: kr.key, base: R.spmBase(env, c.backend) }; } catch (e) { return { error: e.message }; }
 }
 
 // The kit version from <kit>/VERSION, written by the installer. { version } or { error }.

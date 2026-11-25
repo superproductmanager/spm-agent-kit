@@ -67,24 +67,28 @@ const crypto = require('node:crypto');
 const readline = require('node:readline');
 const { spawn } = require('node:child_process');
 const { loadConfig, ConfigError } = require(path.join(__dirname, 'lib', 'config.cjs'));
+const { resolveBackend } = require(path.join(__dirname, 'lib', 'backend.cjs'));
 const { keyMode, NETWORK_SECRET_VALUE } = require(path.join(__dirname, 'lib', 'key-mode.cjs')); // K-A3 item 1
 
-const FN_HOST = 'asia-south1-litethink.cloudfunctions.net';
+// 0.3.0: the server is configurable (settings "backend"). These start at the litethink values; applyBackend() sets them from the settings file.
+let FN_HOST = resolveBackend({}).api_host;
 const FN_PATH = '/documentsApi/reactToDocumentComment';
-const ENDPOINT_URL = `https://${FN_HOST}${FN_PATH}`;
+let ENDPOINT_URL = `https://${FN_HOST}${FN_PATH}`;
 const ORIGIN = 'https://app.superproductmanager.ai';
 const EMOJI = '\u{1F440}'; // eyes
 const MAX_PER_MINUTE = 30;
 const REQUEST_TIMEOUT_MS = 8000;
 const SEEN_CAP = 1000;
 const LIST_PATH = '/documentsApi/listDocumentComments';
-const LIST_URL = `https://${FN_HOST}${LIST_PATH}`;
+let LIST_URL = `https://${FN_HOST}${LIST_PATH}`;
 const LOOKUP_TIMEOUT_MS = 2000;
 const THREAD_CACHE_MS = 60000;
 const THREAD_CAP = 500;
 const LIST_MAX_BYTES = 8 * 1024 * 1024;
 const CREATE_PATH = '/documentsApi/createDocumentComment';
-const CREATE_URL = `https://${FN_HOST}${CREATE_PATH}`;
+let CREATE_URL = `https://${FN_HOST}${CREATE_PATH}`;
+/** Sets the one server this run talks to (main, and the selftests). */
+function applyBackend(b) { FN_HOST = b.api_host; ENDPOINT_URL = `https://${FN_HOST}${FN_PATH}`; LIST_URL = `https://${FN_HOST}${LIST_PATH}`; CREATE_URL = `https://${FN_HOST}${CREATE_PATH}`; }
 const TEXT_TIMEOUT_MS = 8000; // the reply route stores the comment before it answers, so it needs the same budget as a reaction (2 s cut off replies that were stored)
 const TEXT_MAX_PER_MINUTE = 10;
 const ITEM_PATH_RE = /^\/(?:boardsApi\/tasks|mapsApi\/maps)\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/comments$/; // the board (task) and map comment routes (lower-case ids only; the line's ids are lower-cased first)
@@ -597,6 +601,7 @@ async function main(argv, deps) {
     if (!(e instanceof ConfigError)) throw e;
     err(`agent-ack: ${e.message}`); return 2;
   }
+  applyBackend(config.backend);
   const parsed = parseArgs(withoutConfig(argv));
   if (!parsed.ok) { err(`agent-ack: ${parsed.msg}`); err(USAGE); return 2; }
   const mode = keyMode(config, deps.env || process.env); // K-A3 item 1: no key_file means network-secret mode, which needs the proxy
@@ -2030,7 +2035,7 @@ async function selftest() {
   return fail === 0 ? 0 : 1;
 }
 
-module.exports = { parseArgs, isAddressed, addressedReason, guardRequest, guardList, guardCreate, guardApi, GuardError, makeTransport, makeApi, createAcker, readKeyFile, main, realDeps, runChild, selftest, ENDPOINT_URL, LIST_URL, CREATE_URL, EMOJI, setAckName };
+module.exports = { applyBackend, parseArgs, isAddressed, addressedReason, guardRequest, guardList, guardCreate, guardApi, GuardError, makeTransport, makeApi, createAcker, readKeyFile, main, realDeps, runChild, selftest, ENDPOINT_URL, LIST_URL, CREATE_URL, EMOJI, setAckName };
 
 if (require.main === module) {
   const argv = process.argv.slice(2);

@@ -1,5 +1,23 @@
 # Release notes
 
+## 0.3.0
+
+Action needed: no. Existing installs keep the litethink server. Nothing changes until a settings file has a `backend` block.
+
+### New
+
+- Optional `backend` block in the settings file: `api_base`, `firebase_project` and `firebase_web_key`. Each field is optional and falls back to its litethink value. The README has a section on pointing the kit at another server.
+- One module, `lib/backend.cjs`, holds the server values. The scripts that used to hard-code the litethink host, project and accountApi path (`agent-listen.cjs`, `agent-ack.cjs`, `agent-reply.cjs`, `lib/report.cjs`) now read them from it.
+
+### Security
+
+- Every host guard (listener, ack, reply and the report sender) admits only the configured https host, exact match. The litethink host is refused once another server is configured, and every other host stays refused.
+- `backend` values are checked when the settings file is read: `api_base` must be an https origin with no path, port, query or credentials, and a bad value stops the script with exit code 2 and one line.
+
+### Tests
+
+- `test/backend.test.cjs` covers the litethink defaults, a configured host, refused values, and the guards of each script on the configured host and on other hosts.
+
 ## 0.2.1
 
 Action needed: yes. An admin replaces the setup line in the Claude environment's Setup script with the 0.2.1 line. Environments keep running their current version until then.

@@ -1,6 +1,6 @@
 # SPM agent kit
 
-Status: preview for review. Current version: 0.2.1 (see RELEASE-NOTES.md). Do not install it in production.
+Status: preview for review. Current version: 0.3.0 (see RELEASE-NOTES.md). Do not install it in production.
 
 The SPM agent kit lets a Claude Code cloud session listen for tags of an SPM agent.
 When someone writes `@` and the agent's name in an SPM comment, the agent in your session
@@ -91,6 +91,32 @@ symlink is refused too. The check runs before any download, and again just befor
 kit is removed. The installer stages the new kit in a hidden folder beside the install folder, so the final move is a rename.
 
 Its own file is at `install/install-kit.sh`.
+
+## Pointing the kit at another SPM server
+
+By default the kit talks to the litethink SPM server. To point an install at another server, add an optional
+`backend` block to the agent's settings file. Each field is optional. A field you leave out keeps its litethink value,
+so a settings file without the block works exactly as before.
+
+```json
+{
+  "agent": { "name": "Example agent", "email": "spm-example-agent@agents.invalid" },
+  "key_file": "/abs/path/example-agent.key",
+  "backend": {
+    "api_base": "https://functions.example.com",
+    "firebase_project": "example-spm-project",
+    "firebase_web_key": "<the web API key of that Firebase project>"
+  }
+}
+```
+
+- `api_base` is the origin of the functions host only: `https`, no path, no port, no query and no user name or password.
+  The scripts add their own service paths. The listener, ack, reply and report scripts send the agent's key only to that host.
+- `firebase_project` is the Firebase project id that the listener signs in to.
+- `firebase_web_key` is the web API key used for the listener's sign-in. Leave it out to use the key sources the kit already reads.
+- Any other host is refused, as before. Setting `backend` does not widen what the kit may call; it only moves the one host it may call.
+- The SPM server must run the same API routes as litethink.
+- Changing `backend` is a settings-file change only. Run the start or setup line again after you change it so the listener restarts against the new server.
 
 ## Settings
 

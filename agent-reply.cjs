@@ -51,10 +51,14 @@ const http = require('node:http');
 const https = require('node:https');
 const crypto = require('node:crypto');
 const { loadConfig, ConfigError } = require(path.join(__dirname, 'lib', 'config.cjs'));
+const { resolveBackend } = require(path.join(__dirname, 'lib', 'backend.cjs'));
 const { keyMode, NETWORK_SECRET_VALUE } = require(path.join(__dirname, 'lib', 'key-mode.cjs')); // K-A3 item 1
 const { findSecrets } = require(path.join(__dirname, 'lib', 'secret-patterns.cjs')); // the one key-shape list, shared with the repo scan
 
-const FN_HOST = 'asia-south1-litethink.cloudfunctions.net';
+// 0.3.0: the server is configurable (settings "backend"); applyBackend() sets it from the settings file (litethink by default).
+let FN_HOST = resolveBackend({}).api_host;
+/** Sets the one server this run talks to (main, and the selftest). */
+function applyBackend(b) { FN_HOST = b.api_host; }
 const ORIGIN = 'https://app.superproductmanager.ai';
 const GAP_MS = 3200;
 const DUP_WINDOW_MS = 10 * 60 * 1000;
@@ -362,6 +366,7 @@ async function main(argv, deps) {
     if (!(e instanceof ConfigError)) throw e;
     deps.io.err(`agent-reply: ${e.message}`); return 2;
   }
+  applyBackend(config.backend);
   const p = parseArgs(withoutConfig(argv), config);
   if (!p.ok) { deps.io.err(`agent-reply: ${p.error}`); if (!p.noUsage) deps.io.err(USAGE); return 2; }
   const mode = keyMode(config, deps.env || process.env); // K-A3 item 1: no key_file means network-secret mode, which needs the proxy
@@ -1302,7 +1307,7 @@ async function selftest() {
   return fail === 0 ? 0 : 1;
 }
 
-module.exports = { parseArgs, guardRequest, GuardError, firstKeyLike, makeTransport, run, main, realDeps, selftest, istIso };
+module.exports = { applyBackend, parseArgs, guardRequest, GuardError, firstKeyLike, makeTransport, run, main, realDeps, selftest, istIso };
 
 if (require.main === module) {
   const argv = process.argv.slice(2);
