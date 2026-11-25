@@ -170,7 +170,8 @@ A command matches a rule only when it starts with that same absolute path, unquo
 | File | What it does |
 |---|---|
 | `agent-listen.cjs` | Watches the agent's notice inbox and reports new tags. |
-| `agent-reply.cjs` | Posts a reply in a comment thread as the agent. |
+| `agent-reply.cjs` | Posts a reply in a comment thread as the agent. With `--for-comment`, posts it on behalf of the person who tagged the agent. |
+| `agent-call.cjs` | Makes one SPM API call as the agent, optionally on behalf of the tagging person with `--for-comment`. |
 | `agent-ack.cjs` | Posts a short "seen" note in a thread, so people know the request arrived. |
 | `agent-resolve.cjs` | Marks a notice as resolved, so the listener stops raising it again. |
 | `agent-selfcheck.cjs` | Runs checks on the settings file, the key and the server. Prints one cause and one fix for each failure. |
@@ -243,6 +244,21 @@ The listener writes one JSON line per notice. These keys tell a reader what to d
 | `skipped` | `no_lookup` when a catch-up or re-raise line is for a board or map and no read can show the agent's earlier replies. Nothing is posted for it. |
 | `text_acked` | `true` when the "Seen" reply was posted, `false` when it failed, `null` when no reply was tried. |
 | `ack_error` | Set when a step of the "Seen" reply failed. `lookup` means the thread check failed, so nothing was posted. |
+
+## Acting for the person who tagged the agent (`agent-call.cjs`, `--for-comment`)
+
+When a person tags the agent in a comment, the agent can act with that person's permissions, and only those. Pass the tagging comment's id as `--for-comment`:
+
+```sh
+node agent-call.cjs --config <absolute path> --method GET --path /boardsApi/tasks/<task id>/comments --workspace <workspace> --for-comment <comment id>
+```
+
+- `--method` is `GET` or `POST`. `--path` is an API path such as `/boardsApi/tasks/<id>/comments`. A full URL, a `//` path or a `..` segment is refused before any call. The host is always `backend.api_base` from the settings file.
+- `--workspace` sends `X-SPM-Workspace`. `--for-comment` sends `X-SPM-On-Behalf-Of-Comment`. `--body-file` (POST only) is a file holding the JSON body.
+- The JSON reply body goes to stdout and the script exits 0. A 4xx prints `HTTP <status> <error code>` on stderr and exits 2 (for example `on_behalf_not_tagged`). Anything else exits 1. The key is never printed.
+- `agent-reply.cjs --for-comment <comment id>` sends the same header on its thread lookup and its post.
+
+SPM checks the comment on every call: it must tag the agent, be less than 24 hours old, be written by a person, and the person must still be able to see the item.
 
 ## Tests
 

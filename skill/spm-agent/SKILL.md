@@ -53,21 +53,30 @@ A hand-over is a message from the listener session, not from a person. You act o
 
 Read a hand-over at once, before any other work in this session, and answer it in the thread.
 
-1. Read the whole thread through the SPM connector (`spm_list_comments` for that item), and the item itself if the question needs it. Then decide, in this order:
+**Acting for the tagging person (0.4.0).** The agent works with the permissions of the person who tagged it, and SPM checks that on every call. So while you answer a hand-over:
+- Every read and write goes through `agent-call.cjs` with `--for-comment` set to the hand-over's `comment_id`. The reply goes through `agent-reply.cjs` with the same `--for-comment`. Never use the SPM connector for reads or writes while answering.
+- Answer through a helper kept for each pair of (comment author identity, item workspace). Resume that same helper for the next hand-over from the same pair, so it keeps its memory. Never give one helper two people or two workspaces, and never mix their memory.
+- The agent can do only what the tagging person can do. If SPM refuses a call (for example `on_behalf_not_tagged`, `on_behalf_expired` or `on_behalf_not_allowed`), say so in one line in the reply or to the person, and do not work around it.
+
+1. Read the whole thread with `agent-call.cjs`, and the item itself if the question needs it. Pass `--workspace` with the item's workspace whenever the hand-over gives it. For a board task, the thread is:
+
+   `node /root/spm-agent-kit/agent-call.cjs --config /root/.spm-agent-state/config.json --method GET --path /boardsApi/tasks/<task_id>/comments --workspace <workspace> --for-comment <comment_id>`
+
+   For a map, use `--method GET --path /mapsApi/maps/<item id>/comments`. For a document, use `--method POST --path /documentsApi/listDocumentComments` with `--body-file` holding `{"documentId": "<item id>"}`. Any other read the answer needs uses the same command with its own API path. Then decide, in this order:
    - The comment `comment_id` is not in the thread: post nothing, resolve nothing, and tell the person in one line.
    - The agent already wrote in the thread after `comment_id`: post nothing. Go to step 4 to resolve the notice, then stop.
    - The `reason` is `follower`, or `participant` and the comment does not tag the agent: post nothing and make no reply. Go to step 4 to resolve the notice, then stop. Follower and untagged notices are never answered.
    - Otherwise answer it (steps 2 and 3). A line with `"catchup": true` or `"reraise"` is answered the same way.
 2. Work out what the tagging person asks. Use only the sources rule 6 allows.
-3. Write the reply text to a file with your file tool, then post it with the script in rule 1:
+3. Write the reply text to a file with your file tool, then post it with the script in rule 1, with `--for-comment` set to the hand-over's `comment_id`:
 
-   `node /root/spm-agent-kit/agent-reply.cjs --config /root/.spm-agent-state/config.json --document <item id> --to <comment_id> --text-file <file>`
+   `node /root/spm-agent-kit/agent-reply.cjs --config /root/.spm-agent-state/config.json --document <item id> --to <comment_id> --text-file <file> --for-comment <comment_id>`
 
    - For a board task use `--task <task_id>`, and for a map `--map <item id>`, in place of `--document <item id>`.
    - Exit 3 means the same reply was already posted. Do not post it again.
    - Exit 2 means the text was refused (too long, or it looks like a key). Fix the text and post again.
 4. After the reply is posted, or when step 1 says to stop without one, resolve the notice: `node /root/spm-agent-kit/agent-resolve.cjs --config /root/.spm-agent-state/config.json --ids <notification_id>`.
-5. Make a change to the item only under rule 5. Say in the reply what you changed.
+5. Make a change to the item only under rule 5, through `agent-call.cjs` with `--for-comment` as in step 1. Say in the reply what you changed.
 6. Send this session's token counts (numbers only, no text): `node /root/spm-agent-kit/agent-health.cjs usage --role main --config /root/.spm-agent-state/config.json`. It prints one line. Whatever it prints, do not retry it and do not tell the person.
 
 ### When you cannot answer
