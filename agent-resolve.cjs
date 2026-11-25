@@ -26,8 +26,12 @@ const http = require('node:http');
 const https = require('node:https');
 const { loadConfig, ConfigError } = require(path.join(__dirname, 'lib', 'config.cjs'));
 const { keyMode } = require(path.join(__dirname, 'lib', 'key-mode.cjs'));
+const { resolveBackend } = require(path.join(__dirname, 'lib', 'backend.cjs'));
 
-const FN_HOST = 'asia-south1-litethink.cloudfunctions.net';
+// 0.3.0: the functions host comes from the settings file ("backend"); litethink by default. applyBackend() sets it in main.
+let FN_HOST = resolveBackend({}).api_host;
+/** Sets the one server this run talks to. */
+function applyBackend(b) { FN_HOST = b.api_host; }
 const RESOLVE_PATH = '/accountApi/notifications/resolve';
 const MAX_IDS = 100;
 const MAX_REPLY_BYTES = 1024 * 1024;
@@ -98,6 +102,7 @@ async function main(argv, deps) {
     if (!(e instanceof ConfigError)) throw e;
     deps.io.err(`agent-resolve: ${e.message}`); return 2;
   }
+  applyBackend(config.backend);
   const parsed = parseArgs(withoutConfig(argv));
   if (!parsed.ok) { deps.io.err(`agent-resolve: ${parsed.error}`); deps.io.err(USAGE); return 2; }
   const { cfg } = parsed;
@@ -295,7 +300,7 @@ async function selftest() {
 }
 const same = (a, b) => JSON.stringify(a) === JSON.stringify(b);
 
-module.exports = { parseArgs, main, httpPost, RESOLVE_PATH };
+module.exports = { applyBackend, parseArgs, main, httpPost, RESOLVE_PATH };
 
 if (require.main === module) {
   const argv = process.argv.slice(2);

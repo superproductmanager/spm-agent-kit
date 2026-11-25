@@ -29,7 +29,7 @@
  * The state folder is SPM_AGENT_STATE_DIR, else $HOME/.spm-agent-state (see lib/report.cjs). It holds the spool
  * (setup-report.jsonl), the rejected log, the sent copy (health-sent.jsonl), the salt for session keys (report-salt),
  * health.json (state, and reports from SPM), and the listener log and main-session-id the heartbeat reads.
- * SPM: https://asia-south1-litethink.cloudfunctions.net/accountApi (override for tests: SPM_AGENT_API_BASE, 127.0.0.1 only;
+ * SPM: the configured backend's accountApi (settings "backend"; https://asia-south1-litethink.cloudfunctions.net/accountApi when none is set) (override for tests: SPM_AGENT_API_BASE, 127.0.0.1 only;
  * SPM_AGENT_IDENTIFY_TIMEOUT_MS shortens the 10 s identify timeout, for tests only).
  * EXIT CODES: 0 ok, or reports kept for later, or reports off; 2 bad arguments or settings file, a queueing command
  * with no kit VERSION file, or a bad report-salt; 5 the settings file names another agent than this key's; 6 SPM refused

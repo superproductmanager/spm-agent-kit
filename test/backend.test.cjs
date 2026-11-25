@@ -127,3 +127,34 @@ test('lib/report: the SPM base is the configured accountApi; the litethink base 
   assert.throws(() => report.spmBase({ SPM_AGENT_API_BASE: report.SPM_DEFAULT_BASE }, b), 'litethink base refused under a configured backend');
   assert.throws(() => report.spmBase({ SPM_AGENT_API_BASE: 'https://evil.example.net/accountApi' }, b), 'other host refused');
 });
+
+// ---------------------------------------------------------------- 0.3.0 round 2: every script reads the configured server
+
+const resolveAgent = require('../agent-resolve.cjs');
+const selfcheck = require('../agent-selfcheck.cjs');
+
+test('agent-resolve: a configured backend is the host of the request (dry run shows it, nothing sent)', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'spm-kit-resolve-'));
+  const cfg = path.join(dir, 'cfg.json');
+  fs.writeFileSync(cfg, JSON.stringify({ agent: { name: 'Example agent', email: 'spm-example-agent@agents.invalid' }, backend: CONF }));
+  const out = []; const err = [];
+  const code = await resolveAgent.main(['--config', cfg, '--ids', UUID, '--dry-run'], { io: { out: (s) => out.push(String(s)), err: (s) => err.push(String(s)) }, env: {}, post: () => { throw new Error('nothing may be sent in a dry run'); } });
+  const text = out.join('\n') + err.join('\n');
+  assert.equal(code, 0, text);
+  assert.ok(text.includes(`https://${CONF_HOST}/accountApi/notifications/resolve`), text);
+  assert.ok(!text.includes('litethink'), text);
+});
+
+test('agent-selfcheck: a configured backend sets the functions host, the project and the secret text', () => {
+  selfcheck.applyBackend(resolveBackend({ backend: CONF }));
+  try {
+    const t = selfcheck.currentTargets();
+    assert.equal(t.fn_host, CONF_HOST);
+    assert.equal(t.project, CONF.firebase_project);
+    assert.equal(t.fs_root, `/v1/projects/${CONF.firebase_project}/databases/(default)/documents`);
+    assert.ok(t.secret_not_reached.every((x) => x.includes(CONF_HOST) && !x.includes('litethink')), JSON.stringify(t.secret_not_reached));
+  } finally { selfcheck.applyBackend(resolveBackend({})); }
+  const d = selfcheck.currentTargets();
+  assert.equal(d.fn_host, 'asia-south1-litethink.cloudfunctions.net');
+  assert.equal(d.project, 'litethink');
+});

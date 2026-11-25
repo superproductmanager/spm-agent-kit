@@ -276,3 +276,14 @@ test('key_file mode: the key value never appears in selfcheck output', async () 
     await spm.close();
   }
 });
+
+// ---------------------------------------------------------------- 0.3.0 round 2: the network-secret host text follows the configured backend
+test('network-secret mode: the not-reached text names the configured host', () => {
+  const { resolveBackend } = require('../lib/backend.cjs');
+  const sc = require('../agent-selfcheck.cjs');
+  sc.applyBackend(resolveBackend({ backend: { api_base: 'https://functions.spm-test.example.com' } }));
+  try {
+    const t = sc.currentTargets();
+    assert.ok(t.secret_not_reached.every((x) => x.includes('functions.spm-test.example.com')), JSON.stringify(t.secret_not_reached));
+  } finally { sc.applyBackend(resolveBackend({})); }
+});

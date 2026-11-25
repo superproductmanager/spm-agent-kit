@@ -53,15 +53,17 @@ const path = require('node:path');
 const { loadWebKeyFrom, readKeyFile } = require('./agent-listen.cjs');
 const crypto = require('node:crypto');
 const { loadConfig, loadConfigOptionalAgent } = require('./lib/config.cjs');
+const { resolveBackend } = require('./lib/backend.cjs');
 const { keyMode, proxyUrl } = require('./lib/key-mode.cjs');
 
-const PROJECT = 'litethink';
+// 0.3.0: the functions host and the Firebase project come from the settings file ("backend"); litethink by default.
+let PROJECT = resolveBackend({}).firebase_project;
 const FS_HOST = 'firestore.asia-southeast1.rep.googleapis.com'; // D10: our database's regional host
 const SHARED_FS_HOST = 'firestore.googleapis.com';             // shared host: info only
-const FN_HOST = 'asia-south1-litethink.cloudfunctions.net';
+let FN_HOST = resolveBackend({}).api_host;
 const IDT_HOST = 'identitytoolkit.googleapis.com';
 const REFERER = 'https://app.superproductmanager.ai/';
-const FS_ROOT = `/v1/projects/${PROJECT}/databases/(default)/documents`;
+let FS_ROOT = `/v1/projects/${PROJECT}/databases/(default)/documents`;
 const TIMEOUT_MS = 10000;
 
 // Server code -> one plain cause line and its fix. Keys are the codes listed in the header comment.
@@ -91,7 +93,11 @@ const SERVER_CAUSES = {
 const UNEXPECTED_FIX = 'run again; if it repeats, send this line to SPM';
 // Network-secret mode (K-A3 item 2): these three codes mean the cloud secret never reached SPM.
 const SECRET_NOT_REACHED_CODES = ['missing_credential', 'invalid_credential', 'untrusted_origin'];
-const SECRET_NOT_REACHED = ['the network secret did not reach SPM: check the secret\'s host is exactly asia-south1-litethink.cloudfunctions.net and its header is X-SPM-API-Key', 'set the network secret for host asia-south1-litethink.cloudfunctions.net with header X-SPM-API-Key, then run again'];
+let SECRET_NOT_REACHED = secretNotReachedFor(FN_HOST);
+/** The two texts for a refused network secret. They name the configured functions host (0.3.0). */
+function secretNotReachedFor(host) {
+  return ['the network secret did not reach SPM: check the secret\'s host is exactly ' + host + ' and its header is X-SPM-API-Key', 'set the network secret for host ' + host + ' with header X-SPM-API-Key, then run again'];
+}
 
 // --setup prints nothing on stdout; its results go to the spool only.
 let QUIET = false;
@@ -320,6 +326,14 @@ async function mainSetup(argv) {
 
 // ---------------------------------------------------------------- arguments and main
 
+/** Sets the one server this run talks to (0.3.0). main reads the settings file first; tests call it directly. */
+function applyBackend(b) {
+  PROJECT = b.firebase_project; FN_HOST = b.api_host; FS_ROOT = `/v1/projects/${PROJECT}/databases/(default)/documents`;
+  BASE_FLAGS['--base-fn'] = `https://${FN_HOST}`; SECRET_NOT_REACHED = secretNotReachedFor(FN_HOST);
+}
+/** The targets this run uses (for the tests). */
+function currentTargets() { return { fn_host: FN_HOST, project: PROJECT, fs_root: FS_ROOT, secret_not_reached: SECRET_NOT_REACHED.slice() }; }
+
 // The test-only --base-* flags (0.2.0): a value must be http on 127.0.0.1 (any port and path) or exactly that slot's default.
 const BASE_FLAGS = {
   '--base-regional': `https://${FS_HOST}`,
@@ -363,6 +377,7 @@ function parseArgs(argv) {
 
 async function main(argv) {
   if (argv.includes('--setup')) return mainSetup(argv.filter((x) => x !== '--setup'));
+  try { applyBackend(loadConfig({ argv, env: process.env }).backend); } catch (_) { /* a settings error is reported below, as before */ }
   const a = parseArgs(argv);
   if (a.usage) { process.stderr.write(a.usage + '\n'); return 2; }
   let conf;
@@ -397,4 +412,4 @@ if (require.main === module) {
   );
 }
 
-module.exports = { parseArgs, main, SERVER_CAUSES, serverCause, kitVersion };
+module.exports = { applyBackend, currentTargets, parseArgs, main, SERVER_CAUSES, serverCause, kitVersion };

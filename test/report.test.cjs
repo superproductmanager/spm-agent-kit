@@ -458,3 +458,11 @@ test('B3 a network error keeps every line; a 429 or 5xx keeps every line; 2xx co
     assert.deepEqual(readLines(file), []);
   } finally { await srv.close(); }
 });
+
+// ---------------------------------------------------------------- 0.3.0 round 2: a configured backend is the production base
+test('spmBase: a configured backend is the production base; the litethink base is then refused', () => {
+  const { resolveBackend } = require('../lib/backend.cjs');
+  const b = resolveBackend({ backend: { api_base: 'https://functions.spm-test.example.com' } });
+  assert.equal(report.spmBase({}, b), 'https://functions.spm-test.example.com/accountApi');
+  assert.throws(() => report.spmBase({ SPM_AGENT_API_BASE: 'https://asia-south1-litethink.cloudfunctions.net/accountApi' }, b));
+});

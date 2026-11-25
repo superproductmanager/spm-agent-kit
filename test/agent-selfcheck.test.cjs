@@ -822,3 +822,15 @@ test('0.2.0 parseArgs: http://127.0.0.1 (any port and path) and each slot defaul
   const crossSlot = parseArgs(['--base-regional', FN_DEFAULT]);
   assert.ok(crossSlot.usage, 'the default of another slot is not accepted here');
 });
+
+// ---------------------------------------------------------------- 0.3.0 round 2: the configured backend drives the self-check targets
+test('agent-selfcheck: the configured functions host and project are the targets', () => {
+  const { resolveBackend } = require('../lib/backend.cjs');
+  const sc = require('../agent-selfcheck.cjs');
+  sc.applyBackend(resolveBackend({ backend: { api_base: 'https://functions.spm-test.example.com', firebase_project: 'spm-test-example' } }));
+  try {
+    const t = sc.currentTargets();
+    assert.equal(t.fn_host, 'functions.spm-test.example.com');
+    assert.equal(t.fs_root, '/v1/projects/spm-test-example/databases/(default)/documents');
+  } finally { sc.applyBackend(resolveBackend({})); }
+});
