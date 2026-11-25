@@ -35,6 +35,8 @@ function startStub() {
       const body = Buffer.concat(chunks).toString('utf8');
       calls.push({ method: req.method, path: u.pathname, query: u.search, headers: req.headers, body });
       const send = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
+      if (u.pathname === '/documentsApi/listDocumentComments') return send(200, { comments: [] });
+      if (u.pathname === '/documentsApi/listDocumentComments') return send(200, { comments: [] });
       if (u.pathname === '/ok') return send(200, { ok: true, echo: 'ok' });
       if (u.pathname === '/echo-body') return send(200, { got: JSON.parse(body || 'null') });
       if (u.pathname === '/missing') return send(404, { code: 'not_found', error: 'no such item' });
@@ -50,12 +52,13 @@ function startStub() {
 }
 
 // Runs main() with the real transport pointed at the stub port; returns { code, out, err, env }.
-async function runCall(port, argv, { env = {}, config = cfgFile } = {}) {
+async function runCall(port, argv, { env = {}, config = cfgFile, seen = null } = {}) {
   const out = []; const err = [];
+  const real = makeTransport({ lib: http, resolveTarget: () => ({ hostname: '127.0.0.1', port }) });
   const deps = {
     io: { out: (s) => out.push(s), err: (s) => err.push(s) },
     env: { ...env },
-    http: makeTransport({ lib: http, resolveTarget: () => ({ hostname: '127.0.0.1', port }) }),
+    http: (url, ...rest) => { if (seen) seen.push(url); return real(url, ...rest); },
     readKeyFile: (file) => fs.readFileSync(file, 'utf8').trim(),
   };
   const code = await main(['--config', config, ...argv], deps);
@@ -180,5 +183,31 @@ test('network-secret mode (no key_file, proxy set) sends the placeholder; no pro
     const refused = await runCall(stub.port, ['--method', 'GET', '--path', '/ok'], { config: noKeyCfg, env: {} });
     assert.equal(refused.code, 2);
     assert.equal(stub.calls.length, 1, 'a refused run still reached the stub');
+  } finally { await stub.close(); }
+});
+
+test('the base URL comes from the settings backend block (resolveBackend): the call goes to the stub host named there', async () => {
+  const stub = await startStub();
+  try {
+    const hostCfg = path.join(dir, 'backend-host.json');
+    fs.writeFileSync(hostCfg, JSON.stringify({ agent: { name: 'Example agent', email: EMAIL }, key_file: keyFile, backend: { api_base: 'https://stub-backend.invalid' } }));
+    const seen = [];
+    const r = await runCall(stub.port, ['--method', 'GET', '--path', '/ok?q=1'], { config: hostCfg, seen });
+    assert.equal(r.code, 0, r.err);
+    assert.equal(seen.length, 1);
+    assert.equal(new URL(seen[0]).origin, 'https://stub-backend.invalid');
+    assert.equal(new URL(seen[0]).pathname + new URL(seen[0]).search, '/ok?q=1');
+  } finally { await stub.close(); }
+});
+
+test('documentsApi paths send Origin https://app.superproductmanager.ai; other paths send no Origin', async () => {
+  const stub = await startStub();
+  try {
+    const d = await runCall(stub.port, ['--method', 'POST', '--path', '/documentsApi/listDocumentComments', '--body-file', bodyFile]);
+    assert.equal(d.code, 0, d.err);
+    assert.equal(stub.calls[0].headers.origin, 'https://app.superproductmanager.ai');
+    const b = await runCall(stub.port, ['--method', 'GET', '--path', '/ok']);
+    assert.equal(b.code, 0, b.err);
+    assert.equal(stub.calls[1].headers.origin, undefined, 'a non-document path sent an Origin');
   } finally { await stub.close(); }
 });

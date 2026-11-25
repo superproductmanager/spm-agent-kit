@@ -23,6 +23,7 @@ const { loadConfig, ConfigError } = require(path.join(__dirname, 'lib', 'config.
 const { keyMode, NETWORK_SECRET_VALUE, proxyUrl } = require(path.join(__dirname, 'lib', 'key-mode.cjs'));
 
 const METHODS = ['GET', 'POST'];
+const ORIGIN = 'https://app.superproductmanager.ai'; // sent on documentsApi paths, as agent-reply.cjs does on documents posts
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const WORKSPACE_RE = /^[A-Za-z0-9_-]{1,80}$/;
 const PATH_RE = /^\/[A-Za-z0-9_\-./]+(\?[A-Za-z0-9_\-.=&%]*)?$/;
@@ -138,9 +139,10 @@ async function main(argv, deps = realDeps()) {
   }
   const parsed = parseCallArgs(withoutConfig(argv));
   if (!parsed.ok) { err(parsed.error); deps.io.err(USAGE); return 2; }
-  const base = new URL(config.backend.api_base);
-  const url = new URL(parsed.path, base.origin + '/');
-  if (url.origin !== base.origin) { err('refused: the path leaves the configured host'); return 2; }
+  // config.backend is the resolveBackend() output (lib/config.cjs), the same field agent-reply.cjs reads through applyBackend
+  const backend = config.backend;
+  const url = new URL(parsed.path, backend.api_base);
+  if (url.hostname !== backend.api_host || url.origin !== new URL(backend.api_base).origin) { err('refused: the path leaves the configured host'); return 2; }
   const mode = keyMode(config, deps.env || process.env);
   if (mode.mode === 'refused') { err(mode.message); return 2; }
   let key;
@@ -161,6 +163,7 @@ async function main(argv, deps = realDeps()) {
   const headers = { 'X-SPM-API-Key': key, 'X-SPM-User-Email': config.email };
   if (parsed.workspace) headers['X-SPM-Workspace'] = parsed.workspace;
   if (parsed.forComment) headers['X-SPM-On-Behalf-Of-Comment'] = parsed.forComment;
+  if (url.pathname.startsWith('/documentsApi/')) headers.Origin = ORIGIN;
   let res;
   try { res = await deps.http(url.href, parsed.method, headers, body, { timeoutMs: TIMEOUT_MS }); } catch (e) {
     err(`no answer from the server (${word(e && e.code)}); nothing was returned`); return 1;
