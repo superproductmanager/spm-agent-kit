@@ -1091,3 +1091,50 @@ test('0.2.0 report on: setup keeps the spool, including a report already waiting
     assert.ok(fs.readFileSync(SPOOL(sb), 'utf8').includes(OLD_LINE.trim()), 'the waiting report was dropped');
   } finally { cleanup(sb); }
 });
+
+// ---- 0.3.1 (KITFIX bug 3): --api-base, --firebase-project, --firebase-web-key write settings.backend before selfcheck --setup
+const BACKEND_API = 'https://example-functions.invalid';
+const BACKEND_PROJECT = 'example-project';
+const BACKEND_KEY = 'example-web-key-0000000000000000';
+/** A selfcheck stand-in that records its arguments and the config file as it is when it is called. */
+function stubSelfcheckRecordingConfig(sb) {
+  const body = [
+    "'use strict';",
+    "const fs = require('node:fs');",
+    "const path = require('node:path');",
+    "let cfg = null;",
+    "try { cfg = fs.readFileSync(path.join(process.env.HOME, '.spm-agent-state', 'config.json'), 'utf8'); } catch (_) { cfg = null; }",
+    `fs.appendFileSync(${JSON.stringify(sb.selfcheckLog)}, JSON.stringify({ args: process.argv.slice(2), config: cfg }) + '\\n');`,
+    'process.exit(0);',
+    '',
+  ].join('\n');
+  fs.writeFileSync(path.join(sb.kit, 'agent-selfcheck.cjs'), body);
+}
+
+test('--api-base, --firebase-project and --firebase-web-key write settings.backend before selfcheck --setup runs', () => {
+  const sb = sandbox({ version: '0.3.1\n' });
+  try {
+    stubSelfcheckRecordingConfig(sb);
+    const r = runSetup(sb, ['--name', NAME, '--email', EMAIL, '--app-id', APP_ID, '--no-sdk',
+      '--api-base', BACKEND_API, '--firebase-project', BACKEND_PROJECT, '--firebase-web-key', BACKEND_KEY]);
+    assert.equal(r.status, 0, r.stderr);
+    const calls = fs.readFileSync(sb.selfcheckLog, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l));
+    assert.equal(calls.length, 1, 'selfcheck --setup ran once');
+    assert.equal(calls[0].args[0], '--setup');
+    const backend = { api_base: BACKEND_API, firebase_project: BACKEND_PROJECT, firebase_web_key: BACKEND_KEY };
+    assert.deepEqual(JSON.parse(calls[0].config).backend, backend, 'the backend block was already in config.json when selfcheck ran');
+    assert.deepEqual(readJson(CONFIG(sb)).backend, backend);
+    assert.equal(readJson(CONFIG(sb)).app_id, APP_ID, 'the app id is kept');
+  } finally { cleanup(sb); }
+});
+
+test('a --api-base that is not an https origin is refused with exit 2 and nothing is written', () => {
+  const sb = sandbox({ version: '0.3.1\n' });
+  try {
+    const r = runSetup(sb, ['--app-id', APP_ID, '--no-sdk', '--api-base', 'http://example-functions.invalid']);
+    assert.equal(r.status, 2);
+    assert.ok(/--api-base/.test(r.stderr), r.stderr);
+    assert.equal(fs.existsSync(CONFIG(sb)), false, 'config.json not written');
+    assert.equal(fs.existsSync(sb.selfcheckLog), false, 'selfcheck not run');
+  } finally { cleanup(sb); }
+});

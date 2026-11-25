@@ -834,3 +834,51 @@ test('agent-selfcheck: the configured functions host and project are the targets
     assert.equal(t.fs_root, '/v1/projects/spm-test-example/databases/(default)/documents');
   } finally { sc.applyBackend(resolveBackend({})); }
 });
+
+// ---------------------------------------------------------------- 0.3.1 KITFIX: the backend web key and the setup target
+/** keyDirWith plus a "backend" block in agent.json (0.3.1 tests only). */
+function keyDirWithBackend(backend) {
+  const d = keyDirWith();
+  const p = path.join(d, 'agent.json');
+  const cfg = JSON.parse(fs.readFileSync(p, 'utf8'));
+  cfg.backend = backend;
+  fs.writeFileSync(p, JSON.stringify(cfg));
+  return d;
+}
+
+test('sign-in uses backend.firebase_web_key from the settings file when set (no env key, no app id)', async () => {
+  const w = await world();
+  const r = await runSelfcheck({ keyDir: keyDirWithBackend({ firebase_web_key: FAKE_WEB }), bases: w.bases, webKey: null });
+  assert.ok(hasLine(r.stdout, /^ok sign-in$/), r.stdout + r.stderr);
+  noSecret(r, 'backend web key');
+});
+
+test('sign-in: backend.firebase_web_key wins over a different FIREBASE_API_KEY in the environment', async () => {
+  const w = await world();
+  const r = await runSelfcheck({ keyDir: keyDirWithBackend({ firebase_web_key: FAKE_WEB }), bases: w.bases, webKey: 'example-wrong-web-key-000000000' });
+  assert.ok(hasLine(r.stdout, /^ok sign-in$/), r.stdout + r.stderr);
+});
+
+test('--setup mode applies the configured backend: the functions target is the configured host and project', async () => {
+  const { resolveBackend } = require('../lib/backend.cjs');
+  const sc = require('../agent-selfcheck.cjs');
+  const w = await world();
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-setup-home-'));
+  const cfgDir = fs.mkdtempSync(path.join(os.tmpdir(), 'selfcheck-setup-cfg-'));
+  const cfg = path.join(cfgDir, 'config.json');
+  fs.writeFileSync(cfg, JSON.stringify({ agent: { name: TEST_AGENT.name, email: TEST_AGENT.email }, backend: { api_base: 'https://functions.spm-test.example.com', firebase_project: 'spm-test-example' } }));
+  const savedHome = process.env.HOME;
+  process.env.HOME = home;
+  try {
+    const code = await sc.main(['--setup', '--config', cfg, '--base-regional', w.bases.regional, '--base-shared', w.bases.shared, '--base-fn', w.bases.fn, '--base-idt', w.bases.idt]);
+    assert.equal(code, 0);
+    const t = sc.currentTargets();
+    assert.equal(t.fn_host, 'functions.spm-test.example.com');
+    assert.equal(t.project, 'spm-test-example');
+  } finally {
+    process.env.HOME = savedHome;
+    sc.applyBackend(resolveBackend({}));
+    fs.rmSync(home, { recursive: true, force: true });
+    fs.rmSync(cfgDir, { recursive: true, force: true });
+  }
+});

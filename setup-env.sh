@@ -4,6 +4,7 @@
 #   bash "$HOME/spm-agent-kit/setup-env.sh" [--app-id <SPM app id>] [--name "<agent name>" --email <agent address>] [options]
 #
 #   --app-id <value>              optional (Addendum A1): the public SPM app id, 20 to 60 of A-Z a-z 0-9 _ - . Given: validated and written.
+#   --api-base, --firebase-project, --firebase-web-key   optional (0.3.1): write the backend block of the config before the setup check runs.
 #                                 Not given: an app id already in the config is kept; agent-health.cjs start writes it from SPM otherwise.
 #   --report on|off               optional (Addendum A4): off writes "report": false into the config (no health reports are sent); on (default) writes nothing
 #   --autostart on|off            optional (Addendum B1): off writes "autostart": false into the config, writes no CLAUDE.md block,
@@ -54,6 +55,9 @@ usage() {
   cat <<'USAGE'
 usage: setup-env.sh [--app-id <value>] [--name <text> --email <address>] [--ignore-agent <name>]... [--transport node|webchannel] [--report on|off] [--autostart on|off] [--no-sdk] [--help]
   --app-id        optional: the public SPM app id, 20 to 60 of A-Z a-z 0-9 _ - (kept from the config when not given)
+  --api-base      optional: the SPM functions address, https://<host> with no path (writes backend.api_base)
+  --firebase-project  optional: the Firebase project id, 4 to 30 lower-case letters, digits or hyphens (writes backend.firebase_project)
+  --firebase-web-key  optional: the public web API key of that project, 20 to 80 of A-Z a-z 0-9 _ - (writes backend.firebase_web_key)
   --report        on (default) or off: off sends no health reports
   --autostart     on (default) or off: off turns the agent's automatic start off (no CLAUDE.md block is written, and the kit's block is removed)
   --name          optional: the agent's name as people tag it, 1 to 60 of A-Z a-z 0-9, space, dot, brackets, hyphen (give it with --email)
@@ -80,12 +84,16 @@ EMAIL_GIVEN=0
 HAS_IGNORE=0
 IGNORE_LIST=""
 SDK=1
+HAS_BACKEND=0
+API_BASE=""
+FB_PROJECT=""
+FB_KEY=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --help|-h) usage; exit 0 ;;
     --no-sdk) SDK=0; shift ;;
-    --name|--email|--app-id|--ignore-agent|--transport|--report|--autostart)
+    --name|--email|--app-id|--ignore-agent|--transport|--report|--autostart|--api-base|--firebase-project|--firebase-web-key)
       if [ $# -lt 2 ] || [ -z "$2" ] || [[ "$2" == --* ]]; then
         fail "$1 needs a value (see --help)"
       fi
@@ -98,6 +106,9 @@ while [ $# -gt 0 ]; do
         --transport) TRANSPORT="$2" ;;
         --report) REPORT="$2" ;;
         --autostart) AUTOSTART="$2" ;;
+        --api-base) API_BASE="$2"; HAS_BACKEND=1 ;;
+        --firebase-project) FB_PROJECT="$2"; HAS_BACKEND=1 ;;
+        --firebase-web-key) FB_KEY="$2"; HAS_BACKEND=1 ;;
       esac
       shift 2
       ;;
@@ -123,6 +134,21 @@ if [ -n "$APP_ID" ]; then
   APP_ID_RE='^[A-Za-z0-9_-]{20,60}$'
   [[ "$APP_ID" =~ $APP_ID_RE ]] || fail "--app-id must be 20 to 60 letters, digits, hyphens or underscores"
   HAS_APP=1
+fi
+# 0.3.1: the backend flags use the same rules as lib/backend.cjs, so a value refused here is one the self-check would ignore.
+if [ "$HAS_BACKEND" -eq 1 ]; then
+  if [ -n "$API_BASE" ]; then
+    API_BASE_RE='^https://[A-Za-z0-9.-]+/?$'
+    [[ "$API_BASE" =~ $API_BASE_RE ]] || fail "--api-base must be an https address with no path, port or query (see --help)"
+  fi
+  if [ -n "$FB_PROJECT" ]; then
+    FB_PROJECT_RE='^[a-z][a-z0-9-]{3,29}$'
+    [[ "$FB_PROJECT" =~ $FB_PROJECT_RE ]] || fail "--firebase-project must be 4 to 30 lower-case letters, digits or hyphens (see --help)"
+  fi
+  if [ -n "$FB_KEY" ]; then
+    FB_KEY_RE='^[A-Za-z0-9_-]{20,80}$'
+    [[ "$FB_KEY" =~ $FB_KEY_RE ]] || fail "--firebase-web-key must be 20 to 80 letters, digits, hyphens or underscores (see --help)"
+  fi
 fi
 case "$REPORT" in
   ""|on|off) ;;
@@ -337,6 +363,16 @@ try {
   if (agent) cfg.agent = agent;
   if (e.SPM_SETUP_HAS_APP === '1') cfg.app_id = e.SPM_SETUP_APP_ID;
   else if (typeof oldCfg.app_id === 'string' && /^[A-Za-z0-9_-]{20,60}$/.test(oldCfg.app_id)) cfg.app_id = oldCfg.app_id;
+  // 0.3.1: the backend block. Each backend flag sets its field; with no flag the block already in the file is kept.
+  const oldBackend = oldCfg.backend && typeof oldCfg.backend === 'object' && !Array.isArray(oldCfg.backend) ? oldCfg.backend : null;
+  let backend = oldBackend ? { ...oldBackend } : null;
+  if (e.SPM_SETUP_HAS_BACKEND === '1') {
+    backend = backend || {};
+    if (e.SPM_SETUP_API_BASE) backend.api_base = e.SPM_SETUP_API_BASE;
+    if (e.SPM_SETUP_FB_PROJECT) backend.firebase_project = e.SPM_SETUP_FB_PROJECT;
+    if (e.SPM_SETUP_FB_KEY) backend.firebase_web_key = e.SPM_SETUP_FB_KEY;
+  }
+  if (backend && Object.keys(backend).length > 0) cfg.backend = backend;
   if (e.SPM_SETUP_HAS_IGNORE === '1') {
     const parts = e.SPM_SETUP_IGNORE.split('\n');
     parts.pop(); // the list ends with a newline
@@ -436,7 +472,7 @@ spool_setup() {
 SPM_SETUP_KIT="$KIT" SPM_SETUP_HOME="$HOME" SPM_SETUP_KIT_VERSION="$KIT_VERSION" \
   SPM_SETUP_HAS_AGENT="$HAS_AGENT" SPM_SETUP_NAME="$NAME" SPM_SETUP_EMAIL="$EMAIL" \
   SPM_SETUP_APP_ID="$APP_ID" SPM_SETUP_HAS_APP="$HAS_APP" SPM_SETUP_REPORT="$REPORT" SPM_SETUP_AUTOSTART="$AUTOSTART" SPM_SETUP_TRANSPORT="$TRANSPORT" SPM_SETUP_HAS_IGNORE="$HAS_IGNORE" \
-  SPM_SETUP_IGNORE="$IGNORE_LIST" \
+  SPM_SETUP_IGNORE="$IGNORE_LIST" SPM_SETUP_HAS_BACKEND="$HAS_BACKEND" SPM_SETUP_API_BASE="$API_BASE" SPM_SETUP_FB_PROJECT="$FB_PROJECT" SPM_SETUP_FB_KEY="$FB_KEY" \
   node -e "$WRITE_JS"
 RC=$?
 if [ "$RC" -ne 0 ]; then

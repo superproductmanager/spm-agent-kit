@@ -209,9 +209,12 @@ async function checkSpmKey(ctx) {
 }
 
 async function checkSignIn(ctx) {
-  let webKey;
-  try { webKey = loadWebKeyFrom(process.env, ctx.appId); } catch (_) {
-    return { ok: false, name: 'sign-in', code: 'no_app_id', cause: 'no app id (web API key) is set on this machine', fix: 'run setup-env.sh again with --app-id <the public SPM app id>, or set FIREBASE_API_KEY in the environment' };
+  // 0.3.1: backend.firebase_web_key in the settings file is used when set; otherwise the usual sources, as before.
+  let webKey = ctx.backendWebKey || null;
+  if (!webKey) {
+    try { webKey = loadWebKeyFrom(process.env, ctx.appId); } catch (_) {
+      return { ok: false, name: 'sign-in', code: 'no_app_id', cause: 'no app id (web API key) is set on this machine', fix: 'run setup-env.sh again with --app-id <the public SPM app id>, or set FIREBASE_API_KEY in the environment' };
+    }
   }
   const url = `${ctx.bases.idt}/v1/accounts:signInWithCustomToken?key=${encodeURIComponent(webKey)}`;
   const r = await call(url, 'POST', { Referer: REFERER, 'Content-Type': 'application/json' }, JSON.stringify({ token: ctx.customToken, returnSecureToken: true }));
@@ -303,11 +306,12 @@ function spoolCheck(step, status, code, role = 'setup') {
 /** --setup: the three no-key checks, each one spool line. Never exits non-zero. */
 async function mainSetup(argv) {
   QUIET = true;
-  const a = parseArgs(argv);
+  // 0.3.1: the backend block is applied before parseArgs, because parseArgs takes its default bases from the backend.
   let conf = null;
-  if (!a.usage) {
-    try { conf = loadConfigOptionalAgent({ argv, env: process.env }); } catch (_) { conf = null; }
-  }
+  try { conf = loadConfigOptionalAgent({ argv, env: process.env }); } catch (_) { conf = null; }
+  if (conf && conf.backend) { try { applyBackend(conf.backend); } catch (_) { /* the default targets stay */ } }
+  const a = parseArgs(argv);
+  if (a.usage) conf = null;
   if (!conf) {
     for (const s of ['spm-host', 'google-host']) spoolCheck(s, 'fail', 'no_config');
     return 0;
@@ -387,7 +391,8 @@ async function main(argv) {
   VIA_PROXY = mode.mode === 'secret';
   out(`info kit version: ${kitVersion()}`);
   const secret = mode.mode === 'secret';
-  const ctx = { email: conf.email, appId: conf.appId, bases: a.bases, key: secret ? mode.key : keyFor(conf.keyFile), customToken: null, idToken: null, secret };
+  const backendWebKey = conf.backend && conf.backend.firebase_web_key ? conf.backend.firebase_web_key : null; // 0.3.1
+  const ctx = { email: conf.email, appId: conf.appId, backendWebKey, bases: a.bases, key: secret ? mode.key : keyFor(conf.keyFile), customToken: null, idToken: null, secret };
   // 0.2.1 (F8): the three steps after the google-host check are also written to the spool as role listener, pass, fail with
   // a code word, or skip (code not_run) after an earlier fail. Only the code word reaches the spool.
   let failed = false;
