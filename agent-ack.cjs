@@ -12,7 +12,7 @@
  *
  * ADDED KEYS. "addressed" (true or false) is always added. "acked" is true, false, or null (no reaction was tried). "ack_error" is added when the reaction failed:
  * http_<status>, network, timeout, rate_limited, bad_ids, no_key, guard, internal or lookup. "reason" is added only for "group" or "thread" (a line
- * addressed by name has no reason key). "already_answered" is added as true only for a catch-up or re-raise notice (see NOTICE LINES). "skipped" is added
+ * addressed by name has no reason key). "already_answered" is added as true when the agent already wrote after the noticed comment in a thread (see NOTICE LINES). "skipped" is added
  * only as "no_lookup": a catch-up or re-raise notice with no thread root, so its thread cannot be checked. "text_acked" is always last: true, false, or null
  * (no text reply was tried). An input line's own keys with these names are replaced.
  * A line that is not a JSON object passes through unchanged. A failure never delays a line beyond its request timeout (8 s; the thread lookup 2 s).
@@ -50,7 +50,7 @@
  * NOT written in that thread after the noticed comment. The thread is read first (one list call on a document, one GET on a board or map); the
  * noticed comment's position is its place in that list. Another comment of the agent after it gives nothing and "already_answered": true. A failed
  * read, or a noticed comment missing from the list, gives nothing and "ack_error": "lookup". A catch-up line with no thread root gives nothing and
- * "skipped": "no_lookup". Live lines (no catchup or reraise key) are judged as before, with no read.
+ * "skipped": "no_lookup". Live lines (no catchup or reraise key) with a thread root are checked the same way: an agent reply after the noticed comment gives nothing and "already_answered": true; a failed read still gives the eyes and the Seen text. Live lines with no thread root are judged as before, with no read.
  *
  * KEY. The key is read once at start from key_file and sent only as the X-SPM-API-Key header. It is never printed or written; any output line that
  * contains it is redacted. The server's reply body is discarded unread. If the key cannot be read, one notice goes to stderr, every addressed line is
@@ -534,11 +534,10 @@ function createAcker(cfg, deps) {
       : { item_type: kind, item_id: o.item.id, comment_id: o.comment_id, task_id: kind === 'board' ? o.task_id : null, thread_root_id: o.thread_root_id, body: row.body, author_kind: row.author_kind, kind: o.verb };
     const why = addressedReason(line, cfg.mentions, cfg.others);
     if (why === 'named' || why === 'group') {
-      if (isCatchOrRaise(o)) { // an old notice: the thread is checked on the same read, before any eyes or text
-        const gate = gateOf(snap, me);
-        if (gate === 'answered') return { ...none, addressed: true, alreadyAnswered: true };
-        if (gate === 'lookup') return { ...none, addressed: true, error: 'lookup' };
-      }
+      // the thread is checked on the same read, before any eyes or text (live participant lines too)
+      const gate = gateOf(snap, me);
+      if (gate === 'answered') return { ...none, addressed: true, alreadyAnswered: true };
+      if (gate === 'lookup' && isCatchOrRaise(o)) return { ...none, addressed: true, error: 'lookup' };
       if (kind !== 'document') return { addressed: true, acked: null, error: null, textAcked: await itemTextAck(line, kind, itemIds(line, kind)), alreadyAnswered: false };
       const [r, tx] = await Promise.all([ack(o.item.id, o.comment_id), textAck(line)]);
       return { addressed: true, acked: r.acked, error: r.error || null, textAcked: tx, alreadyAnswered: false };
@@ -576,20 +575,22 @@ function createAcker(cfg, deps) {
           if (!ids) { acked = false; error = 'bad_ids'; }
           else if (!cfg.key) { acked = false; error = 'no_key'; }
           else {
-            const gate = replay ? await replayGate(kind, ids, ids.comment, ids.root) : 'ok';
+            // every addressed line with a thread root is checked first: an agent reply after the noticed comment means no Seen
+            const gate = (replay || ids.root !== null) ? await replayGate(kind, ids, ids.comment, ids.root) : 'ok';
             if (gate === 'answered') alreadyAnswered = true;
-            else if (gate === 'lookup') error = 'lookup';
-            else if (gate === 'no_lookup') skipped = 'no_lookup';
+            else if (gate === 'lookup' && replay) error = 'lookup'; // a live line whose read fails still gets its text
+            else if (gate === 'no_lookup' && replay) skipped = 'no_lookup';
             else textAcked = await itemTextAck(line, kind, ids);
           }
         }
         else if (addressed) {
           if (why === 'group') reason = 'group';
           const root = typeof line.thread_root_id === 'string' && UUID_RE.test(line.thread_root_id) ? line.thread_root_id.toLowerCase() : null;
-          const gate = replay && cfg.key ? await replayGate('document', line.document_id, line.comment_id.toLowerCase(), root) : 'ok';
+          // every addressed line with a thread root is checked first: an agent reply after the noticed comment means no eyes and no Seen
+          const gate = (replay || root !== null) && cfg.key ? await replayGate('document', line.document_id, line.comment_id.toLowerCase(), root) : 'ok';
           if (gate === 'answered') alreadyAnswered = true;
-          else if (gate === 'lookup') error = 'lookup';
-          else if (gate === 'no_lookup') skipped = 'no_lookup';
+          else if (gate === 'lookup' && replay) error = 'lookup'; // a live line whose read fails still gets its eyes and text
+          else if (gate === 'no_lookup' && replay) skipped = 'no_lookup';
           else { const [r, tx] = await Promise.all([ack(line.document_id, line.comment_id), textAck(line)]); acked = r.acked; error = r.error || null; textAcked = tx; }
         }
         else if (!notice && why !== 'other' && kind === 'document') {
@@ -1268,7 +1269,7 @@ function defineCases(cases, env) {
     const r = await runAll(env, [threadLine(571, '@Other agent please do this', 570), threadLine(572, '@Example agent please do that', 570), threadLine(573, 'both of you, thanks', 570)]);
     check(r.out[0].addressed === false && r.out[0].acked === null && !('reason' in r.out[0]), r.raw[0]);
     check(r.out[1].addressed === true && r.out[1].acked === true && !('reason' in r.out[1]) && r.out[2].addressed === true && r.out[2].reason === 'group', `${r.raw[1]} / ${r.raw[2]}`);
-    check(si.lists.length === 0 && si.requests.length === 2, `lists ${si.lists.length} reactions ${si.requests.length}`);
+    check(si.lists.length === 2 && si.requests.length === 2, `lists ${si.lists.length} reactions ${si.requests.length}`);
   });
 
   T('T36', 'a comment written by an agent, or any kind other than comment.created / comment.replied, in a thread this agent started: never reacted to, no lookup', async () => {
@@ -1398,20 +1399,22 @@ function defineCases(cases, env) {
     const line = threadLine(741, '@Example agent please', 740);
     const a = mkAcker(() => t);
     const x1 = JSON.parse(await a.handleLine(line)); const x2 = JSON.parse(await a.handleLine(line));
-    check(x1.text_acked === true && x2.text_acked === true && si.posts.length === 1, `one process, two lines: posts ${si.posts.length}`);
+    check(x1.text_acked === true && x2.already_answered === true && x2.text_acked === null && si.posts.length === 1, `one process, two lines: posts ${si.posts.length}`);
     check(JSON.parse(si.posts[0].raw).body === 'Seen by the Example agent at 23:51 IST. Working on it; the answer follows in this thread.', `text ${JSON.parse(si.posts[0].raw).body}`);
     const same = JSON.parse(await mkAcker(() => t).handleLine(line)); // a restart in the same minute: the same request replays
-    check(same.text_acked === true && si.posts.length === 2 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `replay: posts ${si.posts.length}`);
-    t = t0 + 5 * 60000; // a restart five minutes later: the text differs (HH:MM), the key is the same: 422 idempotency_key_reused, counted as posted
+    check(same.already_answered === true && same.text_acked === null && si.posts.length === 1 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `restart sees the reply: posts ${si.posts.length}`);
+    t = t0 + 5 * 60000; // a restart five minutes later, whose thread read does not show the stored reply (a stale list): the post goes again, the key is the same: 422 idempotency_key_reused, counted as posted
+    const kept = si.comments; si.comments = kept.filter((c) => c.author_identity !== SELF_ID);
     const later = JSON.parse(await mkAcker(() => t).handleLine(line));
-    check(later.text_acked === true && si.posts.length === 3 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `422 path: posts ${si.posts.length} rows ${si.comments.filter((c) => c.author_identity === SELF_ID).length}`);
+    si.comments = kept;
+    check(later.text_acked === true && si.posts.length === 2 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `422 path: posts ${si.posts.length} rows ${si.comments.filter((c) => c.author_identity === SELF_ID).length}`);
     // concurrent lines for one comment share ONE request
     si.reset(); si.comments = [mk(742, 'human'), mk(743, 'human', 742)]; si.behave = (rec) => (rec.post ? { delayMs: 200 } : null);
     const line2 = threadLine(743, '@Example agent please', 742);
     const both = await Promise.all([mkAcker(() => t).handleLine(line2)]);
     const acker2 = mkAcker(() => t); const pair = await Promise.all([acker2.handleLine(line2), acker2.handleLine(line2)]);
-    check(JSON.parse(both[0]).text_acked === true && pair.every((l) => JSON.parse(l).text_acked === true) && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `concurrent: posts ${si.posts.length}`);
-    check(si.posts.length === 2, `the concurrent pair made one request (plus the first acker's): ${si.posts.length}`);
+    check(JSON.parse(both[0]).text_acked === true && pair.every((l) => { const o = JSON.parse(l); return o.text_acked === true || o.already_answered === true; }) && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `concurrent: posts ${si.posts.length}`);
+    check(si.posts.length === 1, `the pair made no second request (shared, or the stored reply was found): ${si.posts.length}`);
   });
 
   T('T44', '--no-text-ack turns the text reply off (eyes unchanged, text_acked null); default is on; given twice is a usage error', async () => {
@@ -1481,11 +1484,11 @@ function defineCases(cases, env) {
     let t = 9000000; const rw = { hostname: '127.0.0.1', port: si.port };
     const acker = createAcker({ key: FAKE_KEY, email: FAKE_EMAIL, mentions: ['@example agent'], others: ['@other agent'], selfId: SELF_ID, label: 'Example agent' }, { transport: makeTransport(rw), api: makeApi(rw), now: () => t });
     si.comments = [mk(800, 'human')];
-    for (let i = 0; i < 12; i++) si.comments.push(mk(801 + i, 'human', 800));
     const outs = [];
-    for (let i = 0; i < 11; i++) outs.push(JSON.parse(await acker.handleLine(threadLine(801 + i, '@Example agent', 800))));
+    // each human comment is posted just before its line arrives: the thread is in posting order, as the real one is
+    for (let i = 0; i < 11; i++) { si.comments.push(mk(801 + i, 'human', 800)); outs.push(JSON.parse(await acker.handleLine(threadLine(801 + i, '@Example agent', 800)))); }
     check(outs.slice(0, 10).every((o) => o.text_acked === true) && outs[10].text_acked === false && outs[10].acked === true && si.posts.length === 10 && si.requests.length === 11, `posts ${si.posts.length} reactions ${si.requests.length}: ${JSON.stringify(outs[10])}`);
-    t += 59999; const still = JSON.parse(await acker.handleLine(threadLine(812, '@Example agent', 800)));
+    si.comments.push(mk(812, 'human', 800)); t += 59999; const still = JSON.parse(await acker.handleLine(threadLine(812, '@Example agent', 800)));
     check(still.text_acked === false, 'still capped at 59.999 s');
     t += 2; const later = JSON.parse(await acker.handleLine(threadLine(812, '@Example agent', 800)));
     check(later.text_acked === true && si.posts.length === 11, 'the window slid after 60 s (the capped try was not remembered)');
@@ -1505,8 +1508,8 @@ function defineCases(cases, env) {
   T('T60', 'a NAMED BOARD line: exactly one POST /boardsApi/tasks/<task_id>/comments { body, parent_id } under the thread root with Origin, key and address (no Idempotency-Key, the route has none), the ack text, text_acked true; NO reaction, NO list lookup; acked stays null', async () => {
     seedItem('board', itemRow(1000, 'human'), itemRow(1001, 'human', 1000));
     const r = await runAll(env, [boardLine(1001, '@Example agent please look at this task', 1000)]);
-    check(si.itemReqs.length === 1 && si.requests.length === 0 && si.posts.length === 0 && si.lists.length === 0, `item requests ${si.itemReqs.length} reactions ${si.requests.length} document posts ${si.posts.length} lists ${si.lists.length}`);
-    const q = si.itemReqs[0];
+    check(si.itemReqs.length === 2 && si.itemReqs[0].method === 'GET' && si.itemReqs[1].method === 'POST' && si.requests.length === 0 && si.posts.length === 0 && si.lists.length === 0, `item requests ${si.itemReqs.length} reactions ${si.requests.length} document posts ${si.posts.length} lists ${si.lists.length}`);
+    const q = si.itemReqs[1];
     check(q.method === 'POST' && q.url === `/boardsApi/tasks/${TASK_ID}/comments`, `${q.method} ${q.url}`);
     check(itemHeaderNames(q) === 'content-length,content-type,origin,x-spm-api-key,x-spm-user-email' && q.headers.origin === ORIGIN && q.headers['x-spm-api-key'] === FAKE_KEY && q.headers['x-spm-user-email'] === FAKE_EMAIL, `headers ${itemHeaderNames(q)}`);
     const b = JSON.parse(q.raw);
@@ -1523,8 +1526,9 @@ function defineCases(cases, env) {
   T('T61', 'a NAMED MAP line: POST /mapsApi/maps/<item_id>/comments under the thread root, text_acked true, acked null, no reaction; a top-level named comment is its own root', async () => {
     seedItem('map', itemRow(1100, 'human'), itemRow(1101, 'human', 1100), itemRow(1102, 'human'));
     const r = await runAll(env, [mapLine(1101, '@Example agent look at the map', 1100), mapLine(1102, '@Example agent top level', 1102)]);
-    check(si.itemReqs.length === 2 && si.itemReqs.every((q) => q.url === `/mapsApi/maps/${MAP_ID}/comments`) && si.requests.length === 0 && si.lists.length === 0, `item requests ${si.itemReqs.map((q) => q.url)}`);
-    check(JSON.parse(si.itemReqs[0].raw).parent_id === cid(1100) && JSON.parse(si.itemReqs[1].raw).parent_id === cid(1102), 'parent ids');
+    check(si.itemReqs.length === 4 && si.itemReqs.every((q) => q.url === `/mapsApi/maps/${MAP_ID}/comments`) && si.requests.length === 0 && si.lists.length === 0, `item requests ${si.itemReqs.map((q) => q.url)}`);
+    const p61 = si.itemReqs.filter((q) => q.method === 'POST').map((q) => JSON.parse(q.raw).parent_id).sort();
+    check(p61.join() === [cid(1100), cid(1102)].sort().join(), 'parent ids');
     check(r.out.every((o) => o.addressed === true && o.acked === null && o.text_acked === true && lastKeys(o, 3) === 'addressed,acked,text_acked'), r.raw.join(' | '));
   });
 
@@ -1532,7 +1536,7 @@ function defineCases(cases, env) {
     seedItem('board', itemRow(1200, 'human'), itemRow(1201, 'human', 1200));
     seedItem('map', itemRow(1210, 'human'), itemRow(1211, 'human', 1210));
     const r = await runAll(env, [boardLine(1201, '@Example agent reply on a task', 1200), mapLine(1211, '@Example agent reply on a map', 1210)]);
-    check(r.out.every((o) => o.text_acked === true) && JSON.parse(si.itemReqs[0].raw).parent_id === cid(1200) && JSON.parse(si.itemReqs[1].raw).parent_id === cid(1210), r.raw.join(' | '));
+    check(r.out.every((o) => o.text_acked === true) && si.itemReqs.filter((q) => q.method === 'POST').map((q) => JSON.parse(q.raw).parent_id).sort().join() === [cid(1200), cid(1210)].sort().join(), r.raw.join(' | '));
     // a line whose thread_root_id is itself a reply (a malformed line): the real route would refuse (400 reply_to_reply): text_acked false, nothing posted, no crash
     si.reset(); seedItem('board', itemRow(1220, 'human'), itemRow(1221, 'human', 1220));
     const bad = await runAll(env, [boardLine(1221, '@Example agent root is a reply', 1221, { thread_root_id: cid(1221) })]);
@@ -1547,12 +1551,12 @@ function defineCases(cases, env) {
     check(r.out[0].addressed === true && r.out[0].reason === 'group' && r.out[0].text_acked === true && lastKeys(r.out[0], 4) === 'addressed,acked,reason,text_acked', r.raw[0]);
     check(r.out[1].addressed === true && r.out[1].reason === 'group' && r.out[1].text_acked === true, r.raw[1]);
     check(r.out.slice(2).every((o) => o.addressed === false && o.acked === null && o.text_acked === null && !('reason' in o)), r.raw.slice(2).join(' | '));
-    check(si.itemReqs.length === 2, `posts ${si.itemReqs.length}`);
+    check(si.itemReqs.filter((q) => q.method === 'POST').length === 2, `posts ${si.itemReqs.length}`);
     si.reset(); seedItem('board', itemRow(1320, 'human'));
     const none = [boardLine(1320, '@Example agent x', 1320, { author_kind: 'agent' }), boardLine(1320, '@Example agent x', 1320, { kind: 'comment.updated' }), boardLine(1320, '@Example agent x', 1320, { kind: 'comment.deleted' }),
       boardLine(1320, 'Seen by the Other agent at 10:00 IST. @Example agent you take this', 1320), boardLine(1320, '  seen BY the   other agent @Example agent', 1320), boardLine(1320, '@Example agent x', 1320, { author_kind: 'Human' })];
     const r2 = await runAll(env, none);
-    check(si.itemReqs.length === 0 && r2.out.every((o) => o.text_acked === null), `no ack expected: ${r2.raw.join(' | ')}`);
+    check(si.itemReqs.every((q) => q.method === 'GET') && r2.out.every((o) => o.text_acked === null), `no ack expected: ${r2.raw.join(' | ')}`);
     check(r2.out[3].addressed === true && r2.out[4].addressed === true && r2.out[3].acked === null, 'the "Seen by the" lines are addressed (by name) but their text reply is withheld');
     // a line that names only the other agent is not for this agent, and gets no text reply
     si.reset(); seedItem('map', itemRow(1330, 'human'));
@@ -1565,20 +1569,20 @@ function defineCases(cases, env) {
     seedItem('map', itemRow(1400, 'human'), itemRow(1411, 'human', 1400));
     const line = boardLine(1401, '@Example agent please', 1400);
     const r = await runAll(env, [line, line]);
-    check(r.out.every((o) => o.text_acked === true) && si.itemReqs.length === 1, `same line twice: requests ${si.itemReqs.length} ${r.raw.join(' | ')}`);
+    check(r.out[0].text_acked === true && (r.out[1].text_acked === true || r.out[1].already_answered === true) && si.itemReqs.filter((q) => q.method === 'POST').length === 1, `same line twice: ${si.itemReqs.map((q) => q.method).join()} ${r.raw.join(' | ')}`);
     si.reset(); seedItem('board', itemRow(1400, 'human'), itemRow(1401, 'human', 1400)); si.behave = (rec) => (rec.itemPost ? { delayMs: 200 } : null);
     const c = await runAll(env, [line, line, line]);
-    check(c.out.every((o) => o.text_acked === true) && si.itemReqs.length === 1, `concurrent: requests ${si.itemReqs.length}`);
-    si.reset(); seedItem('board', itemRow(1400, 'human'), itemRow(1401, 'human', 1400), itemRow(1402, 'human', 1400));
-    const two = await runAll(env, [line, boardLine(1402, '@Example agent two', 1400)]);
-    check(si.itemReqs.length === 2 && two.out.every((o) => o.text_acked === true), `two comments: ${si.itemReqs.length}`);
-    si.reset(); seedItem('board', itemRow(1400, 'human'), itemRow(1401, 'human', 1400)); si.behave = (rec) => (rec.itemPost && rec.n === 1 ? { status: 500 } : null);
+    check(c.out.every((o) => o.text_acked === true || o.already_answered === true) && si.itemReqs.filter((q) => q.method === 'POST').length === 1, `concurrent: ${si.itemReqs.map((q) => q.method).join()}`);
+    si.reset(); seedItem('board', itemRow(1400, 'human'), itemRow(1401, 'human', 1400), itemRow(1402, 'human'));
+    const two = await runAll(env, [line, boardLine(1402, '@Example agent two', 1402)]);
+    check(si.itemReqs.filter((q) => q.method === 'POST').length === 2 && two.out.every((o) => o.text_acked === true), `two comments: ${si.itemReqs.length}`);
+    si.reset(); seedItem('board', itemRow(1400, 'human'), itemRow(1401, 'human', 1400)); si.behave = (rec) => (rec.itemPost && rec.n === 2 ? { status: 500 } : null);
     const h = spawnAck(env); h.write(line); await h.waitLines(1); h.write(line); await h.waitLines(2); h.end(); await h.finish();
     const f = h.lines().map((l) => JSON.parse(l));
-    check(f[0].text_acked === false && f[1].text_acked === true && si.itemReqs.length === 2, `a failed try is retried: ${h.lines().join(' | ')}`);
+    check(f[0].text_acked === false && f[1].text_acked === true && si.itemReqs.filter((q) => q.method === 'POST').length === 2, `a failed try is retried: ${h.lines().join(' | ')}`);
     si.reset(); seedItem('board', itemRow(1400, 'human'), itemRow(1401, 'human', 1400)); seedItem('map', itemRow(1400, 'human'), itemRow(1411, 'human', 1400));
     const k = await runAll(env, [boardLine(1401, '@Example agent x', 1400), mapLine(1401, '@Example agent x', 1400, { parent_id: cid(1400) })]);
-    check(si.itemReqs.length === 2 && k.out.every((o) => o.text_acked === true) && si.itemReqs[0].url.startsWith('/boardsApi/') && si.itemReqs[1].url.startsWith('/mapsApi/'), `board and map with one comment id: ${si.itemReqs.map((q) => q.url)}`);
+    const pk = si.itemReqs.filter((q) => q.method === 'POST'); check(pk.length === 2 && k.out.every((o) => o.text_acked === true) && pk[0].url.startsWith('/boardsApi/') && pk[1].url.startsWith('/mapsApi/'), `board and map with one comment id: ${si.itemReqs.map((q) => q.url)}`);
   });
 
   // AD1-AD4, AD6 (spec addendum 1): a board or map post that 404s with no header is looked up ONCE by the item id (GET accountApi/me/items?type&id) and retried ONCE with X-SPM-Workspace = the workspace_id the lookup gave
@@ -1587,27 +1591,27 @@ function defineCases(cases, env) {
     const r = await runAll(env, [mapLine(1101, '@Example agent look at the map', 1100)]);
     const seq = si.itemReqs.map((q) => (q.headers['x-spm-workspace'] ? 'ws' : 'no-ws') + ':' + q.method);
     check(r.out[0].text_acked === true, `text_acked ${r.out[0].text_acked} requests ${JSON.stringify(seq)} lookups ${si.lookups.length}`);
-    check(JSON.stringify(seq) === JSON.stringify(['no-ws:POST', 'ws:POST']), `item requests ${JSON.stringify(seq)}`);
+    check(JSON.stringify(seq) === JSON.stringify(['no-ws:GET', 'ws:GET', 'ws:POST']), `item requests ${JSON.stringify(seq)}`);
     check(si.lookups.length === 1 && si.lookups[0].url === `/accountApi/me/items?type=map&id=${MAP_ID}` && !si.lookups[0].headers['x-spm-workspace'], `lookups ${JSON.stringify(si.lookups.map((q) => q.url))}`);
-    check(si.itemReqs[1].headers['x-spm-workspace'] === WS_OTHER && JSON.parse(si.itemReqs[1].raw).parent_id === cid(1100), 'the retry header or the parent is wrong');
+    const pw = si.itemReqs.find((q) => q.method === 'POST'); check(pw.headers['x-spm-workspace'] === WS_OTHER && JSON.parse(pw.raw).parent_id === cid(1100), 'the retry header or the parent is wrong');
   });
   T('W2', 'a board line in another workspace: the lookup asks for the BOARD id (item_id), and the retry carries the item workspace', async () => {
     si.itemWsId = WS_OTHER; seedItem('board', itemRow(1100, 'human'));
     const r = await runAll(env, [boardLine(1101, '@Example agent look at the board', 1100)]);
-    check(r.out[0].text_acked === true && si.itemReqs.length === 2 && si.itemReqs[1].headers['x-spm-workspace'] === WS_OTHER, `text_acked ${r.raw.join(' | ')} posts ${si.itemReqs.length}`);
+    check(r.out[0].text_acked === true && si.itemReqs.length === 3 && si.itemReqs[2].method === 'POST' && si.itemReqs[2].headers['x-spm-workspace'] === WS_OTHER, `text_acked ${r.raw.join(' | ')} posts ${si.itemReqs.length}`);
     check(si.lookups.length === 1 && si.lookups[0].url === `/accountApi/me/items?type=board&id=${BOARD_ID}`, `lookups ${JSON.stringify(si.lookups.map((q) => q.url))}`);
   });
   T('W3', 'an EMPTY lookup (the agent cannot open the item): one lookup, no header sent, text_acked false, nothing posted', async () => {
     si.itemWsId = WS_OTHER; si.memberIds = [WS_HOME]; seedItem('map', itemRow(1100, 'human'));
     const r = await runAll(env, [mapLine(1101, '@Example agent look', 1100)]);
-    check(r.out[0].text_acked === false && si.lookups.length === 1 && si.itemReqs.every((q) => !q.headers['x-spm-workspace']) && si.itemReqs.length === 1, `text_acked ${r.out[0].text_acked} lookups ${si.lookups.length} posts ${si.itemReqs.length}`);
+    check(r.out[0].text_acked === false && si.lookups.length === 2 && si.itemReqs.every((q) => !q.headers['x-spm-workspace']) && si.itemReqs.length === 2, `text_acked ${r.out[0].text_acked} lookups ${si.lookups.length} posts ${si.itemReqs.length}`);
     check(si.itemComments.map.size === 1, 'a comment was posted');
   });
   T('W4', 'a retry refused 400 (the item workspace is not one the agent is in): text_acked false, the retry made once, nothing posted', async () => {
     si.itemWsId = WS_OTHER; si.memberIds = [WS_HOME]; si.lookupShowsAll = true; seedItem('map', itemRow(1100, 'human'));
     const r = await runAll(env, [mapLine(1101, '@Example agent refused retry', 1100)]);
     const withWs = si.itemReqs.filter((q) => q.headers['x-spm-workspace'] === WS_OTHER);
-    check(r.out[0].text_acked === false && withWs.length === 1 && si.itemComments.map.size === 1, `text_acked ${r.out[0].text_acked} retries ${withWs.length}`);
+    check(r.out[0].text_acked === false && withWs.length === 2 && si.itemComments.map.size === 1, `text_acked ${r.out[0].text_acked} retries ${withWs.length}`);
   });
   T('W5', 'guard (AD4): the workspace header only as the looked-up workspace_id; the lookup only as a bare GET with type and id; never on a document route or a notices path', async () => {
     const H = new URL(ENDPOINT_URL).host;
@@ -1632,12 +1636,12 @@ function defineCases(cases, env) {
     let t = 9000000; const rw = { hostname: '127.0.0.1', port: si.port };
     const acker = createAcker({ key: FAKE_KEY, email: FAKE_EMAIL, mentions: ['@example agent'], others: ['@other agent'], selfId: SELF_ID, label: 'Example agent' }, { transport: makeTransport(rw), api: makeApi(rw), now: () => t });
     seedItem('board', itemRow(1500, 'human')); seedItem('map', itemRow(1600, 'human'));
-    for (let i = 0; i < 12; i++) { seedItem('board', itemRow(1501 + i, 'human', 1500)); seedItem('map', itemRow(1601 + i, 'human', 1600)); }
+    for (let i = 0; i < 12; i++) { seedItem('board', itemRow(1501 + i, 'human')); seedItem('map', itemRow(1601 + i, 'human')); }
     const outs = [];
-    for (let i = 0; i < 11; i++) outs.push(JSON.parse(await acker.handleLine(i % 2 ? mapLine(1601 + i, '@Example agent', 1600) : boardLine(1501 + i, '@Example agent', 1500))));
-    check(outs.slice(0, 10).every((o) => o.text_acked === true) && outs[10].text_acked === false && si.itemReqs.length === 10, `requests ${si.itemReqs.length}: ${JSON.stringify(outs[10])}`);
-    t += 60001; const later = JSON.parse(await acker.handleLine(boardLine(1501 + 10, '@Example agent', 1500)));
-    check(later.text_acked === true && si.itemReqs.length === 11, 'the window slid');
+    for (let i = 0; i < 11; i++) outs.push(JSON.parse(await acker.handleLine(i % 2 ? mapLine(1601 + i, '@Example agent', 1601 + i) : boardLine(1501 + i, '@Example agent', 1501 + i))));
+    check(outs.slice(0, 10).every((o) => o.text_acked === true) && outs[10].text_acked === false && si.itemReqs.filter((q) => q.method === 'POST').length === 10, `requests ${si.itemReqs.length}: ${JSON.stringify(outs[10])}`);
+    t += 60001; const later = JSON.parse(await acker.handleLine(boardLine(1511, '@Example agent', 1511)));
+    check(later.text_acked === true && si.itemReqs.filter((q) => q.method === 'POST').length === 11, 'the window slid');
   });
 
   T('T66', 'malformed item lines never post: no task_id (or null, or not a uuid) on a board line, a bad item_id, a bad comment_id or thread_root_id, an unknown item_type, no thread_root_id: acked/text_acked per the document rules, no crash, the line printed', async () => {
@@ -1659,10 +1663,10 @@ function defineCases(cases, env) {
   T('T67', 'no key, --no-text-ack and a missing key file on item lines: --no-text-ack leaves text_acked null and posts nothing; an unreadable key file gives acked false, ack_error no_key, nothing posted, the line still printed', async () => {
     seedItem('board', itemRow(1800, 'human'), itemRow(1801, 'human', 1800));
     const a = await runAll(env, [boardLine(1801, '@Example agent', 1800)], { args: ['--no-text-ack'] });
-    check(si.itemReqs.length === 0 && a.out[0].addressed === true && a.out[0].acked === null && a.out[0].text_acked === null, a.raw[0]);
+    check(si.itemReqs.every((q) => q.method === 'GET') && a.out[0].addressed === true && a.out[0].acked === null && a.out[0].text_acked === null, a.raw[0]);
     const h = spawnAck(env, { keyFile: path.join(env.runDir, 'missing.key') }); h.write(boardLine(1801, '@Example agent', 1800)); h.end(); await h.finish();
     const o = JSON.parse(h.lines()[0]);
-    check(o.addressed === true && o.acked === false && o.ack_error === 'no_key' && o.text_acked === null && si.itemReqs.length === 0, h.lines()[0]);
+    check(o.addressed === true && o.acked === false && o.ack_error === 'no_key' && o.text_acked === null && si.itemReqs.filter((q) => q.method === 'POST').length === 0, h.lines()[0]);
   });
 
   T('T68', 'a document line keeps its exact output: six input lines and their six output lines are pinned as literal strings (named, group, other agent, no mention, garbage, repeat)', async () => {
@@ -1746,13 +1750,13 @@ function defineCases(cases, env) {
 
   T('T74', 'ordering and count are preserved around slow item posts (one output line per input line, same order, garbage untouched), and the post reaches the server within 500 ms of the line', async () => {
     seedItem('board', itemRow(2300, 'human'), itemRow(2301, 'human', 2300)); seedItem('map', itemRow(2310, 'human'), itemRow(2311, 'human', 2310));
-    si.behave = (rec) => (rec.itemPost ? { delayMs: rec.n === 1 ? 400 : 0 } : null);
+    si.behave = (rec) => (rec.itemPost ? { delayMs: rec.n === 2 ? 400 : 0 } : null);
     const h = spawnAck(env); const t0 = Date.now();
     h.write(boardLine(2301, '@Example agent one', 2300)); h.write('garbage 1'); h.write(mapLine(2311, 'both of you', 2310)); h.write(humanLine(2312, 'nobody here')); h.write('garbage 2');
     const lines = await h.waitLines(5, 5000); h.end(); await h.finish();
     const out = lines.map((l) => { try { return JSON.parse(l); } catch { return l; } });
     check(lines.length === 5 && out[1] === 'garbage 1' && out[4] === 'garbage 2' && out[0].comment_id === cid(2301) && out[2].comment_id === cid(2311) && out[3].comment_id === cid(2312), lines.join(' | '));
-    check(out[0].text_acked === true && out[2].text_acked === true && out[3].text_acked === null && si.itemReqs.length === 2 && si.itemReqs[0].t - t0 < 1500, `posts ${si.itemReqs.length}`);
+    check(out[0].text_acked === true && out[2].text_acked === true && out[3].text_acked === null && si.itemReqs.filter((q) => q.method === 'POST').length === 2 && si.itemReqs.filter((q) => q.method === 'POST')[0].t - t0 < 1500, `posts ${si.itemReqs.length}`);
   });
 
   T('T75', 'the header comment and usage document the item lines; the item routes use only the text acknowledgement', async () => {
@@ -1770,16 +1774,16 @@ function defineCases(cases, env) {
 
 
   T('T82', 'notice line, document: a MENTIONED human comment gets one reaction (documentId and commentId from the notice) and one text reply under its thread root (Idempotency-Key ack-text:<comment>); no thread lookup; the notice keys stay, addressed, acked and text_acked are appended, and its own reason "mentioned" is kept', async () => {
-    si.comments = [mk(900, 'human'), mk(901, 'human', 900)];
-    const lines = [noticeLine(900, 900), noticeLine(901, 900, { verb: 'comment.replied' })];
+    si.comments = [mk(900, 'human'), mk(901, 'human')];
+    const lines = [noticeLine(900, 900), noticeLine(901, 901)];
     const r = await runAll(env, lines);
-    check(r.code === 0 && si.requests.length === 2 && si.posts.length === 2 && si.lists.length === 0, `reactions ${si.requests.length} posts ${si.posts.length} lists ${si.lists.length} stderr ${r.stderr}`);
+    check(r.code === 0 && si.requests.length === 2 && si.posts.length === 2 && si.lists.length === 2, `reactions ${si.requests.length} posts ${si.posts.length} lists ${si.lists.length} stderr ${r.stderr}`);
     for (const n of [900, 901]) {
       const q = si.requests.find((x) => JSON.parse(x.raw).commentId === cid(n));
       check(q && q.url === '/documentsApi/reactToDocumentComment' && JSON.stringify(JSON.parse(q.raw)) === JSON.stringify({ documentId: DOC, commentId: cid(n), emoji: '\u{1F440}', op: 'add' }), `reaction for ${n}: ${q && q.raw}`);
       const p = si.posts.find((x) => x.headers['idempotency-key'] === `ack-text:${cid(n)}`);
       const b = p && JSON.parse(p.raw);
-      check(p && b.documentId === DOC && b.parent_id === cid(900) && NOTICE_TEXT_RE.test(b.body), `text for ${n}: ${p && p.raw}`);
+      check(p && b.documentId === DOC && b.parent_id === cid(n) && NOTICE_TEXT_RE.test(b.body), `text for ${n}: ${p && p.raw}`);
     }
     r.out.forEach((o, i) => {
       const orig = JSON.parse(lines[i]);
@@ -1792,8 +1796,8 @@ function defineCases(cases, env) {
   T('T83', 'notice line, board: a mentioned human comment gets the text reply only, through the task route (boardsApi/tasks/<task_id>/comments) under its thread root; no reaction, no list lookup; acked null, text_acked true', async () => {
     seedItem('board', itemRow(910, 'human'));
     const r = await runAll(env, [noticeLine(910, 910, { item: { type: 'board', id: BOARD_ID }, task_id: TASK_ID })]);
-    check(r.code === 0 && si.requests.length === 0 && si.lists.length === 0 && si.itemReqs.length === 1, `reactions ${si.requests.length} lists ${si.lists.length} item posts ${si.itemReqs.length} stderr ${r.stderr}`);
-    const q = si.itemReqs[0]; const b = JSON.parse(q.raw);
+    check(r.code === 0 && si.requests.length === 0 && si.lists.length === 0 && si.itemReqs.length === 2 && si.itemReqs[0].method === 'GET', `reactions ${si.requests.length} lists ${si.lists.length} item posts ${si.itemReqs.length} stderr ${r.stderr}`);
+    const q = si.itemReqs[1]; const b = JSON.parse(q.raw);
     check(q.method === 'POST' && q.url === `/boardsApi/tasks/${TASK_ID}/comments` && itemHeaderNames(q) === 'content-length,content-type,origin,x-spm-api-key,x-spm-user-email', `${q.method} ${q.url} ${itemHeaderNames(q)}`);
     check(b.parent_id === cid(910) && NOTICE_TEXT_RE.test(b.body), `board text ${q.raw}`);
     const o = r.out[0];
@@ -1803,8 +1807,8 @@ function defineCases(cases, env) {
   T('T84', 'notice line, map: a mentioned human comment gets the text reply only, through the map route (mapsApi/maps/<item_id>/comments); no reaction, no list lookup; acked null, text_acked true', async () => {
     seedItem('map', itemRow(920, 'human'));
     const r = await runAll(env, [noticeLine(920, 920, { item: { type: 'map', id: MAP_ID } })]);
-    check(r.code === 0 && si.requests.length === 0 && si.lists.length === 0 && si.itemReqs.length === 1, `reactions ${si.requests.length} lists ${si.lists.length} item posts ${si.itemReqs.length} stderr ${r.stderr}`);
-    const q = si.itemReqs[0]; const b = JSON.parse(q.raw);
+    check(r.code === 0 && si.requests.length === 0 && si.lists.length === 0 && si.itemReqs.length === 2 && si.itemReqs[0].method === 'GET', `reactions ${si.requests.length} lists ${si.lists.length} item posts ${si.itemReqs.length} stderr ${r.stderr}`);
+    const q = si.itemReqs[1]; const b = JSON.parse(q.raw);
     check(q.method === 'POST' && q.url === `/mapsApi/maps/${MAP_ID}/comments` && itemHeaderNames(q) === 'content-length,content-type,origin,x-spm-api-key,x-spm-user-email', `${q.method} ${q.url} ${itemHeaderNames(q)}`);
     check(b.parent_id === cid(920) && NOTICE_TEXT_RE.test(b.body), `map text ${q.raw}`);
     const o = r.out[0];
@@ -1931,12 +1935,13 @@ function defineCases(cases, env) {
   T('T94', 'a participant notice and the listener line of the SAME comment, in one process, in either order: one reaction and one text reply in total', async () => {
     si.comments = [mk(1200, 'agent'), tagged(1201, 1200, '@Example agent please look')];
     const r1 = await runAll(env, [partNotice(1201, 1200), threadLine(1201, '@Example agent please look', 1200)]);
-    check(si.lists.length === 1 && si.requests.length === 1 && si.posts.length === 1, `notice first: lists ${si.lists.length} reactions ${si.requests.length} posts ${si.posts.length}`);
-    check(r1.out[0].addressed === true && r1.out[0].text_acked === true && r1.out[1].acked === true && r1.out[1].text_acked === true, r1.raw.join(' | '));
+    check(si.lists.length === 2 && si.requests.length === 1 && si.posts.length === 1, `notice first: lists ${si.lists.length} reactions ${si.requests.length} posts ${si.posts.length}`);
+    const shared1 = r1.out[1].acked === true && r1.out[1].text_acked === true; // the two lines run at once: the listener line shares the participant's request (or finds its reply)
+    check(r1.out[0].addressed === true && r1.out[0].text_acked === true && (shared1 || (r1.out[1].already_answered === true && r1.out[1].acked === null && r1.out[1].text_acked === null)), r1.raw.join(' | '));
     si.reset(); si.comments = [mk(1200, 'agent'), tagged(1201, 1200, '@Example agent please look')];
     const r2 = await runAll(env, [threadLine(1201, '@Example agent please look', 1200), partNotice(1201, 1200)]);
     check(si.requests.length === 1 && si.posts.length === 1, `listener first: reactions ${si.requests.length} posts ${si.posts.length}`);
-    check(r2.out[0].acked === true && r2.out[0].text_acked === true && r2.out[1].addressed === true && r2.out[1].acked === true && r2.out[1].text_acked === true, r2.raw.join(' | '));
+    check(r2.out[0].acked === true && r2.out[0].text_acked === true && r2.out[1].addressed === true && (r2.out[1].text_acked === true || (r2.out[1].already_answered === true && r2.out[1].acked === null && r2.out[1].text_acked === null)), r2.raw.join(' | '));
   });
 
   // ==== Notice lines are built by the REAL noticeLine() of agent-listen.cjs from a fixture row (the row's ids are the stand-in's; nothing else is changed)
@@ -2062,11 +2067,48 @@ function defineCases(cases, env) {
     check(si.requests.length === 0 && p.length === 1 && JSON.parse(p[0].raw).parent_id === cid(1080) && r.out[0].text_acked === true && r.out[0].addressed === true, `${r.raw[0]} posts ${p.length}`);
   });
 
-  T('T105', 'live lines unchanged: a LIVE document notice where the agent already wrote after the noticed comment still gets the eyes and the Seen text, with no thread read and no already_answered key', async () => {
+  T('T105', 'live notice, now checked: a LIVE document notice where the agent already wrote after the noticed comment gets NO eyes and NO Seen text; one thread read; already_answered true', async () => {
     si.comments = [mk(1090, 'human'), mk(1091, 'human', 1090), mk(1092, 'agent', 1090)];
     const r = await runAll(env, [fixNotice(1091, 1090, {})]);
     const o = r.out[0];
-    check(si.lists.length === 0 && si.requests.length === 1 && si.posts.length === 1 && o.acked === true && o.text_acked === true && !('already_answered' in o) && Object.keys(o).slice(-3).join() === 'addressed,acked,text_acked', r.raw[0]);
+    check(si.lists.length === 1 && si.requests.length === 0 && si.posts.length === 0 && o.addressed === true && o.already_answered === true && o.acked === null && o.text_acked === null && !('ack_error' in o) && Object.keys(o).slice(-2).join() === 'already_answered,text_acked', `lists ${si.lists.length} reqs ${si.requests.length} posts ${si.posts.length} ${r.raw[0]}`);
+  });
+
+  // live-line gate: a live addressed line with a thread root reads its thread before Seen, like a catch-up line.
+  T('T106a', 'live MAP comment.created line whose thread already holds an agent reply after the tagged comment: no Seen POST, no reaction, already_answered true, one GET of the comment list', async () => {
+    seedItem('map', itemRow(1110, 'human'), { ...itemRow(1111, 'human', 1110), body: '@Example agent check node 3' }, itemRow(1112, 'agent', 1111));
+    const r = await runAll(env, [mapLine(1111, '@Example agent check node 3', 1111)]);
+    const o = r.out[0];
+    check(itemPosts('map').length === 0 && si.requests.length === 0 && si.itemReqs.filter((x) => x.method === 'GET').length === 1, `posts ${itemPosts('map').length} gets ${si.itemReqs.filter((x) => x.method === 'GET').length} ${r.raw[0]}`);
+    check(o.addressed === true && o.already_answered === true && o.text_acked === null && !('ack_error' in o), r.raw[0]);
+  });
+
+  T('T106b', 'live document line whose thread already holds an agent reply after the tagged comment: no Seen POST, no reaction, already_answered true, one list call', async () => {
+    si.comments = [mk(1120, 'human'), mk(1121, 'human', 1120), mk(1122, 'agent', 1121)];
+    const r = await runAll(env, [threadLine(1121, '@Example agent please check', 1121, { kind: 'comment.created' })]);
+    const o = r.out[0];
+    check(si.lists.length === 1 && si.requests.length === 0 && si.posts.length === 0, `lists ${si.lists.length} reqs ${si.requests.length} posts ${si.posts.length} ${r.raw[0]}`);
+    check(o.addressed === true && o.already_answered === true && o.text_acked === null && o.acked === null, r.raw[0]);
+  });
+
+  T('T106c', 'live map and document lines with NO agent reply yet: Seen posted as today (eyes and text on a document, text on a map); one read each, no already_answered key', async () => {
+    seedItem('map', itemRow(1130, 'human'));
+    const m = await runAll(env, [mapLine(1130, '@Example agent check node 3', 1130)]);
+    check(itemPosts('map').length === 1 && m.out[0].text_acked === true && !('already_answered' in m.out[0]), `map ${m.raw[0]} posts ${itemPosts('map').length}`);
+    si.reset(); si.comments = [mk(1131, 'human')];
+    const d = await runAll(env, [threadLine(1131, '@Example agent please check', 1131, { kind: 'comment.created' })]);
+    check(si.lists.length === 1 && si.requests.length === 1 && si.posts.length === 1 && d.out[0].acked === true && d.out[0].text_acked === true && !('already_answered' in d.out[0]), `doc ${d.raw[0]} lists ${si.lists.length}`);
+  });
+
+  T('T106d', 'live lines whose thread read FAILS (HTTP 500): Seen still posted as today, no ack_error, a flaky read never silences an acknowledgement (document and map)', async () => {
+    si.comments = [mk(1140, 'human')];
+    si.behave = (rec) => (rec.list ? { status: 500 } : null);
+    const d = await runAll(env, [threadLine(1140, '@Example agent please check', 1140, { kind: 'comment.created' })]);
+    check(si.lists.length === 1 && si.requests.length === 1 && si.posts.length === 1 && d.out[0].acked === true && d.out[0].text_acked === true && !('ack_error' in d.out[0]) && !('already_answered' in d.out[0]), `doc ${d.raw[0]}`);
+    si.reset(); seedItem('map', itemRow(1150, 'human'));
+    si.behave = (rec) => (rec.method === 'GET' && rec.url.includes('/comments') ? { status: 500 } : null);
+    const m = await runAll(env, [mapLine(1150, '@Example agent check node 3', 1150)]);
+    check(itemPosts('map').length === 1 && m.out[0].text_acked === true && !('ack_error' in m.out[0]) && !('already_answered' in m.out[0]), `map ${m.raw[0]} posts ${itemPosts('map').length}`);
   });
 
 
