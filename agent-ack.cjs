@@ -206,7 +206,8 @@ function gateOf(snap, me) {
   if (!snap.ok) return 'lookup';
   const idx = snap.thread.findIndex((c) => c.id === me);
   if (idx < 0) return 'lookup';
-  return snap.thread.slice(idx + 1).some((c) => c.mine) ? 'answered' : 'ok';
+  // the agent's own Seen line (the exact text this script posts) is an acknowledgement, not an answer: it does not count
+  return snap.thread.slice(idx + 1).some((c) => c.mine && !(typeof c.body === 'string' && ackTextOk(c.body))) ? 'answered' : 'ok';
 }
 
 // ---------------------------------------------------------------- the transport (real https in a run; plain http to a local stand-in in the selftest: the SAME guard and code either way)
@@ -1399,22 +1400,20 @@ function defineCases(cases, env) {
     const line = threadLine(741, '@Example agent please', 740);
     const a = mkAcker(() => t);
     const x1 = JSON.parse(await a.handleLine(line)); const x2 = JSON.parse(await a.handleLine(line));
-    check(x1.text_acked === true && x2.already_answered === true && x2.text_acked === null && si.posts.length === 1, `one process, two lines: posts ${si.posts.length}`);
+    check(x1.text_acked === true && x2.text_acked === true && si.posts.length === 1, `one process, two lines: posts ${si.posts.length}`);
     check(JSON.parse(si.posts[0].raw).body === 'Seen by the Example agent at 23:51 IST. Working on it; the answer follows in this thread.', `text ${JSON.parse(si.posts[0].raw).body}`);
     const same = JSON.parse(await mkAcker(() => t).handleLine(line)); // a restart in the same minute: the same request replays
-    check(same.already_answered === true && same.text_acked === null && si.posts.length === 1 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `restart sees the reply: posts ${si.posts.length}`);
-    t = t0 + 5 * 60000; // a restart five minutes later, whose thread read does not show the stored reply (a stale list): the post goes again, the key is the same: 422 idempotency_key_reused, counted as posted
-    const kept = si.comments; si.comments = kept.filter((c) => c.author_identity !== SELF_ID);
+    check(same.text_acked === true && si.posts.length === 2 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `replay: posts ${si.posts.length}`);
+    t = t0 + 5 * 60000; // a restart five minutes later: the text differs (HH:MM), the key is the same: 422 idempotency_key_reused, counted as posted
     const later = JSON.parse(await mkAcker(() => t).handleLine(line));
-    si.comments = kept;
-    check(later.text_acked === true && si.posts.length === 2 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `422 path: posts ${si.posts.length} rows ${si.comments.filter((c) => c.author_identity === SELF_ID).length}`);
+    check(later.text_acked === true && si.posts.length === 3 && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `422 path: posts ${si.posts.length} rows ${si.comments.filter((c) => c.author_identity === SELF_ID).length}`);
     // concurrent lines for one comment share ONE request
     si.reset(); si.comments = [mk(742, 'human'), mk(743, 'human', 742)]; si.behave = (rec) => (rec.post ? { delayMs: 200 } : null);
     const line2 = threadLine(743, '@Example agent please', 742);
     const both = await Promise.all([mkAcker(() => t).handleLine(line2)]);
     const acker2 = mkAcker(() => t); const pair = await Promise.all([acker2.handleLine(line2), acker2.handleLine(line2)]);
-    check(JSON.parse(both[0]).text_acked === true && pair.every((l) => { const o = JSON.parse(l); return o.text_acked === true || o.already_answered === true; }) && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `concurrent: posts ${si.posts.length}`);
-    check(si.posts.length === 1, `the pair made no second request (shared, or the stored reply was found): ${si.posts.length}`);
+    check(JSON.parse(both[0]).text_acked === true && pair.every((l) => JSON.parse(l).text_acked === true) && si.comments.filter((c) => c.author_identity === SELF_ID).length === 1, `concurrent: posts ${si.posts.length}`);
+    check(si.posts.length === 2, `the concurrent pair made one request (plus the first acker's): ${si.posts.length}`);
   });
 
   T('T44', '--no-text-ack turns the text reply off (eyes unchanged, text_acked null); default is on; given twice is a usage error', async () => {
@@ -1774,8 +1773,8 @@ function defineCases(cases, env) {
 
 
   T('T82', 'notice line, document: a MENTIONED human comment gets one reaction (documentId and commentId from the notice) and one text reply under its thread root (Idempotency-Key ack-text:<comment>); no thread lookup; the notice keys stay, addressed, acked and text_acked are appended, and its own reason "mentioned" is kept', async () => {
-    si.comments = [mk(900, 'human'), mk(901, 'human')];
-    const lines = [noticeLine(900, 900), noticeLine(901, 901)];
+    si.comments = [mk(900, 'human'), mk(901, 'human', 900)];
+    const lines = [noticeLine(900, 900), noticeLine(901, 900, { verb: 'comment.replied' })];
     const r = await runAll(env, lines);
     check(r.code === 0 && si.requests.length === 2 && si.posts.length === 2 && si.lists.length === 2, `reactions ${si.requests.length} posts ${si.posts.length} lists ${si.lists.length} stderr ${r.stderr}`);
     for (const n of [900, 901]) {
@@ -1783,7 +1782,7 @@ function defineCases(cases, env) {
       check(q && q.url === '/documentsApi/reactToDocumentComment' && JSON.stringify(JSON.parse(q.raw)) === JSON.stringify({ documentId: DOC, commentId: cid(n), emoji: '\u{1F440}', op: 'add' }), `reaction for ${n}: ${q && q.raw}`);
       const p = si.posts.find((x) => x.headers['idempotency-key'] === `ack-text:${cid(n)}`);
       const b = p && JSON.parse(p.raw);
-      check(p && b.documentId === DOC && b.parent_id === cid(n) && NOTICE_TEXT_RE.test(b.body), `text for ${n}: ${p && p.raw}`);
+      check(p && b.documentId === DOC && b.parent_id === cid(900) && NOTICE_TEXT_RE.test(b.body), `text for ${n}: ${p && p.raw}`);
     }
     r.out.forEach((o, i) => {
       const orig = JSON.parse(lines[i]);
@@ -2075,6 +2074,30 @@ function defineCases(cases, env) {
   });
 
   // live-line gate: a live addressed line with a thread root reads its thread before Seen, like a catch-up line.
+  // the agent's own Seen line is not an answer (only a real agent reply is).
+  T('T107a', 'the agent\'s own Seen line is not an answer: A and B tagged in one thread, the Seen for A lands after B: B still gets its Seen', async () => {
+    si.comments = [mk(1160, 'human'), mk(1161, 'human', 1160), mk(1162, 'human', 1160)];
+    const a = await runAll(env, [threadLine(1161, '@Example agent please check A', 1160)]);
+    check(a.out[0].text_acked === true, `A: ${a.raw[0]}`);
+    const b = await runAll(env, [threadLine(1162, '@Example agent please check B', 1160)]);
+    check(b.out[0].text_acked === true && !('already_answered' in b.out[0]) && si.posts.length === 2, `B: ${b.raw[0]} posts ${si.posts.length}`);
+  });
+
+  T('T107b', 'a REAL agent reply after B still answers it: B gets no Seen and already_answered true', async () => {
+    si.comments = [mk(1170, 'human'), mk(1171, 'human', 1170), mk(1172, 'human', 1170), mk(1173, 'agent', 1170)];
+    const b = await runAll(env, [threadLine(1171, '@Example agent please check B', 1170)]);
+    const o = b.out[0];
+    check(o.already_answered === true && o.text_acked === null && si.posts.length === 0, `B: ${b.raw[0]} posts ${si.posts.length}`);
+  });
+
+  T('T107c', 'the T82 fixture as it was before the live-line gate (a notice on a root, then a notice on its reply): both comments get their Seen, no already_answered', async () => {
+    si.comments = [mk(1180, 'human'), mk(1181, 'human', 1180)];
+    const r1 = await runAll(env, [noticeLine(1180, 1180)]); // the root's Seen lands in the list after the reply
+    const r2 = await runAll(env, [noticeLine(1181, 1180, { verb: 'comment.replied' })]);
+    const r = { raw: [...r1.raw, ...r2.raw], out: [...r1.out, ...r2.out] };
+    check(si.posts.length === 2 && si.requests.length === 2 && r.out.every((o) => o.text_acked === true && !('already_answered' in o)), `posts ${si.posts.length} reactions ${si.requests.length}: ${r.raw.join(' | ')}`);
+  });
+
   T('T106a', 'live MAP comment.created line whose thread already holds an agent reply after the tagged comment: no Seen POST, no reaction, already_answered true, one GET of the comment list', async () => {
     seedItem('map', itemRow(1110, 'human'), { ...itemRow(1111, 'human', 1110), body: '@Example agent check node 3' }, itemRow(1112, 'agent', 1111));
     const r = await runAll(env, [mapLine(1111, '@Example agent check node 3', 1111)]);
