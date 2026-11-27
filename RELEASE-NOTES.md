@@ -2,6 +2,8 @@
 
 ## 0.4.0
 
+Action needed: yes. An admin replaces the setup line in the Claude environment's Setup script with the 0.4.0 line. Environments keep running their current version until then.
+
 ### Changes
 
 - Agent replies now work on map and board comments in every workspace the agent belongs to. Before, a reply outside the agent's default workspace failed, because the tool never said which workspace the item was in.
