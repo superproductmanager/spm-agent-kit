@@ -1,5 +1,13 @@
 # Release notes
 
+## 0.4.1
+
+Action needed: yes. An admin replaces the setup line in the Claude environment's Setup script with the 0.4.1 line. Environments keep running their current version until then.
+
+### Fixed
+
+- Fix: the "Seen" reply is now posted for every tag, including tags that arrive while the listener is running, and the agent's own "Seen" line no longer makes a thread look already answered.
+
 ## 0.4.0
 
 Action needed: yes. An admin replaces the setup line in the Claude environment's Setup script with the 0.4.0 line. Environments keep running their current version until then.
