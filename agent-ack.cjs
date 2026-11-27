@@ -69,6 +69,7 @@ const { spawn } = require('node:child_process');
 const { loadConfig, ConfigError } = require(path.join(__dirname, 'lib', 'config.cjs'));
 const { resolveBackend } = require(path.join(__dirname, 'lib', 'backend.cjs'));
 const { keyMode, NETWORK_SECRET_VALUE } = require(path.join(__dirname, 'lib', 'key-mode.cjs')); // K-A3 item 1
+const { LOOKUP_PATH, lookupRoute, parseLookupUrl, workspaceFromLookup, isLookedUpWorkspace } = require(path.join(__dirname, 'lib', 'item-workspace.cjs')); // AD1-AD6: the item's workspace, looked up once on a 404
 
 // 0.3.0: the server is configurable (settings "backend"). These start at the litethink values; applyBackend() sets them from the settings file.
 let FN_HOST = resolveBackend({}).api_host;
@@ -240,7 +241,7 @@ function makeTransport(rewrite, lib = https) {
       let settled = false; let timer = null; let req = null;
       const finish = (r) => { if (settled) return; settled = true; clearTimeout(timer); resolve(r); };
       const u = new URL(urlStr);
-      const opts = { method, path: u.pathname, hostname: rewrite ? rewrite.hostname : u.hostname, port: rewrite ? rewrite.port : 443, ...(rewrite ? {} : proxyOpt(lib)), headers: { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) } };
+      const opts = { method, path: u.pathname + u.search, hostname: rewrite ? rewrite.hostname : u.hostname, port: rewrite ? rewrite.port : 443, ...(rewrite ? {} : proxyOpt(lib)), headers: { ...headers, 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(bodyStr) } };
       try {
         req = (rewrite ? http : lib).request(opts, (res) => { finish({ status: res.statusCode }); res.resume(); });
       } catch { finish({ err: 'network' }); return; }
@@ -277,13 +278,20 @@ function guardCreate(urlStr, method, headers, bodyObj) {
   if (typeof bodyObj.documentId !== 'string' || typeof bodyObj.parent_id !== 'string' || !UUID_RE.test(bodyObj.documentId) || !UUID_RE.test(bodyObj.parent_id)) fail('create ids');
   if (typeof bodyObj.body !== 'string' || !ackTextOk(bodyObj.body)) fail('create text');
 }
-/** the one comment this script ever posts on a board task or a map: POST boardsApi/tasks/<uuid>/comments or mapsApi/maps/<uuid>/comments { body: the ack text, parent_id } with Origin and the two key headers ONLY (no Idempotency-Key: these routes have none) */
-function guardItemCreate(urlStr, method, headers, bodyObj) {
+/** AD4: the workspace header is admitted only as the workspace_id this run's lookup returned (wsAllowed); absent is fine; with an on-behalf header it is never sent (the kit has none here) */
+function wsHeaderCheck(headers, wsAllowed) {
+  const key = Object.keys(headers).find((k) => k.toLowerCase() === 'x-spm-workspace');
+  if (key === undefined) return;
+  if (!isLookedUpWorkspace(String(headers[key]).toLowerCase(), wsAllowed)) throw new GuardError('refused: the workspace header is not the looked-up workspace');
+}
+/** the one comment this script ever posts on a board task or a map: POST boardsApi/tasks/<uuid>/comments or mapsApi/maps/<uuid>/comments { body: the ack text, parent_id } with Origin and the two key headers (and the looked-up workspace header, when a lookup gave one) */
+function guardItemCreate(urlStr, method, headers, bodyObj, wsAllowed = null) {
   const fail = (m) => { throw new GuardError(m); };
   let u; try { u = new URL(urlStr); } catch { fail('bad url'); }
   if (u.protocol !== 'https:' || u.port !== '' || u.search !== '' || u.hash !== '' || u.username !== '' || u.password !== '' || u.hostname !== FN_HOST || !ITEM_PATH_RE.test(u.pathname)) fail('only POST boardsApi/tasks/<uuid>/comments or mapsApi/maps/<uuid>/comments on ' + FN_HOST + ' is allowed');
   if (method !== 'POST') fail('item create method');
-  const names = Object.keys(headers).map((k) => k.toLowerCase()).sort();
+  wsHeaderCheck(headers, wsAllowed);
+  const names = Object.keys(headers).map((k) => k.toLowerCase()).filter((k) => k !== 'x-spm-workspace').sort();
   if (names.join(',') !== 'origin,x-spm-api-key,x-spm-user-email') fail('item create header names');
   const h = {}; for (const k of Object.keys(headers)) h[k.toLowerCase()] = headers[k];
   if (h.origin !== ORIGIN) fail('item create origin');
@@ -292,33 +300,43 @@ function guardItemCreate(urlStr, method, headers, bodyObj) {
   if (typeof bodyObj.body !== 'string' || !ackTextOk(bodyObj.body)) fail('item create text');
 }
 /** the thread read of a board or map item: GET boardsApi/tasks/<uuid>/comments or mapsApi/maps/<uuid>/comments on the same host, with the two key headers and no body (the same route agent-reply.cjs reads) */
-function guardItemRead(urlStr, method, headers, bodyObj) {
+function guardItemRead(urlStr, method, headers, bodyObj, wsAllowed = null) {
   const fail = (m) => { throw new GuardError(m); };
   let u; try { u = new URL(urlStr); } catch { fail('bad url'); }
   if (u.protocol !== 'https:' || u.port !== '' || u.search !== '' || u.hash !== '' || u.username !== '' || u.password !== '' || u.hostname !== FN_HOST || !ITEM_PATH_RE.test(u.pathname)) fail('only GET boardsApi/tasks/<uuid>/comments or mapsApi/maps/<uuid>/comments on ' + FN_HOST + ' is allowed');
   if (method !== 'GET') fail('item read method');
-  const names = Object.keys(headers).map((k) => k.toLowerCase()).sort();
+  wsHeaderCheck(headers, wsAllowed);
+  const names = Object.keys(headers).map((k) => k.toLowerCase()).filter((k) => k !== 'x-spm-workspace').sort();
   if (names.join(',') !== 'x-spm-api-key,x-spm-user-email') fail('item read header names');
   if (bodyObj !== undefined) fail('item read carries no body');
 }
-function guardApi(urlStr, method, headers, bodyObj) {
+/** AD1/AD4: the item lookup, GET accountApi/me/items?type=board|map&id=<uuid> with the key and address only, no body (see lib/item-workspace.cjs) */
+function guardLookup(urlStr, method, headers, bodyObj) {
+  const fail = (m) => { throw new GuardError(m); };
+  if (method !== 'GET' || bodyObj !== undefined) fail('item lookup is a bare GET');
+  const names = Object.keys(headers).map((k) => k.toLowerCase()).sort();
+  if (names.join(',') !== 'x-spm-api-key,x-spm-user-email') fail('item lookup header names');
+  if (!parseLookupUrl(urlStr, FN_HOST)) fail('only GET accountApi/me/items?type=board|map&id=<uuid> on ' + FN_HOST + ' is allowed');
+}
+function guardApi(urlStr, method, headers, bodyObj, wsAllowed = null) {
   let u; try { u = new URL(urlStr); } catch { throw new GuardError('bad url'); }
   if (u.pathname === CREATE_PATH) return guardCreate(urlStr, method, headers, bodyObj);
-  if (method === 'GET' && ITEM_PATH_RE.test(u.pathname)) return guardItemRead(urlStr, method, headers, bodyObj);
-  if (ITEM_PATH_RE.test(u.pathname)) return guardItemCreate(urlStr, method, headers, bodyObj);
+  if (u.pathname === LOOKUP_PATH) return guardLookup(urlStr, method, headers, bodyObj);
+  if (method === 'GET' && ITEM_PATH_RE.test(u.pathname)) return guardItemRead(urlStr, method, headers, bodyObj, wsAllowed);
+  if (ITEM_PATH_RE.test(u.pathname)) return guardItemCreate(urlStr, method, headers, bodyObj, wsAllowed);
   return guardList(urlStr, method, headers, bodyObj); // any other path fails the list guard's path check
 }
 /** rewrite (selftest only): { hostname, port } of a local stand-in. Resolves { status, json } or { err } (timeout, network, toobig); the reply is parsed here and only ids and flags are ever read from it. */
 function makeApi(rewrite, lib = https) {
-  return function api(urlStr, method, headers, bodyObj, timeoutMs) {
-    guardApi(urlStr, method, headers, bodyObj);
+  return function api(urlStr, method, headers, bodyObj, timeoutMs, wsAllowed = null) {
+    guardApi(urlStr, method, headers, bodyObj, wsAllowed);
     const isGet = method === 'GET'; // the thread read: no body, no content headers
     const bodyStr = isGet ? '' : JSON.stringify(bodyObj);
     return new Promise((resolve) => {
       let settled = false; let timer = null; let req = null;
       const finish = (r) => { if (settled) return; settled = true; clearTimeout(timer); resolve(r); };
       const u = new URL(urlStr);
-      const opts = { method, path: u.pathname, hostname: rewrite ? rewrite.hostname : u.hostname, port: rewrite ? rewrite.port : 443, ...(rewrite ? {} : proxyOpt(lib)), headers: { ...headers, ...(isGet ? {} : { 'Content-Type': 'application/json' }), Accept: 'application/json', ...(isGet ? {} : { 'Content-Length': Buffer.byteLength(bodyStr) }) } };
+      const opts = { method, path: u.pathname + u.search, hostname: rewrite ? rewrite.hostname : u.hostname, port: rewrite ? rewrite.port : 443, ...(rewrite ? {} : proxyOpt(lib)), headers: { ...headers, ...(isGet ? {} : { 'Content-Type': 'application/json' }), Accept: 'application/json', ...(isGet ? {} : { 'Content-Length': Buffer.byteLength(bodyStr) }) } };
       try {
         req = (rewrite ? http : lib).request(opts, (res) => {
           const chunks = []; let size = 0;
@@ -411,6 +429,21 @@ function createAcker(cfg, deps) {
     return p;
   }
 
+  /** AD1, AD2, AD6: one board or map item call, with the item's workspace. The first try carries the workspace this run already looked up (if any), else no header. On the first 404 not_found, ONE lookup by the item id (GET accountApi/me/items?type&id) and ONE retry with the workspace_id it gives; that id is kept for the run only when the retry works. A 404 creates nothing, so the retry cannot double a post. */
+  const itemWs = new Map(); // `${kind}#${item id}` -> the workspace_id this run's lookup returned and the server accepted
+  async function itemCall(kind, itemId, method, url, headers, body, ms) {
+    const k = `${kind}#${itemId}`;
+    const cached = itemWs.get(k) || null;
+    const withWs = (ws) => (ws ? { ...headers, 'X-SPM-Workspace': ws } : headers);
+    const r = await deps.api(url, method, withWs(cached), body, ms, cached);
+    if (cached || !r || r.status !== 404 || !isPlainObject(r.json) || r.json.code !== 'not_found') return r;
+    const lk = await deps.api(`https://${FN_HOST}/${lookupRoute(kind, itemId)}`, 'GET', { 'X-SPM-API-Key': cfg.key, 'X-SPM-User-Email': cfg.email }, undefined, ms, null);
+    const wsId = lk && lk.status === 200 ? workspaceFromLookup(lk.json, kind, itemId) : null;
+    if (!wsId) return r;
+    const again = await deps.api(url, method, withWs(wsId), body, ms, wsId);
+    if (again && again.status === 200) itemWs.set(k, wsId);
+    return again;
+  }
   /** ONE reply under the thread root of a board or map comment (the same text, the same shared cap; no Idempotency-Key: the route has none). true only on HTTP 200 with { comment: { id } }. */
   function postItemText(kind, ids) {
     const t = now();
@@ -420,7 +453,7 @@ function createAcker(cfg, deps) {
     const headers = { Origin: ORIGIN, 'X-SPM-API-Key': cfg.key, 'X-SPM-User-Email': cfg.email };
     const url = kind === 'board' ? `https://${FN_HOST}/boardsApi/tasks/${ids.task}/comments` : `https://${FN_HOST}/mapsApi/maps/${ids.item}/comments`;
     let p;
-    try { p = Promise.resolve(deps.api(url, 'POST', headers, { body: ackText(t), parent_id: ids.root }, textMs)); } catch { return Promise.resolve(false); }
+    try { p = itemCall(kind, ids.item, 'POST', url, headers, { body: ackText(t), parent_id: ids.root }, textMs); } catch { return Promise.resolve(false); }
     return p.then((r) => Boolean(r && r.status === 200 && isPlainObject(r.json) && isPlainObject(r.json.comment) && typeof r.json.comment.id === 'string'), () => false);
   }
   /** true / false for an addressed board or map line that has a thread root; null when no text reply applies (switched off, no api or key, no root, the comment is itself an ack) */
@@ -473,7 +506,7 @@ function createAcker(cfg, deps) {
     let r = null;
     try {
       if (kind === 'document') r = await deps.api(LIST_URL, 'POST', { 'X-SPM-User-Email': cfg.email, 'X-SPM-API-Key': cfg.key }, { documentId: target }, lookupMs);
-      else r = await deps.api(kind === 'board' ? `https://${FN_HOST}/boardsApi/tasks/${target.task}/comments` : `https://${FN_HOST}/mapsApi/maps/${target.item}/comments`, 'GET', { 'X-SPM-API-Key': cfg.key, 'X-SPM-User-Email': cfg.email }, undefined, lookupMs);
+      else r = await itemCall(kind, target.item, 'GET', kind === 'board' ? `https://${FN_HOST}/boardsApi/tasks/${target.task}/comments` : `https://${FN_HOST}/mapsApi/maps/${target.item}/comments`, { 'X-SPM-API-Key': cfg.key, 'X-SPM-User-Email': cfg.email }, undefined, lookupMs);
     } catch { r = null; }
     return snapshotOf(r, root, selfId, true);
   }
@@ -654,9 +687,12 @@ const humanLine = (n, text, extra) => JSON.stringify({ t: '2026-10-04T16:50:15+0
 /** A real http server on 127.0.0.1 that implements the reactToDocumentComment CONTRACT :
  *  trusted Origin else 403 untrusted_origin; X-SPM-API-Key + X-SPM-User-Email else 401; body {documentId, commentId, emoji, op}; non-empty emoji of at most 16 UTF-16 units and op add|remove else 400;
  *  unknown document or a comment not in it -> 404; add is an idempotent upsert (UNIQUE comment, emoji, reactor); 200 {"ok":true}. A CONTRACT-FAITHFUL STAND-IN: production needs Postgres. */
+// Workspaces of the stand-in (AD10): the item lives in st.itemWsId; the agent's own default is WS_HOME. The rules copied are the real ones (server rule); this is a stand-in, production is the real Cloud Function.
+const WS_HOME = '00000000-0000-4000-8000-0000000000a1';
+const WS_OTHER = '00000000-0000-4000-8000-0000000000a2';
 function makeStandIn() {
   const keyOk = (k) => k === FAKE_KEY || (st.placeholderKey === true && k === 'network-secret'); // network-secret mode sends the placeholder; the stand-in takes it only when a test turns placeholderKey on
-  const st = { placeholderKey: false, requests: [], lists: [], posts: [], itemReqs: [], itemComments: { board: new Map(), map: new Map() }, idem: new Map(), comments: [], callerIdentity: SELF_ID, isYouOff: false, reactions: new Set(), behave: null, server: null, port: 0 };
+  const st = { placeholderKey: false, requests: [], lists: [], posts: [], itemReqs: [], lookups: [], itemWsId: WS_HOME, defaultWsId: WS_HOME, memberIds: [WS_HOME, WS_OTHER], lookupShowsAll: false, itemComments: { board: new Map(), map: new Map() }, idem: new Map(), comments: [], callerIdentity: SELF_ID, isYouOff: false, reactions: new Set(), behave: null, server: null, port: 0 };
   st.server = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
@@ -664,7 +700,8 @@ function makeStandIn() {
       const isList = req.url === '/documentsApi/listDocumentComments'; // lists go to st.lists, comment posts to st.posts, reactions to st.requests (the old counts keep meaning "reaction requests")
       const isPost = req.url === '/documentsApi/createDocumentComment';
       const im = /^\/(boardsApi|mapsApi)\/([^/]+)\/([^/]+)\/comments$/.exec(req.url); // the board and map comment routes (no query is ever sent)
-      const sink = im ? st.itemReqs : isList ? st.lists : isPost ? st.posts : st.requests;
+      const isLookup = req.url.startsWith('/accountApi/me/items'); // AD1: the item lookup (identityFromKey, the key's owner)
+      const sink = im ? st.itemReqs : isLookup ? st.lookups : isList ? st.lists : isPost ? st.posts : st.requests;
       const rec = { t: Date.now(), method: req.method, url: req.url, headers: { ...req.headers }, raw: Buffer.concat(chunks).toString('utf8'), n: sink.length + 1, list: isList, post: isPost, itemPost: Boolean(im) && req.method === 'POST' };
       sink.push(rec);
       const send = (status, json) => { res.writeHead(status, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(json)); };
@@ -674,6 +711,7 @@ function makeStandIn() {
       if (b && b.hang) return;
       if (b && b.raw !== undefined) { res.writeHead(200, { 'Content-Type': 'application/json' }); return res.end(b.raw); }
       if (b && b.status) return send(b.status, { error: 'forced', echoedKey: rec.headers['x-spm-api-key'] });
+      if (isLookup) return lookupRequest(rec, send);
       if (im) return itemRequest(rec, im, send);
       if (isPost) {
         // POST createDocumentComment with the Idempotency-Key header, as the reply script calls it: Origin + x-spm-api-key + x-spm-user-email,
@@ -735,11 +773,26 @@ function makeStandIn() {
     if (type === 'board') return { id: c.id, task_id: TASK_ID, author_email: c.author_email, body: c.body, created_at: c.created_at, updated_at: null, author_display_name: c.author_display_name, ...tail };
     return { id: c.id, map_id: MAP_ID, node_id: NODE_ID, author_email: c.author_email, author_display_name: c.author_display_name, body: c.body, created_at: c.created_at, updated_at: null, ...tail };
   };
+  // GET /accountApi/me/items?type=board|map&id=<uuid> (server rule): the ITEM's workspace_id, or no items when the agent cannot open it
+  function lookupRequest(rec, send) {
+    if (rec.method !== 'GET') return send(405, errBody('method_not_allowed', 'GET only'));
+    if (!keyOk(rec.headers['x-spm-api-key'])) return send(401, errBody('unauthenticated', 'invalid or revoked API key'));
+    if (rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return send(403, errBody('api_key_owner_mismatch', 'this API key can only act as its owner'));
+    const q = new URL(rec.url, 'http://x').searchParams;
+    if (!['board', 'map'].includes(q.get('type'))) return send(400, errBody('invalid_type', 'type must be board or map'));
+    const want = q.get('type') === 'board' ? BOARD_ID : MAP_ID;
+    const visible = q.get('id') === want && (st.lookupShowsAll || st.memberIds.includes(st.itemWsId));
+    return send(200, { items: visible ? [{ type: q.get('type'), id: want, title: 'stand-in item', workspace_id: st.itemWsId, tier: 'comment', via: 'row', level: null }] : [], next_cursor: null });
+  }
   function itemRequest(rec, m, send) {
     const [, fn, seg, rawId] = m; const type = fn === 'boardsApi' ? 'board' : 'map';
     const out = (name, status, body) => send(status, body);
     if (!keyOk(rec.headers['x-spm-api-key'])) return out('board.events.bad-key', 401, errBody('unauthenticated', 'invalid or revoked API key'));
     if (rec.headers['x-spm-user-email'] !== FAKE_EMAIL) return out('board.events.owner-mismatch', 403, errBody('api_key_owner_mismatch', 'this API key can only act as its owner'));
+    // the workspace header (server rule): a header naming a workspace the caller is not in is 400; the item opens only in its own workspace (no header = the caller's default)
+    const wsHdr = rec.headers['x-spm-workspace'];
+    if (wsHdr !== undefined && !st.memberIds.includes(String(wsHdr).toLowerCase())) return out(`${type}.workspace.refused`, 400, errBody('workspace_not_allowed', 'X-SPM-Workspace is not one of your workspaces'));
+    if ((wsHdr === undefined ? st.defaultWsId : String(wsHdr).toLowerCase()) !== st.itemWsId) return out(`${type}.workspace.not-found`, 404, errBody('not_found', 'not found'));
     if (rec.method === 'GET' && seg === (type === 'board' ? 'tasks' : 'maps')) { // the thread read: the comment list of the item, the stand-in's own rows in the order they were stored
       if (rawId.toLowerCase() !== (type === 'board' ? TASK_ID : MAP_ID)) return out(`${type}.comments.list.not-found`, 404, errBody('not_found', 'not found'));
       return out(`${type}.comments.list`, 200, { comments: [...st.itemComments[type].values()].map((c) => itemWire(type, c, FAKE_EMAIL)) });
@@ -759,7 +812,7 @@ function makeStandIn() {
   }
   st.start = () => new Promise((resolve) => st.server.listen(0, '127.0.0.1', () => { st.port = st.server.address().port; resolve(); }));
   st.stop = () => new Promise((resolve) => { st.server.closeAllConnections?.(); st.server.close(() => resolve()); });
-  st.reset = () => { st.requests.length = 0; st.lists.length = 0; st.posts.length = 0; st.itemReqs.length = 0; st.itemComments = { board: new Map(), map: new Map() }; st.idem.clear(); st.comments = []; st.callerIdentity = SELF_ID; st.isYouOff = false; st.reactions.clear(); st.behave = null; st.placeholderKey = false; };
+  st.reset = () => { st.requests.length = 0; st.lists.length = 0; st.posts.length = 0; st.itemReqs.length = 0; st.lookups.length = 0; st.itemWsId = WS_HOME; st.defaultWsId = WS_HOME; st.memberIds = [WS_HOME, WS_OTHER]; st.lookupShowsAll = false; st.itemComments = { board: new Map(), map: new Map() }; st.idem.clear(); st.comments = []; st.callerIdentity = SELF_ID; st.isYouOff = false; st.reactions.clear(); st.behave = null; st.placeholderKey = false; };
   return st;
 }
 /** One comment row in the list wire shape (authors by identity: 'agent' = this agent, 'other' = some other identity, 'human'); parent = a number (a cid) or undefined for a top-level comment. */
@@ -1526,6 +1579,53 @@ function defineCases(cases, env) {
     si.reset(); seedItem('board', itemRow(1400, 'human'), itemRow(1401, 'human', 1400)); seedItem('map', itemRow(1400, 'human'), itemRow(1411, 'human', 1400));
     const k = await runAll(env, [boardLine(1401, '@Example agent x', 1400), mapLine(1401, '@Example agent x', 1400, { parent_id: cid(1400) })]);
     check(si.itemReqs.length === 2 && k.out.every((o) => o.text_acked === true) && si.itemReqs[0].url.startsWith('/boardsApi/') && si.itemReqs[1].url.startsWith('/mapsApi/'), `board and map with one comment id: ${si.itemReqs.map((q) => q.url)}`);
+  });
+
+  // AD1-AD4, AD6 (spec addendum 1): a board or map post that 404s with no header is looked up ONCE by the item id (GET accountApi/me/items?type&id) and retried ONCE with X-SPM-Workspace = the workspace_id the lookup gave
+  T('W1', 'a map line in another workspace: the post 404s with no header, ONE lookup (type=map, the map id, no workspace header), then the post carries the item workspace and text_acked is true', async () => {
+    si.itemWsId = WS_OTHER; seedItem('map', itemRow(1100, 'human'));
+    const r = await runAll(env, [mapLine(1101, '@Example agent look at the map', 1100)]);
+    const seq = si.itemReqs.map((q) => (q.headers['x-spm-workspace'] ? 'ws' : 'no-ws') + ':' + q.method);
+    check(r.out[0].text_acked === true, `text_acked ${r.out[0].text_acked} requests ${JSON.stringify(seq)} lookups ${si.lookups.length}`);
+    check(JSON.stringify(seq) === JSON.stringify(['no-ws:POST', 'ws:POST']), `item requests ${JSON.stringify(seq)}`);
+    check(si.lookups.length === 1 && si.lookups[0].url === `/accountApi/me/items?type=map&id=${MAP_ID}` && !si.lookups[0].headers['x-spm-workspace'], `lookups ${JSON.stringify(si.lookups.map((q) => q.url))}`);
+    check(si.itemReqs[1].headers['x-spm-workspace'] === WS_OTHER && JSON.parse(si.itemReqs[1].raw).parent_id === cid(1100), 'the retry header or the parent is wrong');
+  });
+  T('W2', 'a board line in another workspace: the lookup asks for the BOARD id (item_id), and the retry carries the item workspace', async () => {
+    si.itemWsId = WS_OTHER; seedItem('board', itemRow(1100, 'human'));
+    const r = await runAll(env, [boardLine(1101, '@Example agent look at the board', 1100)]);
+    check(r.out[0].text_acked === true && si.itemReqs.length === 2 && si.itemReqs[1].headers['x-spm-workspace'] === WS_OTHER, `text_acked ${r.raw.join(' | ')} posts ${si.itemReqs.length}`);
+    check(si.lookups.length === 1 && si.lookups[0].url === `/accountApi/me/items?type=board&id=${BOARD_ID}`, `lookups ${JSON.stringify(si.lookups.map((q) => q.url))}`);
+  });
+  T('W3', 'an EMPTY lookup (the agent cannot open the item): one lookup, no header sent, text_acked false, nothing posted', async () => {
+    si.itemWsId = WS_OTHER; si.memberIds = [WS_HOME]; seedItem('map', itemRow(1100, 'human'));
+    const r = await runAll(env, [mapLine(1101, '@Example agent look', 1100)]);
+    check(r.out[0].text_acked === false && si.lookups.length === 1 && si.itemReqs.every((q) => !q.headers['x-spm-workspace']) && si.itemReqs.length === 1, `text_acked ${r.out[0].text_acked} lookups ${si.lookups.length} posts ${si.itemReqs.length}`);
+    check(si.itemComments.map.size === 1, 'a comment was posted');
+  });
+  T('W4', 'a retry refused 400 (the item workspace is not one the agent is in): text_acked false, the retry made once, nothing posted', async () => {
+    si.itemWsId = WS_OTHER; si.memberIds = [WS_HOME]; si.lookupShowsAll = true; seedItem('map', itemRow(1100, 'human'));
+    const r = await runAll(env, [mapLine(1101, '@Example agent refused retry', 1100)]);
+    const withWs = si.itemReqs.filter((q) => q.headers['x-spm-workspace'] === WS_OTHER);
+    check(r.out[0].text_acked === false && withWs.length === 1 && si.itemComments.map.size === 1, `text_acked ${r.out[0].text_acked} retries ${withWs.length}`);
+  });
+  T('W5', 'guard (AD4): the workspace header only as the looked-up workspace_id; the lookup only as a bare GET with type and id; never on a document route or a notices path', async () => {
+    const H = new URL(ENDPOINT_URL).host;
+    const hdr = { 'X-SPM-API-Key': FAKE_KEY, 'X-SPM-User-Email': FAKE_EMAIL };
+    const itemUrl = `https://${H}/mapsApi/maps/${MAP_ID}/comments`;
+    const body = { body: 'Seen by the Example agent at 10:00 IST. Working on it; the answer follows in this thread.', parent_id: cid(1100) };
+    const refused = (fn) => { try { fn(); return false; } catch (e) { return e instanceof GuardError; } };
+    check(refused(() => guardApi(itemUrl, 'POST', { Origin: ORIGIN, ...hdr, 'X-SPM-Workspace': WS_OTHER }, body, null)), 'a header with no lookup in this run was admitted');
+    check(refused(() => guardApi(itemUrl, 'POST', { Origin: ORIGIN, ...hdr, 'X-SPM-Workspace': WS_HOME }, body, WS_OTHER)), 'a header other than the looked-up workspace was admitted');
+    check(!refused(() => guardApi(itemUrl, 'POST', { Origin: ORIGIN, ...hdr, 'X-SPM-Workspace': WS_OTHER }, body, WS_OTHER)), 'the looked-up workspace header on the post was refused');
+    check(!refused(() => guardApi(itemUrl, 'GET', { ...hdr, 'X-SPM-Workspace': WS_OTHER }, undefined, WS_OTHER)), 'the looked-up workspace header on the thread read was refused');
+    check(refused(() => guardApi(`https://${H}/documentsApi/listDocumentComments`, 'POST', { ...hdr, 'X-SPM-Workspace': WS_OTHER }, { documentId: DOC }, WS_OTHER)), 'the header was admitted on a document route');
+    const lk = `https://${H}/accountApi/me/items?type=map&id=${MAP_ID}`;
+    check(!refused(() => guardApi(lk, 'GET', hdr, undefined, null)), 'the bare lookup was refused');
+    check(refused(() => guardApi(lk, 'GET', { ...hdr, 'X-SPM-Workspace': WS_OTHER }, undefined, WS_OTHER)), 'the lookup admitted a workspace header');
+    check(refused(() => guardApi(`${lk}&limit=5`, 'GET', hdr, undefined, null)), 'the lookup admitted an extra query key');
+    check(refused(() => guardApi(lk, 'POST', hdr, {}, null)), 'the lookup admitted a POST');
+    check(refused(() => guardApi(`https://${H}/accountApi/inbox`, 'GET', hdr, undefined, null)), 'a notices-feed path was admitted');
   });
 
   T('T65', 'the rate cap is shared: at most 10 text replies per rolling minute per process across documents, boards and maps (the 11th is text_acked false, no request); the window slides (fake clock)', async () => {

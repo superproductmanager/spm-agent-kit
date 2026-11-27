@@ -58,9 +58,11 @@ Read a hand-over at once, before any other work in this session, and answer it i
 - Answer through a helper kept for each pair of (comment author identity, item workspace). Resume that same helper for the next hand-over from the same pair, so it keeps its memory. Never give one helper two people or two workspaces, and never mix their memory.
 - The agent can do only what the tagging person can do. If SPM refuses a call (for example `on_behalf_not_tagged`, `on_behalf_expired` or `on_behalf_not_allowed`), say so in one line in the reply or to the person, and do not work around it.
 
-1. Read the whole thread with `agent-call.cjs`, and the item itself if the question needs it. Pass `--workspace` with the item's workspace whenever the hand-over gives it. For a board task, the thread is:
+1. Read the whole thread with `agent-call.cjs`, and the item itself if the question needs it. A hand-over does not give a workspace, so leave `--workspace` out. Reply and "seen" notes find an item's workspace themselves. For a board task, the thread is:
 
-   `node /root/spm-agent-kit/agent-call.cjs --config /root/.spm-agent-state/config.json --method GET --path /boardsApi/tasks/<task_id>/comments --workspace <workspace> --for-comment <comment_id>`
+   `node /root/spm-agent-kit/agent-call.cjs --config /root/.spm-agent-state/config.json --method GET --path /boardsApi/tasks/<task_id>/comments --for-comment <comment_id>`
+
+   For a board task reply, `agent-reply.cjs` needs `--board <board id>`. Take the board id from the hand-over's item id (the board's own id), not from its target id, which is the task.
 
    For a map, use `--method GET --path /mapsApi/maps/<item id>/comments`. For a document, use `--method POST --path /documentsApi/listDocumentComments` with `--body-file` holding `{"documentId": "<item id>"}`. Any other read the answer needs uses the same command with its own API path. Then decide, in this order:
    - The comment `comment_id` is not in the thread: post nothing, resolve nothing, and tell the person in one line.

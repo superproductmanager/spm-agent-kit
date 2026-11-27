@@ -257,6 +257,7 @@ node agent-call.cjs --config <absolute path> --method GET --path /boardsApi/task
 - `--workspace` sends `X-SPM-Workspace`. `--for-comment` sends `X-SPM-On-Behalf-Of-Comment`. `--body-file` (POST only) is a file holding the JSON body.
 - The JSON reply body goes to stdout and the script exits 0. A 4xx prints `HTTP <status> <error code>` on stderr and exits 2 (for example `on_behalf_not_tagged`). Anything else exits 1. The key is never printed.
 - `agent-reply.cjs --for-comment <comment id>` sends the same header on its thread lookup and its post.
+- Map and board replies, and the "seen" notes from `agent-ack.cjs`, work in any workspace the agent belongs to. The first read has no workspace header. If it returns 404, the kit looks up the item's workspace once and retries once with it. For a board task, `agent-reply.cjs` needs `--board <board id>`, the board the task belongs to.
 
 SPM checks the comment on every call: it must tag the agent, be less than 24 hours old, be written by a person, and the person must still be able to see the item.
 

@@ -54,6 +54,7 @@ const { loadConfig, ConfigError } = require(path.join(__dirname, 'lib', 'config.
 const { resolveBackend } = require(path.join(__dirname, 'lib', 'backend.cjs'));
 const { keyMode, NETWORK_SECRET_VALUE } = require(path.join(__dirname, 'lib', 'key-mode.cjs')); // K-A3 item 1
 const { findSecrets } = require(path.join(__dirname, 'lib', 'secret-patterns.cjs')); // the one key-shape list, shared with the repo scan
+const { LOOKUP_PATH, lookupRoute, parseLookupUrl, workspaceFromLookup, isLookedUpWorkspace } = require(path.join(__dirname, 'lib', 'item-workspace.cjs')); // AD1-AD7: the item's workspace, looked up once on a 404
 
 // 0.3.0: the server is configurable (settings "backend"); applyBackend() sets it from the settings file (litethink by default).
 let FN_HOST = resolveBackend({}).api_host;
@@ -99,7 +100,7 @@ function firstKeyLike(text) {
 // argv is the command line WITHOUT --config (main strips it). config is { name, email, keyFile } from the settings file.
 function parseArgs(argv, config = {}) {
   const bad = (why) => ({ ok: false, error: why });
-  const valued = ['--document', '--map', '--task', '--to', '--text', '--text-file', '--for-comment'];
+  const valued = ['--document', '--map', '--task', '--to', '--text', '--text-file', '--for-comment', '--board'];
   const v = {}; let dryRun = false; let isNew = false;
   for (let i = 0; i < argv.length; i++) {
     const f = argv[i];
@@ -119,6 +120,13 @@ function parseArgs(argv, config = {}) {
   const to = isNew ? null : v['--to'].trim().toLowerCase();
   if (!UUID_RE.test(itemId)) return bad(`${kinds[0]} must be a uuid`);
   if (!isNew && !UUID_RE.test(to)) return bad('--to must be a comment id (a uuid)');
+  // AD5: a task's workspace is looked up by its BOARD id (server rule); the skill copies it from the hand-over's target.id
+  let board = null;
+  if (Object.prototype.hasOwnProperty.call(v, '--board')) {
+    if (kind !== 'task') return bad('--board goes with --task (the board that holds the task)');
+    board = v['--board'].trim().toLowerCase();
+    if (!UUID_RE.test(board)) return bad('--board must be a board id (a uuid)');
+  }
   const hasText = Object.prototype.hasOwnProperty.call(v, '--text'); const hasFile = Object.prototype.hasOwnProperty.call(v, '--text-file');
   if (hasText === hasFile) return bad('give exactly one of --text and --text-file');
   let text;
@@ -139,14 +147,14 @@ function parseArgs(argv, config = {}) {
     if (!UUID_RE.test(fc)) return bad('--for-comment must be a comment id (a uuid)');
     forComment = fc;
   }
-  return { ok: true, cfg: { identity: config.email, kind, document: kind === 'document' ? itemId : null, map: kind === 'map' ? itemId : null, task: kind === 'task' ? itemId : null, to, text, dryRun, isNew, keyFile: config.keyFile || null, email: config.email, forComment } };
+  return { ok: true, cfg: { identity: config.email, kind, document: kind === 'document' ? itemId : null, map: kind === 'map' ? itemId : null, task: kind === 'task' ? itemId : null, board, to, text, dryRun, isNew, keyFile: config.keyFile || null, email: config.email, forComment } };
 }
 
 // ---------------------------------------------------------------- the allow-list: checked before EVERY call
-function guardRequest(url, method, headers, body, mode) { // mode 'new': the request of --new (a top-level comment: parent_id is null); anything else is a reply (parent_id is a uuid)
+function guardRequest(url, method, headers, body, mode, wsAllowed = null) { // mode 'new': the request of --new (a top-level comment: parent_id is null); anything else is a reply (parent_id is a uuid). wsAllowed: the item workspace_id this run's lookup returned (AD4), or null
   let u;
   try { u = new URL(url); } catch (_) { throw new GuardError('refused: unparseable url'); }
-  if (u.protocol !== 'https:' || u.port !== '' || u.username !== '' || u.password !== '' || u.hash !== '' || u.search !== '') throw new GuardError('refused: scheme, port, query or credentials in the url');
+  if (u.protocol !== 'https:' || u.port !== '' || u.username !== '' || u.password !== '' || u.hash !== '' || (u.search !== '' && u.pathname !== LOOKUP_PATH)) throw new GuardError('refused: scheme, port, query or credentials in the url');
   if (u.hostname !== FN_HOST) throw new GuardError('refused: host or method is not on the allow-list');
   // X-SPM-On-Behalf-Of-Comment (--for-comment) is allowed on every route here, once, with a comment id; the route checks below see the other headers only
   const onBehalf = Object.keys(headers || {}).filter((h) => h.toLowerCase() === 'x-spm-on-behalf-of-comment');
@@ -155,12 +163,25 @@ function guardRequest(url, method, headers, body, mode) { // mode 'new': the req
   const only =(allowed) => { if (!names.every((n) => allowed.includes(n))) throw new GuardError('refused: a header that does not belong on this route'); };
   const exact = (wanted) => { if (names.length !== wanted.length || !wanted.every((n) => names.includes(n))) throw new GuardError('refused: the headers of this route are exactly ' + wanted.join(', ')); };
   const keys = (b) => (b && typeof b === 'object' && !Array.isArray(b) ? Object.keys(b).sort().join(',') : null);
+  // AD4: the workspace header is allowed on the item routes only, and only with the workspace_id this run's lookup returned; never with the on-behalf header
+  const wsKey = Object.keys(headers || {}).find((h) => h.toLowerCase() === 'x-spm-workspace');
+  const wsNames = wsKey === undefined ? [] : ['x-spm-workspace'];
+  if (wsKey !== undefined) {
+    if (onBehalf.length === 1) throw new GuardError('refused: the workspace header and the on-behalf header go together');
+    if (!isLookedUpWorkspace(String(headers[wsKey]).toLowerCase(), wsAllowed)) throw new GuardError('refused: the workspace header is not the looked-up workspace');
+  }
+  if (u.pathname === LOOKUP_PATH) { // the item lookup (AD1, AD4): a GET with the key and address only, no body, no on-behalf header, exactly type and id
+    if (method !== 'GET' || body !== undefined || onBehalf.length) throw new GuardError('refused: the lookup is a bare GET');
+    exact(['x-spm-api-key', 'x-spm-user-email']);
+    if (!parseLookupUrl(url, FN_HOST)) throw new GuardError('refused: the lookup url');
+    return;
+  }
   if (ITEM_PATH_RE.test(u.pathname)) { // board (tasks) and map comments: GET the list, POST the reply; nothing else on these paths
     if (method === 'GET') {
-      exact(['x-spm-api-key', 'x-spm-user-email']);
+      exact(['x-spm-api-key', 'x-spm-user-email', ...wsNames]);
       if (body !== undefined) throw new GuardError('refused: a GET carries no body');
     } else if (method === 'POST') {
-      exact(['origin', 'x-spm-api-key', 'x-spm-user-email']);
+      exact(['origin', 'x-spm-api-key', 'x-spm-user-email', ...wsNames]);
       const origin = Object.keys(headers).filter((h) => h.toLowerCase() === 'origin').map((h) => headers[h])[0];
       if (origin !== ORIGIN) throw new GuardError('refused: the Origin header');
       // --new (mode 'new'): parent_id is JSON null (a top-level comment); a reply: a uuid. An omitted or empty parent_id is refused in both.
@@ -281,9 +302,11 @@ async function run(cfg, deps) {
     else { try { key = deps.readKeyFile(cfg.keyFile); } catch (e) { L.outcome = 'no_key'; warn(`cannot read the key file (${word(e && e.code)})`); return 1; } }
     const onBehalfHdr = cfg.forComment ? { 'X-SPM-On-Behalf-Of-Comment': cfg.forComment } : {}; // --for-comment: the same header on the lookup and the post
     const headersRead = { 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email, ...onBehalfHdr };
+    let wsAllowed = null; // AD4: the item workspace_id this run's lookup returned; the only value a workspace header may carry
+    let wsHeader = null;  // the header the post carries (the same value), or null
     const call = async (method, route, headers, body) => {
       const url = `https://${FN_HOST}/${route}`;
-      guardRequest(url, method, headers, body, cfg.isNew ? 'new' : 'reply');
+      guardRequest(url, method, headers, body, cfg.isNew ? 'new' : 'reply', wsAllowed);
       try { const res = await deps.http(url, method, headers, body, { timeoutMs: 90000 }); return { status: res.status, json: parseJson(res.text), err: null }; } catch (e) { return { status: null, json: null, err: word(e && e.code) }; }
     };
     const itemId = cfg.kind === 'map' ? cfg.map : cfg.kind === 'task' ? cfg.task : cfg.document;
@@ -291,7 +314,21 @@ async function run(cfg, deps) {
     // (a) the thread root of --to, from the real comment list (--new has no thread: no lookup at all, root stays null, the create carries parent_id null)
     let root = null;
     if (!cfg.isNew) {
-      const lst = cfg.kind === 'document' ? await call('POST', 'documentsApi/listDocumentComments', headersRead, { documentId: cfg.document }) : await call('GET', itemRoute, headersRead, undefined);
+      let lst = cfg.kind === 'document' ? await call('POST', 'documentsApi/listDocumentComments', headersRead, { documentId: cfg.document }) : await call('GET', itemRoute, headersRead, undefined);
+      // AD1-AD3: a map or board item that 404s with no header is looked up ONCE (its workspace), and the thread read is retried ONCE with that workspace_id. Not for --for-comment (the server picks the workspace), not for documents.
+      const canLookup = cfg.kind !== 'document' && lst.status === 404 && lst.json && lst.json.code === 'not_found' && !cfg.forComment && (cfg.kind === 'map' || cfg.board);
+      if (canLookup) {
+        const lt = cfg.kind === 'map' ? { type: 'map', id: cfg.map } : { type: 'board', id: cfg.board };
+        const lk = await call('GET', lookupRoute(lt.type, lt.id), headersRead, undefined);
+        const wsId = lk.status === 200 ? workspaceFromLookup(lk.json, lt.type, lt.id) : null;
+        if (!wsId) warn('the item lookup gave no workspace for this item (an empty answer: not an item this agent can open)');
+        else {
+          wsAllowed = wsId;
+          const again = await call('GET', itemRoute, { ...headersRead, 'X-SPM-Workspace': wsId }, undefined);
+          if (again.status === 200) { lst = again; wsHeader = wsId; say('thread found in the item\'s workspace'); }
+          else warn(`the item's workspace refused the thread read (${again.status === null ? `network ${word(again.err)}` : `HTTP ${again.status} ${word(again.json && again.json.code)}`})`);
+        }
+      }
       if (lst.status !== 200 || !lst.json || !Array.isArray(lst.json.comments)) {
         L.outcome = 'lookup_failed'; L.http_status = lst.status;
         warn(`stopped: the thread lookup failed (${lst.status === null ? `network ${lst.err}` : `HTTP ${lst.status} ${word(lst.json && lst.json.code)}`}); nothing was posted`);
@@ -326,7 +363,7 @@ async function run(cfg, deps) {
     }
     if (wait > 0) await deps.sleep(wait);
     // (b) the post
-    const postHeaders = { Origin: ORIGIN, 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email, ...onBehalfHdr };
+    const postHeaders = { Origin: ORIGIN, 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email, ...onBehalfHdr, ...(wsHeader ? { 'X-SPM-Workspace': wsHeader } : {}) };
     const post = cfg.kind === 'document' ? await call('POST', 'documentsApi/createDocumentComment', postHeaders, { documentId: cfg.document, body: cfg.text, parent_id: root }) : await call('POST', itemRoute, postHeaders, { body: cfg.text, parent_id: root });
     L.http_status = post.status;
     const settle = (fn) => withLock(deps.stateDir, async () => { const st = readState(deps.stateDir); fn(st); writeStateAtomic(deps.stateDir, st); });
@@ -405,6 +442,11 @@ const BTOP = '00000000-0000-4000-8000-000000000009'; const BREPLY = '00000000-00
 const MTOP = '00000000-0000-4000-8000-00000000000c'; const MREPLY = '00000000-0000-4000-8000-00000000000d'; const MTOP2 = '00000000-0000-4000-8000-00000000000e';
 const check = (cond, msg) => { if (!cond) throw new Error(msg); };
 
+// Workspaces of the stand-in (AD10). The item lives in S.itemWsId; the agent's own default is WS_HOME.
+const BOARD_ID = '00000000-0000-4000-8000-0000000000b0';
+const WS_HOME = '00000000-0000-4000-8000-0000000000a1';
+const WS_OTHER = '00000000-0000-4000-8000-0000000000a2';
+// The stand-in copies the real rules (server rule), NOT a fake: this file is the stand-in, production is the real Cloud Function.
 function makeStandIn() {
   const S = { port: 0, calls: [], creates: [], over: null, server: null };
   const comments = () => new Map([
@@ -417,7 +459,7 @@ function makeStandIn() {
     return type === 'board' ? new Map([[BTOP, mk(BTOP, null, 'top level board comment')], [BREPLY, mk(BREPLY, BTOP, 'a reply on the task')], [BTOP2, mk(BTOP2, null, 'another top level on the task')]])
       : new Map([[MTOP, mk(MTOP, null, 'top level map comment')], [MREPLY, mk(MREPLY, MTOP, 'a reply on the map')], [MTOP2, mk(MTOP2, null, 'another top level on the map')]]);
   };
-  S.reset = () => { S.calls = []; S.creates = []; S.over = null; S.comments = comments(); S.items = { board: itemSeed('board'), map: itemSeed('map') }; };
+  S.reset = () => { S.calls = []; S.creates = []; S.over = null; S.comments = comments(); S.items = { board: itemSeed('board'), map: itemSeed('map') }; S.defaultWsId = WS_HOME; S.itemWsId = WS_HOME; S.memberIds = [WS_HOME, WS_OTHER]; S.lookupShowsAll = false; };
   S.reset();
   const send = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
   const errBody = (code, message) => ({ error: code, code, message });
@@ -436,6 +478,10 @@ function makeStandIn() {
     const id = rawId.toLowerCase();
     const store = S.items[type];
     if (id !== (type === 'board' ? TASK_ID : MAP_ID)) return send(res, 404, errBody('not_found', 'not found'));
+    // the workspace header (server rule): a header naming a workspace the caller is not in is 400; the item opens only in its own workspace (no header = the caller's default)
+    const wsHdr = req.headers['x-spm-workspace'];
+    if (wsHdr !== undefined && !S.memberIds.includes(String(wsHdr).toLowerCase())) return send(res, 400, errBody('workspace_not_allowed', 'X-SPM-Workspace is not one of your workspaces'));
+    if ((wsHdr === undefined ? S.defaultWsId : String(wsHdr).toLowerCase()) !== S.itemWsId) return send(res, 404, errBody('not_found', 'not found'));
     if (req.method === 'GET') return send(res, 200, { comments: [...store.values()].map((c) => itemWire(type, c, em)), cursor: store.size, signal_id: 'f'.repeat(64) });
     rec.create = true; S.creates.push({ body, em, type });
     const n = S.creates.length; const o = typeof S.over === 'function' ? S.over(n) : S.over;
@@ -457,12 +503,24 @@ function makeStandIn() {
     req.on('data', (c) => chunks.push(c));
     req.on('end', () => {
       const p = new URL(req.url, 'http://x').pathname; const body = parseJson(Buffer.concat(chunks).toString('utf8'));
-      const rec = { p, m: req.method, hdr: Object.keys(req.headers).sort(), body, q: new URL(req.url, 'http://x').search, key: req.headers['x-spm-api-key'], ob: req.headers['x-spm-on-behalf-of-comment'] };
+      const rec = { p, m: req.method, hdr: Object.keys(req.headers).sort(), body, q: new URL(req.url, 'http://x').search, key: req.headers['x-spm-api-key'], ob: req.headers['x-spm-on-behalf-of-comment'], ws: req.headers['x-spm-workspace'] || null };
       S.calls.push(rec);
       const owners = { [FAKE_KEY]: ['spm-example-agent@agents.invalid', OTHER_EMAIL], [OTHER_KEY]: [OTHER_EMAIL], [OTHER_KEY]: [OTHER_EMAIL] };
       const sentKey = req.headers['x-spm-api-key'];
       const im = /^\/(boardsApi|mapsApi)\/([^/]+)\/([^/]+)\/comments$/.exec(p);
       if (im) return itemHandler(req, res, p, im, body, rec, sentKey, owners);
+      // GET /accountApi/me/items?type=board|map&id=<uuid> (server rule): the ITEM's workspace, or no items (no existence leak)
+      if (p === '/accountApi/me/items') {
+        if (req.method !== 'GET') return send(res, 405, { error: 'method not allowed' });
+        if (!Object.prototype.hasOwnProperty.call(owners, sentKey)) return send(res, 401, { code: 'invalid_credential' });
+        const emL = String(req.headers['x-spm-user-email'] || '').toLowerCase();
+        if (!owners[sentKey].includes(emL)) return send(res, 403, { code: 'api_key_owner_mismatch' });
+        const q = new URL(req.url, 'http://x').searchParams;
+        if (!['board', 'map'].includes(q.get('type'))) return send(res, 400, { code: 'invalid_type' });
+        const wantId = q.get('type') === 'board' ? BOARD_ID : MAP_ID;
+        const visible = q.get('id') === wantId && (S.lookupShowsAll || S.memberIds.includes(S.itemWsId));
+        return send(res, 200, { items: visible ? [{ type: q.get('type'), id: wantId, title: 'stand-in item', workspace_id: S.itemWsId, tier: 'comment', via: 'row', level: null }] : [], next_cursor: null });
+      }
       if (req.method !== 'POST') return send(res, 405, { error: 'method not allowed' });
       if (!Object.prototype.hasOwnProperty.call(owners, sentKey)) return send(res, 401, { code: 'invalid_credential' });
       const em = String(req.headers['x-spm-user-email'] || '').toLowerCase();
@@ -769,6 +827,72 @@ function defineCases(cases, S) {
     check(w2.code === 1 && S.creates.length === 0 && /HTTP 404 not_found/.test(w2.errs.join('')), `wrong map: code ${w2.code} err ${w2.errs.join('|')}`);
     const x = await runCli(S, baseT(MTOP, 'a map comment id given with --task'));
     check(x.code === 1 && S.creates.length === 0, `a map comment id under --task: code ${x.code}`);
+  });
+
+  // AD1-AD7, AD10 (spec addendum 1): a map or board item that 404s on the first read is looked up ONCE (GET /accountApi/me/items) and retried ONCE with X-SPM-Workspace = the item's workspace_id, and the reply carries that header
+  const lookupCalls = () => S.calls.filter((c) => c.p === '/accountApi/me/items');
+  rc('W1', 'a map comment in another workspace: the first read is 404 with no header, ONE lookup, then the read and the reply carry the item workspace (X-SPM-Workspace)', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, baseM(MTOP, 'answer in other workspace'));
+    const seq = S.calls.filter((c) => c.p === '/mapsApi/maps/' + MAP_ID + '/comments' || c.p === '/accountApi/me/items').map((c) => (c.p.startsWith('/accountApi') ? 'lookup' : c.m + (c.ws ? '+ws' : '-ws')));
+    check(r.code === 0 && S.creates.length === 1 && S.creates[0].body.parent_id === MTOP, `code ${r.code} creates ${S.creates.length} err ${r.errs.join('|')}`);
+    check(JSON.stringify(seq) === JSON.stringify(['GET-ws', 'lookup', 'GET+ws', 'POST+ws']), `call order ${JSON.stringify(seq)}`);
+    check(lookupCalls().length === 1 && lookupCalls()[0].q === `?type=map&id=${MAP_ID}`, `lookup ${JSON.stringify(lookupCalls())}`);
+    check(S.calls.filter((c) => c.ws).every((c) => c.ws === WS_OTHER), 'a header other than the item workspace was sent');
+  });
+  rc('W2', 'a board task with --board: the lookup asks for the BOARD id (type=board), not the task id, and the reply carries the item workspace', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, ['--task', TASK_ID, '--board', BOARD_ID, '--to', BTOP, '--text', 'answer a board in other workspace']);
+    check(r.code === 0 && S.creates.length === 1, `code ${r.code} creates ${S.creates.length} err ${r.errs.join('|')}`);
+    check(lookupCalls().length === 1 && lookupCalls()[0].q === `?type=board&id=${BOARD_ID}`, `lookup ${JSON.stringify(lookupCalls().map((c) => c.q))}`);
+    check(S.creates.length === 1 && S.calls[S.calls.length - 1].ws === WS_OTHER, 'the post did not carry the item workspace');
+  });
+  rc('W3', 'a task without --board: a 404 keeps today\'s message, and no lookup is made', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, baseT(BTOP, 'no board id'));
+    check(r.code === 1 && S.creates.length === 0 && /HTTP 404 not_found/.test(r.errs.join('')) && lookupCalls().length === 0, `code ${r.code} creates ${S.creates.length} err ${r.errs.join('|')} lookups ${lookupCalls().length}`);
+  });
+  rc('W4', 'an EMPTY lookup (the agent cannot open the item): today\'s 404 message, one lookup, nothing posted', async () => {
+    S.reset(); S.itemWsId = WS_OTHER; S.memberIds = [WS_HOME];
+    const r = await runCli(S, baseM(MTOP, 'empty lookup'));
+    check(r.code === 1 && S.creates.length === 0 && /thread lookup failed \(HTTP 404 not_found\); nothing was posted/.test(r.errs.join('')) && lookupCalls().length === 1, `code ${r.code} creates ${S.creates.length} err ${r.errs.join('|')} lookups ${lookupCalls().length}`);
+    check(S.calls.every((c) => !c.ws), 'a header was sent although the lookup was empty');
+  });
+  rc('W5', 'a retry that is refused 400 (the item is in a workspace the agent is not in): today\'s 404 message, nothing posted, the retry made once', async () => {
+    S.reset(); S.itemWsId = WS_OTHER; S.memberIds = [WS_HOME]; S.lookupShowsAll = true;
+    const r = await runCli(S, baseM(MTOP, 'refused retry'));
+    const retries = S.calls.filter((c) => c.ws === WS_OTHER && c.p === '/mapsApi/maps/' + MAP_ID + '/comments');
+    check(r.code === 1 && S.creates.length === 0 && /HTTP 404 not_found/.test(r.errs.join('')) && retries.length === 1, `code ${r.code} creates ${S.creates.length} retries ${retries.length} err ${r.errs.join('|')}`);
+  });
+  rc('W6', 'a --for-comment reply: no lookup and no X-SPM-Workspace header, even on a 404', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, baseM(MTOP, 'on behalf', ['--for-comment', TOP2]));
+    check(r.code === 1 && lookupCalls().length === 0 && S.calls.every((c) => !c.ws), `code ${r.code} lookups ${lookupCalls().length} err ${r.errs.join('|')}`);
+  });
+  rc('W7', 'a document reply never sends a workspace header and never looks up the membership', async () => {
+    S.reset();
+    const r = await runCli(S, base(TOP2, 'document reply'));
+    check(r.code === 0 && S.calls.every((c) => !c.ws && !c.p.startsWith('/accountApi')), `code ${r.code} calls ${JSON.stringify(S.calls.map((c) => c.p))}`);
+  });
+  rc('W8', 'guard (AD4): the workspace header is refused unless it is the workspace_id from this run\'s lookup; the lookup allows only type and id with key and address', async () => {
+    const hdr = { 'X-SPM-API-Key': FAKE_KEY, 'X-SPM-User-Email': 'spm-example-agent@agents.invalid' };
+    const ws = { ...hdr, 'X-SPM-Workspace': WS_OTHER };
+    const itemUrl = `https://${FN_HOST}/mapsApi/maps/${MAP_ID}/comments`;
+    const refused = (fn) => { try { fn(); return false; } catch (e) { return e instanceof GuardError; } };
+    check(refused(() => guardRequest(itemUrl, 'GET', ws, undefined, 'reply', null)), 'a header with no lookup in this run was admitted');
+    check(refused(() => guardRequest(itemUrl, 'GET', { ...hdr, 'X-SPM-Workspace': WS_HOME }, undefined, 'reply', WS_OTHER)), 'a header that is not the looked-up workspace was admitted');
+    check(!refused(() => guardRequest(itemUrl, 'GET', ws, undefined, 'reply', WS_OTHER)), 'the looked-up workspace header was refused');
+    check(!refused(() => guardRequest(itemUrl, 'POST', { Origin: ORIGIN, ...ws }, { body: 'x', parent_id: TOP2 }, 'reply', WS_OTHER)), 'the post with the looked-up workspace header was refused');
+    check(refused(() => guardRequest(itemUrl, 'POST', { Origin: ORIGIN, ...ws, 'X-SPM-On-Behalf-Of-Comment': TOP2 }, { body: 'x', parent_id: TOP2 }, 'reply', WS_OTHER)), 'the workspace header and the on-behalf header went together');
+    const docUrl = `https://${FN_HOST}/documentsApi/listDocumentComments`;
+    check(refused(() => guardRequest(docUrl, 'POST', ws, { documentId: DOC }, 'reply', WS_OTHER)), 'the header was admitted on a document route');
+    const lookupUrl = `https://${FN_HOST}/accountApi/me/items?type=map&id=${MAP_ID}`;
+    check(!refused(() => guardRequest(lookupUrl, 'GET', hdr, undefined, 'reply', null)), 'the lookup with type and id was refused');
+    check(refused(() => guardRequest(lookupUrl, 'GET', ws, undefined, 'reply', WS_OTHER)), 'the lookup admitted a workspace header');
+    check(refused(() => guardRequest(`https://${FN_HOST}/accountApi/me/items?type=map&id=${MAP_ID}&limit=5`, 'GET', hdr, undefined, 'reply', null)), 'the lookup admitted an extra query key');
+    check(refused(() => guardRequest(`https://${FN_HOST}/accountApi/me/items?type=document&id=${DOC}`, 'GET', hdr, undefined, 'reply', null)), 'the lookup admitted a document');
+    check(refused(() => guardRequest(`https://${FN_HOST}/accountApi/me/items?type=map&id=${MAP_ID}`, 'POST', hdr, {}, 'reply', null)), 'the lookup admitted a POST');
+    check(refused(() => guardRequest(`https://${FN_HOST}/accountApi/inbox`, 'GET', hdr, undefined, 'reply', null)), 'a notices-feed path was admitted');
   });
 
   rc('R20', 'exactly one of --document, --map, --task is required: none, two or three are refused (exit 2, nothing sent); each takes a uuid; the usage text names all three', async () => {
