@@ -65,7 +65,7 @@ const GAP_MS = 3200;
 const DUP_WINDOW_MS = 10 * 60 * 1000;
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 const ITEM_PATH_RE = new RegExp('^/(?:boardsApi/tasks|mapsApi/maps)/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/comments$');
-const USAGE = 'usage: node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid>) --to <comment_id> (--text "<text>" | --text-file <absolute path>) [--dry-run]  |  node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid>) --new (--text "<text>" | --text-file <absolute path>) [--dry-run] [--for-comment <comment id>]  |  node agent-reply.cjs --selftest (--config may also be set through SPM_AGENT_CONFIG; --new posts a top-level comment and takes no --to; a text over 600 characters is refused; --for-comment sends the hand-over comment id as X-SPM-On-Behalf-Of-Comment)';
+const USAGE = 'usage: node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid> [--board <uuid>]) --to <comment_id> (--text "<text>" | --text-file <absolute path>) [--dry-run]  |  node agent-reply.cjs --config <absolute path> (--document <uuid> | --map <uuid> | --task <uuid>) --new (--text "<text>" | --text-file <absolute path>) [--dry-run] [--for-comment <comment id>]  |  node agent-reply.cjs --selftest (--config may also be set through SPM_AGENT_CONFIG; --new posts a top-level comment and takes no --to; a text over 600 characters is refused; --for-comment sends the hand-over comment id as X-SPM-On-Behalf-Of-Comment)';
 const MAX_REPLY_BYTES = 16 * 1024 * 1024;
 const TEXT_LIMIT = 600; // characters (Unicode code points), the standing comment format
 const KEY_PATTERNS = [
@@ -120,7 +120,7 @@ function parseArgs(argv, config = {}) {
   const to = isNew ? null : v['--to'].trim().toLowerCase();
   if (!UUID_RE.test(itemId)) return bad(`${kinds[0]} must be a uuid`);
   if (!isNew && !UUID_RE.test(to)) return bad('--to must be a comment id (a uuid)');
-  // AD5: a task's workspace is looked up by its BOARD id (server rule); the skill copies it from the hand-over's target.id
+  // AD5: a task's workspace is looked up by its BOARD id (server rule); the skill copies it from the hand-over's item.id (the board; target.id is the task)
   let board = null;
   if (Object.prototype.hasOwnProperty.call(v, '--board')) {
     if (kind !== 'task') return bad('--board goes with --task (the board that holds the task)');
@@ -364,7 +364,19 @@ async function run(cfg, deps) {
     if (wait > 0) await deps.sleep(wait);
     // (b) the post
     const postHeaders = { Origin: ORIGIN, 'X-SPM-API-Key': key, 'X-SPM-User-Email': cfg.email, ...onBehalfHdr, ...(wsHeader ? { 'X-SPM-Workspace': wsHeader } : {}) };
-    const post = cfg.kind === 'document' ? await call('POST', 'documentsApi/createDocumentComment', postHeaders, { documentId: cfg.document, body: cfg.text, parent_id: root }) : await call('POST', itemRoute, postHeaders, { body: cfg.text, parent_id: root });
+    let post = cfg.kind === 'document' ? await call('POST', 'documentsApi/createDocumentComment', postHeaders, { documentId: cfg.document, body: cfg.text, parent_id: root }) : await call('POST', itemRoute, postHeaders, { body: cfg.text, parent_id: root });
+    // F3: a --new 404 on a map or board item created nothing, so: one lookup of the item's workspace and ONE retry of the post with that workspace_id. Same guard as the thread read: not with --for-comment, a task only with --board.
+    let retried = false;
+    if (cfg.isNew && post.status === 404 && post.json && post.json.code === 'not_found' && !cfg.forComment && (cfg.kind === 'map' || cfg.board)) {
+      const lt = cfg.kind === 'map' ? { type: 'map', id: cfg.map } : { type: 'board', id: cfg.board };
+      const lk = await call('GET', lookupRoute(lt.type, lt.id), headersRead, undefined);
+      const wsId = lk.status === 200 ? workspaceFromLookup(lk.json, lt.type, lt.id) : null;
+      if (!wsId) warn('the item lookup gave no workspace for this item (an empty answer: not an item this agent can open)');
+      else {
+        wsAllowed = wsId; retried = true;
+        post = await call('POST', itemRoute, { ...postHeaders, 'X-SPM-Workspace': wsId }, { body: cfg.text, parent_id: root });
+      }
+    }
     L.http_status = post.status;
     const settle = (fn) => withLock(deps.stateDir, async () => { const st = readState(deps.stateDir); fn(st); writeStateAtomic(deps.stateDir, st); });
     const idOf = cfg.kind === 'document' ? (post.json && post.json.id) : (post.json && post.json.comment && post.json.comment.id); // a board or map reply is { comment: { id, ... } }, a document reply { id, ... }
@@ -389,7 +401,7 @@ async function run(cfg, deps) {
     }
     L.outcome = 'http_error';
     await settle((st) => { delete st.posts[dupKey]; });
-    warn(`stopped: HTTP ${post.status} ${word(post.json && post.json.code)}; nothing was posted; no retry was made`);
+    warn(`stopped: HTTP ${post.status} ${word(post.json && post.json.code)}; nothing was posted; ${retried ? 'the one retry in the item\'s workspace was refused too' : 'no retry was made'}`);
     return 1;
   } catch (e) {
     warn(`unexpected failure (${word(e && (e.code || e.name))}): ${scrub(String(e && e.message)).slice(0, 160)}`);
@@ -459,7 +471,7 @@ function makeStandIn() {
     return type === 'board' ? new Map([[BTOP, mk(BTOP, null, 'top level board comment')], [BREPLY, mk(BREPLY, BTOP, 'a reply on the task')], [BTOP2, mk(BTOP2, null, 'another top level on the task')]])
       : new Map([[MTOP, mk(MTOP, null, 'top level map comment')], [MREPLY, mk(MREPLY, MTOP, 'a reply on the map')], [MTOP2, mk(MTOP2, null, 'another top level on the map')]]);
   };
-  S.reset = () => { S.calls = []; S.creates = []; S.over = null; S.comments = comments(); S.items = { board: itemSeed('board'), map: itemSeed('map') }; S.defaultWsId = WS_HOME; S.itemWsId = WS_HOME; S.memberIds = [WS_HOME, WS_OTHER]; S.lookupShowsAll = false; };
+  S.reset = () => { S.calls = []; S.creates = []; S.over = null; S.comments = comments(); S.items = { board: itemSeed('board'), map: itemSeed('map') }; S.defaultWsId = WS_HOME; S.itemWsId = WS_HOME; S.memberIds = [WS_HOME, WS_OTHER]; S.lookupShowsAll = false; S.grantOpens = false; };
   S.reset();
   const send = (res, status, body) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
   const errBody = (code, message) => ({ error: code, code, message });
@@ -481,7 +493,8 @@ function makeStandIn() {
     // the workspace header (server rule): a header naming a workspace the caller is not in is 400; the item opens only in its own workspace (no header = the caller's default)
     const wsHdr = req.headers['x-spm-workspace'];
     if (wsHdr !== undefined && !S.memberIds.includes(String(wsHdr).toLowerCase())) return send(res, 400, errBody('workspace_not_allowed', 'X-SPM-Workspace is not one of your workspaces'));
-    if ((wsHdr === undefined ? S.defaultWsId : String(wsHdr).toLowerCase()) !== S.itemWsId) return send(res, 404, errBody('not_found', 'not found'));
+    // S.grantOpens (F5, AD10): a grant row opens the item for this agent whatever its workspace, so an agent with no workspace at all still reaches it
+    if (!S.grantOpens && (wsHdr === undefined ? S.defaultWsId : String(wsHdr).toLowerCase()) !== S.itemWsId) return send(res, 404, errBody('not_found', 'not found'));
     if (req.method === 'GET') return send(res, 200, { comments: [...store.values()].map((c) => itemWire(type, c, em)), cursor: store.size, signal_id: 'f'.repeat(64) });
     rec.create = true; S.creates.push({ body, em, type });
     const n = S.creates.length; const o = typeof S.over === 'function' ? S.over(n) : S.over;
@@ -1180,6 +1193,45 @@ function defineCases(cases, S) {
   const baseNT = (text, extra = []) => ['--task', TASK_ID, '--new', '--text', text, ...extra];
   const baseNM = (text, extra = []) => ['--map', MAP_ID, '--new', '--text', text, ...extra];
 
+  // ==== F3: --new on a map or board item that 404s: one lookup, ONE retry of the post in the item's workspace (a 404 created nothing)
+  const newMapPosts = () => S.calls.filter((c) => c.m === 'POST' && c.p === '/mapsApi/maps/' + MAP_ID + '/comments');
+  const newBoardPosts = () => S.calls.filter((c) => c.m === 'POST' && c.p === '/boardsApi/tasks/' + TASK_ID + '/comments');
+  rc('N1', '--new on a map in another workspace: the post 404s, one lookup, ONE retry of the post with the looked-up workspace header, one comment created', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, baseNM('new in other workspace'));
+    const posts = newMapPosts();
+    check(r.code === 0 && S.creates.length === 1 && lookupCalls().length === 1 && S.creates[0].body.parent_id === null, `code ${r.code} creates ${S.creates.length} lookups ${lookupCalls().length} err ${r.errs.join('|')}`);
+    check(posts.length === 2 && posts[0].ws === null && posts[1].ws === WS_OTHER, `posts ${JSON.stringify(posts.map((c) => c.ws))}`);
+  });
+  rc('N2', '--new on a board task in another workspace, with --board: the lookup asks for the BOARD id, ONE retry of the post with the header, one comment created', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, ['--task', TASK_ID, '--board', BOARD_ID, '--new', '--text', 'new on a task in other workspace']);
+    const posts = newBoardPosts();
+    check(r.code === 0 && S.creates.length === 1 && lookupCalls().length === 1 && lookupCalls()[0].q === `?type=board&id=${BOARD_ID}`, `code ${r.code} creates ${S.creates.length} lookups ${JSON.stringify(lookupCalls().map((c) => c.q))} err ${r.errs.join('|')}`);
+    check(posts.length === 2 && posts[0].ws === null && posts[1].ws === WS_OTHER, `posts ${JSON.stringify(posts.map((c) => c.ws))}`);
+  });
+  rc('N3', '--new on a task WITHOUT --board: today\'s 404 message, no lookup, one post, no retry', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, ['--task', TASK_ID, '--new', '--text', 'new on a task with no board id']);
+    check(r.code === 1 && S.creates.length === 0 && /HTTP 404 not_found; nothing was posted; no retry was made/.test(r.errs.join('')) && lookupCalls().length === 0 && newBoardPosts().length === 1, `code ${r.code} creates ${S.creates.length} lookups ${lookupCalls().length} err ${r.errs.join('|')}`);
+  });
+  rc('N4', '--new with an EMPTY lookup: today\'s failure message, one lookup, no retry, nothing posted, no workspace header sent', async () => {
+    S.reset(); S.itemWsId = WS_OTHER; S.memberIds = [WS_HOME];
+    const r = await runCli(S, baseNM('new with an empty lookup'));
+    check(r.code === 1 && S.creates.length === 0 && /HTTP 404 not_found; nothing was posted; no retry was made/.test(r.errs.join('')) && lookupCalls().length === 1 && newMapPosts().length === 1, `code ${r.code} creates ${S.creates.length} lookups ${lookupCalls().length} err ${r.errs.join('|')}`);
+    check(S.calls.every((c) => !c.ws), 'a workspace header was sent although the lookup was empty');
+  });
+  rc('N5', '--new with --for-comment on a 404: no lookup and no retry, no workspace header anywhere', async () => {
+    S.reset(); S.itemWsId = WS_OTHER;
+    const r = await runCli(S, baseNM('new on behalf', ['--for-comment', MTOP2]));
+    check(r.code === 1 && lookupCalls().length === 0 && newMapPosts().length === 1 && S.calls.every((c) => !c.ws), `code ${r.code} lookups ${lookupCalls().length} posts ${newMapPosts().length} err ${r.errs.join('|')}`);
+  });
+  // ==== F5 (AD10): a grant row opens the item for an agent with no workspace at all: no header, no lookup
+  rc('F5', 'a grant row opens the item for an agent with no workspace at all: the reply posts with no workspace header and makes no lookup', async () => {
+    S.reset(); S.defaultWsId = null; S.itemWsId = WS_OTHER; S.memberIds = []; S.grantOpens = true;
+    const r = await runCli(S, baseM(MTOP, 'grant row, no workspace'));
+    check(r.code === 0 && S.creates.length === 1 && lookupCalls().length === 0 && S.calls.every((c) => !c.ws), `code ${r.code} creates ${S.creates.length} lookups ${lookupCalls().length} err ${r.errs.join('|')}`);
+  });
   rc('R42', '--task --new: ONE create to /boardsApi/tasks/<id>/comments with exactly { body, parent_id: null }, NO GET, the id printed is the new comment id, stored top-level on the task, the log line says mode "new" and task', async () => {
     S.reset();
     const sd = path.join(RUN_DIR, 'new-task'); const clock = { t: T0 };

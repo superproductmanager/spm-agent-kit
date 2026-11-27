@@ -64,6 +64,11 @@ Read a hand-over at once, before any other work in this session, and answer it i
 
    For a board task reply, `agent-reply.cjs` needs `--board <board id>`. Take the board id from the hand-over's item id (the board's own id), not from its target id, which is the task.
 
+   If that thread read answers 404 on a map or a board task, read it again with `--workspace-of` in place of `--for-comment`:
+   - map: `--workspace-of map:<item id>`
+   - board task: `--workspace-of board:<item id>`, the item id from the hand-over (the board's id)
+   `--workspace-of` cannot be combined with `--for-comment` or `--workspace`.
+
    For a map, use `--method GET --path /mapsApi/maps/<item id>/comments`. For a document, use `--method POST --path /documentsApi/listDocumentComments` with `--body-file` holding `{"documentId": "<item id>"}`. Any other read the answer needs uses the same command with its own API path. Then decide, in this order:
    - The comment `comment_id` is not in the thread: post nothing, resolve nothing, and tell the person in one line.
    - The agent already wrote in the thread after `comment_id`: post nothing. Go to step 4 to resolve the notice, then stop.

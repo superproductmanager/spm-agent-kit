@@ -37,6 +37,11 @@ function startStub() {
       const send = (status, obj) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(obj)); };
       if (u.pathname === '/documentsApi/listDocumentComments') return send(200, { comments: [] });
       if (u.pathname === '/documentsApi/listDocumentComments') return send(200, { comments: [] });
+      if (u.pathname === '/accountApi/me/items') { // F4 stub: the item's workspace from the id filter; an empty items list for EMPTY_ITEM
+        const id = u.searchParams.get('id'); const type = u.searchParams.get('type');
+        if (id === '00000000-0000-4000-8000-0000000000e0') return send(200, { items: [] });
+        return send(200, { items: [{ type, id, title: 'Example item', workspace_id: '00000000-0000-4000-8000-0000000000a1' }] });
+      }
       if (u.pathname === '/ok') return send(200, { ok: true, echo: 'ok' });
       if (u.pathname === '/echo-body') return send(200, { got: JSON.parse(body || 'null') });
       if (u.pathname === '/missing') return send(404, { code: 'not_found', error: 'no such item' });
@@ -209,5 +214,66 @@ test('documentsApi paths send Origin https://app.superproductmanager.ai; other p
     const b = await runCall(stub.port, ['--method', 'GET', '--path', '/ok']);
     assert.equal(b.code, 0, b.err);
     assert.equal(stub.calls[1].headers.origin, undefined, 'a non-document path sent an Origin');
+  } finally { await stub.close(); }
+});
+
+// ---- F4: --workspace-of map:<id> | board:<id>: one item lookup, then the call carries the item's workspace (AD1, AD2, AD4)
+const WS_UUID = '00000000-0000-4000-8000-0000000000a1';
+const MAP_ITEM = '00000000-0000-4000-8000-000000000007';
+const BOARD_ITEM = '00000000-0000-4000-8000-0000000000b0';
+const EMPTY_ITEM = '00000000-0000-4000-8000-0000000000e0';
+
+test('--workspace-of map:<id>: ONE lookup with only the key and address headers and the query type and id, then the call carries the item workspace', async () => {
+  const stub = await startStub();
+  try {
+    const r = await runCall(stub.port, ['--method', 'GET', '--path', '/ok', '--workspace-of', `map:${MAP_ITEM}`]);
+    assert.equal(r.code, 0, r.err);
+    assert.deepEqual(stub.calls.map((c) => c.path), ['/accountApi/me/items', '/ok'], 'expected one lookup then the call');
+    const [look, call] = stub.calls;
+    assert.equal(look.query, `?type=map&id=${MAP_ITEM}`);
+    assert.deepEqual(xSpmHeaders(look.headers), ['x-spm-api-key', 'x-spm-user-email'], 'the lookup carried a header other than key and address');
+    assert.equal(call.headers['x-spm-workspace'], WS_UUID, 'the call did not carry the item workspace');
+    assert.deepEqual(xSpmHeaders(call.headers), ['x-spm-api-key', 'x-spm-user-email', 'x-spm-workspace']);
+    assert.equal(r.out.includes(KEY), false, 'the key is in stdout');
+  } finally { await stub.close(); }
+});
+
+test('--workspace-of board:<id> asks the lookup for type=board and carries the same workspace on the call', async () => {
+  const stub = await startStub();
+  try {
+    const r = await runCall(stub.port, ['--method', 'GET', '--path', '/ok', '--workspace-of', `board:${BOARD_ITEM}`]);
+    assert.equal(r.code, 0, r.err);
+    assert.equal(stub.calls[0].query, `?type=board&id=${BOARD_ITEM}`);
+    assert.equal(stub.calls[1].headers['x-spm-workspace'], WS_UUID);
+  } finally { await stub.close(); }
+});
+
+test('--workspace-of with an EMPTY lookup answer stops with a plain message (exit 2) and makes no second call', async () => {
+  const stub = await startStub();
+  try {
+    const r = await runCall(stub.port, ['--method', 'GET', '--path', '/ok', '--workspace-of', `board:${EMPTY_ITEM}`]);
+    assert.equal(r.code, 2);
+    assert.match(r.err, /no workspace/);
+    assert.equal(stub.calls.length, 1, 'a second call was made after an empty lookup');
+    assert.equal(stub.calls[0].path, '/accountApi/me/items');
+  } finally { await stub.close(); }
+});
+
+test('--workspace-of is refused with --workspace or --for-comment, and with any value other than map:<uuid> or board:<uuid>: exit 2, nothing sent', async () => {
+  const stub = await startStub();
+  try {
+    const cases = [
+      ['--workspace-of', `map:${MAP_ITEM}`, '--workspace', WS],
+      ['--workspace-of', `board:${BOARD_ITEM}`, '--for-comment', COMMENT],
+      ['--workspace-of', `task:${BOARD_ITEM}`],
+      ['--workspace-of', 'map:nope'],
+      ['--workspace-of', BOARD_ITEM],
+    ];
+    for (const extra of cases) {
+      const r = await runCall(stub.port, ['--method', 'GET', '--path', '/ok', ...extra]);
+      assert.equal(r.code, 2, `argv ${extra.join(' ')} was not refused`);
+      assert.equal(r.out.includes(KEY) || r.err.includes(KEY), false, 'the key is printed');
+    }
+    assert.equal(stub.calls.length, 0, 'a refused argument list still reached the stub');
   } finally { await stub.close(); }
 });

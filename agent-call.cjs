@@ -5,13 +5,16 @@
  * Optionally it acts on behalf of the person who tagged the agent, by sending that comment's id (--for-comment).
  *
  *   node agent-call.cjs --config <absolute path> --method GET|POST --path <api path>
- *                       [--workspace <slug or id>] [--for-comment <comment id>] [--body-file <absolute path>]
+ *                       [--workspace <slug or id> | --workspace-of map:<item id> | --workspace-of board:<item id>]
+ *                       [--for-comment <comment id>] [--body-file <absolute path>]
  *
  * --path is an API path such as /boardsApi/tasks/<id>/comments. It must start with one "/". The host is always the
  * settings file's backend.api_base: a full URL, a "//" path, a ".." segment or any other host is refused (exit 2) before any call.
  * Headers: X-SPM-API-Key (the key from key_file, or the network-secret placeholder when there is no key_file, as agent-reply.cjs does),
  * X-SPM-User-Email (the agent's address from the settings), X-SPM-Workspace when --workspace is given,
  * X-SPM-On-Behalf-Of-Comment when --for-comment is given.
+ * --workspace-of (F4): one GET accountApi/me/items?type=<map|board>&id=<uuid> with only the key and address headers, then the call
+ * carries X-SPM-Workspace set to that item's workspace_id. An empty answer stops (exit 2) with no second call. Not with --workspace or --for-comment.
  * Output: the JSON reply body on stdout and exit 0 on a 2xx. A 4xx prints "agent-call: HTTP <status> <error code>" on stderr and exits 2.
  * Anything else (a 5xx, no answer, an unreadable key) exits 1. The key is never printed.
  */
@@ -21,6 +24,7 @@ const http = require('node:http');
 const https = require('node:https');
 const { loadConfig, ConfigError } = require(path.join(__dirname, 'lib', 'config.cjs'));
 const { keyMode, NETWORK_SECRET_VALUE, proxyUrl } = require(path.join(__dirname, 'lib', 'key-mode.cjs'));
+const { lookupRoute, workspaceFromLookup } = require(path.join(__dirname, 'lib', 'item-workspace.cjs')); // F4: the item's workspace, from one lookup
 
 const METHODS = ['GET', 'POST'];
 const ORIGIN = 'https://app.superproductmanager.ai'; // sent on documentsApi paths, as agent-reply.cjs does on documents posts
@@ -30,7 +34,7 @@ const PATH_RE = /^\/[A-Za-z0-9_\-./]+(\?[A-Za-z0-9_\-.=&%]*)?$/;
 const MAX_PATH = 512;
 const MAX_BODY = 256 * 1024;
 const TIMEOUT_MS = 90000;
-const USAGE = 'usage: node agent-call.cjs --config <absolute path> --method GET|POST --path <api path> [--workspace <slug or id>] [--for-comment <comment id>] [--body-file <absolute path>]';
+const USAGE = 'usage: node agent-call.cjs --config <absolute path> --method GET|POST --path <api path> [--workspace <slug or id> | --workspace-of map:<item id> | --workspace-of board:<item id>] [--for-comment <comment id>] [--body-file <absolute path>]';
 
 const word = (x) => (typeof x === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(x) ? x : 'none');
 const parseJson = (text) => { try { return JSON.parse(text); } catch (_) { return null; } };
@@ -50,7 +54,7 @@ function withoutConfig(argv) {
 /** Parses the flags other than --config. { ok: true, ... } or { ok: false, error }. Values are never echoed back. */
 function parseCallArgs(argv) {
   const bad = (why) => ({ ok: false, error: why });
-  const valued = ['--method', '--path', '--workspace', '--for-comment', '--body-file'];
+  const valued = ['--method', '--path', '--workspace', '--workspace-of', '--for-comment', '--body-file'];
   const v = {};
   for (let i = 0; i < argv.length; i++) {
     const f = argv[i];
@@ -75,13 +79,21 @@ function parseCallArgs(argv) {
     if (!UUID_RE.test(fc)) return bad('--for-comment must be a comment id (a uuid)');
     forComment = fc;
   }
+  let workspaceOf = null;
+  if (has('--workspace-of')) {
+    const m = /^(map|board):([0-9a-f-]+)$/.exec(v['--workspace-of'].trim().toLowerCase());
+    if (!m || !UUID_RE.test(m[2])) return bad('--workspace-of must be map:<item id> or board:<item id> (a uuid)');
+    if (has('--workspace')) return bad('--workspace-of cannot be combined with --workspace');
+    if (has('--for-comment')) return bad('--workspace-of cannot be combined with --for-comment');
+    workspaceOf = { type: m[1], id: m[2] };
+  }
   let bodyFile = null;
   if (has('--body-file')) {
     if (method !== 'POST') return bad('--body-file goes with --method POST only');
     if (!path.isAbsolute(v['--body-file'])) return bad('--body-file must be an absolute path');
     bodyFile = v['--body-file'];
   }
-  return { ok: true, method, path: apiPath, workspace, forComment, bodyFile };
+  return { ok: true, method, path: apiPath, workspace, workspaceOf, forComment, bodyFile };
 }
 
 // ---------------------------------------------------------------- the proxy: a real https call goes through HTTPS_PROXY when one is set (as agent-reply.cjs does)
@@ -151,6 +163,23 @@ async function main(argv, deps = realDeps()) {
     try { key = deps.readKeyFile(config.keyFile); } catch (e) { err(`cannot read the key file (${word(e && e.code)})`); return 1; }
   }
   const scrub = (text) => (typeof key === 'string' && key.length >= 8 ? String(text).split(key).join('[redacted]') : String(text));
+  // F4: --workspace-of: one lookup (key and address only), then the item's workspace_id is the workspace header
+  let workspace = parsed.workspace;
+  if (parsed.workspaceOf) {
+    const lt = parsed.workspaceOf;
+    let lk;
+    try { lk = await deps.http(new URL('/' + lookupRoute(lt.type, lt.id), backend.api_base).href, 'GET', { 'X-SPM-API-Key': key, 'X-SPM-User-Email': config.email }, null, { timeoutMs: TIMEOUT_MS }); } catch (e) {
+      err(`no answer from the server (${word(e && e.code)}) on the item lookup; nothing was sent`); return 1;
+    }
+    if (lk.status !== 200) {
+      const lj = parseJson(lk.text);
+      const lcode = lj && typeof lj.code === 'string' && /^[a-z0-9_]{1,64}$/.test(lj.code) ? lj.code : 'none';
+      err(`item lookup: HTTP ${lk.status} ${lcode}; nothing was sent`);
+      return lk.status >= 400 && lk.status < 500 ? 2 : 1;
+    }
+    workspace = workspaceFromLookup(parseJson(lk.text), lt.type, lt.id);
+    if (!workspace) { err('the item lookup gave no workspace (an empty answer: not an item this agent can open); nothing was sent'); return 2; }
+  }
   let body = null;
   if (parsed.bodyFile) {
     let raw;
@@ -161,7 +190,7 @@ async function main(argv, deps = realDeps()) {
     if (Buffer.byteLength(body) > MAX_BODY) { err('--body-file is too large'); return 2; }
   }
   const headers = { 'X-SPM-API-Key': key, 'X-SPM-User-Email': config.email };
-  if (parsed.workspace) headers['X-SPM-Workspace'] = parsed.workspace;
+  if (workspace) headers['X-SPM-Workspace'] = workspace;
   if (parsed.forComment) headers['X-SPM-On-Behalf-Of-Comment'] = parsed.forComment;
   if (url.pathname.startsWith('/documentsApi/')) headers.Origin = ORIGIN;
   let res;

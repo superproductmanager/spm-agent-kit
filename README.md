@@ -255,6 +255,7 @@ node agent-call.cjs --config <absolute path> --method GET --path /boardsApi/task
 
 - `--method` is `GET` or `POST`. `--path` is an API path such as `/boardsApi/tasks/<id>/comments`. A full URL, a `//` path or a `..` segment is refused before any call. The host is always `backend.api_base` from the settings file.
 - `--workspace` sends `X-SPM-Workspace`. `--for-comment` sends `X-SPM-On-Behalf-Of-Comment`. `--body-file` (POST only) is a file holding the JSON body.
+- `--workspace-of map:<item id>` or `--workspace-of board:<item id>` looks up the item's workspace with one read, then sends `X-SPM-Workspace` with it. An empty answer stops with exit 2 and no second call. It cannot be combined with `--workspace` or `--for-comment`. When a map or board thread read answers 404, read it again this way; for a board task, use the board's id from the hand-over's item id.
 - The JSON reply body goes to stdout and the script exits 0. A 4xx prints `HTTP <status> <error code>` on stderr and exits 2 (for example `on_behalf_not_tagged`). Anything else exits 1. The key is never printed.
 - `agent-reply.cjs --for-comment <comment id>` sends the same header on its thread lookup and its post.
 - Map and board replies, and the "seen" notes from `agent-ack.cjs`, work in any workspace the agent belongs to. The first read has no workspace header. If it returns 404, the kit looks up the item's workspace once and retries once with it. For a board task, `agent-reply.cjs` needs `--board <board id>`, the board the task belongs to.
