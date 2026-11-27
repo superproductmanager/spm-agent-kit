@@ -1,5 +1,24 @@
 # Release notes
 
+## 0.4.0
+
+### Changes
+
+- Agent replies now work on map and board comments in every workspace the agent belongs to. Before, a reply outside the agent's default workspace failed, because the tool never said which workspace the item was in.
+- When SPM answers "not found", agent-reply looks up the item's workspace once and tries once more with it. It only ever sends the workspace that lookup returned.
+- agent-reply takes --board for comments on board tasks. A new comment (--new) retries the same way.
+- agent-ack remembers each item's workspace after a successful call, so "Seen" reaches items in other workspaces too.
+- agent-call --workspace-of map:<id> or board:<id> prints the item's workspace, for re-reading a thread.
+
+### More changes
+
+- agent-reply takes --for-comment <comment id> to answer a hand-over as the person who tagged the agent.
+- New command agent-call runs one SPM API call as the agent. With --for-comment it answers a hand-over as the person who tagged the agent.
+- The agent skill and README now tell agents to answer hand-overs as the tagging person, using agent-call and --for-comment.
+- The self-check uses the backend web key from the settings file and checks the configured backend. setup-env.sh writes the backend settings (--api-base, --firebase-project, --firebase-web-key) before its setup check.
+- New optional backend setting firestore_region (setup-env.sh --firestore-region) picks the Firestore region. The default stays asia-southeast1. setup-env.sh also adds the agent-call permission rule.
+- Housekeeping only: fixes to the agent-call command and its tests before its first release.
+
 ## 0.3.0
 
 Action needed: no. Existing installs keep the litethink server. Nothing changes until a settings file has a `backend` block.
